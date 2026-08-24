@@ -17,12 +17,13 @@
 但足夠用來抓策略的大方向表現。
 """
 
+import bisect
 import logging
 from datetime import datetime, timezone
 
 import requests
 
-from app.signal_engine import compute_signal_from_trades
+from app.signal_engine import compute_signal_from_trades, CHAN_LOOKBACK_TRADES
 from app import trading_core
 from app.trading_stats import compute_stats, assess_readiness
 
@@ -39,6 +40,7 @@ DEFAULT_TRAIL_TRIGGER_POINTS = 3.0
 DEFAULT_TRAIL_DISTANCE_POINTS = 3.0
 
 MAX_BACKTEST_DAYS = 7  # 天數上限，避免單次回測跑太久(纏論分析在大量K棒上會變慢)
+TARGET_STEP_COUNT = 1200  # 重播步數的目標上限，天數越長會自動拉大取樣間隔(stride)來控制在這附近
 
 
 def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2):
@@ -117,24 +119,42 @@ def run_backtest(
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
     回傳格式跟 /paper-trading/summary 一致，方便dashboard共用同一套渲染邏輯。
+
+    效能設計重點(修正記錄，見README)：
+    - 用bisect在已排序的trades時間清單上做二分搜尋定位每一步的「目前為止」邊界，
+      取代原本每一步都重新掃過整份trades清單的O(n^2)寫法
+    - 每一步只保留最近CHAN_LOOKBACK_TRADES筆(這也是compute_signal_from_trades內部
+      實際會用到的上限)，避免隨著回測天數增加，切片大小跟著無限成長
     """
     klines = fetch_historical_klines(days=days)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}
 
     trades = klines_to_synthetic_trades(klines)
+    trade_times = [t["time"] for t in trades]  # 給bisect搜尋用的平行時間清單
 
-    # 以每根K線的收盤時間為一個重播步驟，跟即時模式「每次檢查訊號」的頻率概念一致
-    step_times = sorted({int(k[6]) for k in klines})
+    # 以每根K線的收盤時間為一個重播步驟，跟即時模式「每次檢查訊號」的頻率概念一致。
+    # 天數越長，K線數越多，全部逐根重播會讓運算時間暴增(纏論分析是K棒數量的函數，
+    # 重播步數又跟K線數量同步成長，兩者疊加會讓耗時遠超過HTTP請求能負擔的時間)。
+    # 用stride(取樣間隔)把總重播步數控制在TARGET_STEP_COUNT附近：天數短時每根K線
+    # 都檢查(stride=1)，天數長時跳著檢查，犧牲一些精確度換取能在合理時間內跑完。
+    all_step_times = sorted({int(k[6]) for k in klines})
+    stride = max(1, len(all_step_times) // TARGET_STEP_COUNT)
+    step_times = all_step_times[::stride]
 
     position = None
     closed_trades = []
 
     for step_time in step_times:
-        # 只用「這個時間點為止」的資料，避免look-ahead bias
-        trades_so_far = [t for t in trades if t["time"] <= step_time]
-        if len(trades_so_far) < 20:  # 資料太少，跳過這一步(通常是回測最一開始的幾步)
+        # 二分搜尋定位「這個時間點為止」的邊界，取代線性掃描，避免look-ahead bias
+        cutoff_index = bisect.bisect_right(trade_times, step_time)
+        if cutoff_index < 20:  # 資料太少，跳過這一步(通常是回測最一開始的幾步)
             continue
+
+        # 只取最近CHAN_LOOKBACK_TRADES筆，跟即時模式的資料窗口大小一致，
+        # 避免切片大小隨著回測進度不斷成長拖慢速度
+        window_start = max(0, cutoff_index - CHAN_LOOKBACK_TRADES)
+        trades_so_far = trades[window_start:cutoff_index]
 
         current_price = trades_so_far[-1]["price"]
 
@@ -177,6 +197,8 @@ def run_backtest(
         "backtest_days": days,
         "kline_count": len(klines),
         "synthetic_trade_count": len(trades),
+        "replay_step_count": len(step_times),
+        "replay_stride": stride,  # 1代表每根K線都檢查，>1代表跳著檢查(天數長時的效能取捨)
         "sl_points": sl_points,
         "trail_trigger_points": trail_trigger_points,
         "trail_distance_points": trail_distance_points,

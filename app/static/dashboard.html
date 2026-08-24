@@ -1004,6 +1004,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
     els.backtestResult.innerHTML = `
       <div class="backtest-meta">
         回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根K線 ／ 還原成 ${data.synthetic_trade_count} 筆合成成交
+        ／ 實際重播 ${data.replay_step_count} 步${data.replay_stride > 1 ? `(取樣間隔 ${data.replay_stride}，天數較長時自動降低精細度以控制運算時間)` : ''}
       </div>
       ${readinessDiv.innerHTML}
       <div class="stat-row" style="margin-top:10px;">

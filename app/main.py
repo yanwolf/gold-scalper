@@ -155,10 +155,16 @@ async def backtest_run(
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
     訊號邏輯和交易規則，快速驗證策略表現，不用乾等即時模擬單累積樣本數。
 
-    這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)，
-    一般2-3天大概數十秒內會有結果。
+    這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)。
+
+    重要：run_backtest()本身是同步、吃CPU的函式，如果直接在這個async函式裡
+    呼叫，會整個卡住FastAPI唯一的事件循環，導致回測跑的時候其他所有請求
+    (health check、dashboard、甚至Binance背景資料接收)都會被凍結，
+    嚴重的話整個服務看起來像掛掉一樣(修正記錄見README)。
+    用asyncio.to_thread()丟到背景執行緒跑，讓事件循環保持暢通。
     """
-    return backtest_module.run_backtest(
+    return await asyncio.to_thread(
+        backtest_module.run_backtest,
         days=days,
         interval_seconds=interval_seconds,
         bucket_size=bucket_size,
