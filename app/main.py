@@ -200,7 +200,7 @@ CHAN_LOOKBACK_TRADES = 20000  # 纏論固定用較大的回看範圍，確保K�
 
 
 @app.get("/signal/latest")
-async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, trade_limit: int = 3000):
+async def signal_latest(interval_seconds: int = 60, bucket_size: float = 1.0, trade_limit: int = 3000):
     """
     綜合訊號：纏論(中樞突破/背馳) + 分價量表(POC/Value Area)，
     兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。

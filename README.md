@@ -241,3 +241,14 @@ trades快照算出來的，一併包在回應裡回傳。前端 `fetchAndRender(
 流程還是一樣：Token/Chat ID本身要透過Zeabur環境變數設定(`TELEGRAM_BOT_TOKEN`、
 `TELEGRAM_CHAT_ID`)，dashboard面板負責「找到正確的Chat ID」和「驗證設定有沒有生效」，
 不會把Bot Token直接暴露在前端頁面上(安全考量，Token只存在後端環境變數)。
+
+## 修正記錄：預設週期改成1分鐘K線
+
+纏論(分型/筆/中樞)在5分鐘K線下需要收集比較久的資料才夠判斷，1分鐘K線能更快
+驗證多空進出場的時機點。已把預設週期從5分鐘改成1分鐘：
+- `app/notifier.py` 的 `DEFAULT_INTERVAL_SECONDS`（Telegram通知判斷用）
+- `/signal/latest` 的 `interval_seconds` 預設值
+- dashboard的K線週期下拉選單，預設改選「1分鐘K線」
+
+之後想切回5分鐘或15分鐘，dashboard上直接切換下拉選單即可即時查看；
+Telegram背景通知的判斷週期則需要改`DEFAULT_INTERVAL_SECONDS`後重新部署才會生效。
