@@ -805,10 +805,16 @@ function renderPaperTrading(data){
   if(data.open_position){
     const p = data.open_position;
     const dirLabel = p.direction === 'bullish' ? '看多 ▲' : '看空 ▼';
+    const trailBadge = p.trailing_active
+      ? `<span style="color:var(--gold);">移動停損已啟動</span>`
+      : `<span style="color:var(--muted);">尚未啟動移動停損</span>`;
     els.paperOpenPosition.innerHTML = `
       <div class="paper-position-card ${p.direction}">
-        <span><span class="dir-label">開倉中 ${dirLabel}</span> @ ${p.entry_price.toFixed(2)}</span>
-        <span class="mono">SL ${p.sl_price.toFixed(2)} / TP ${p.tp_price.toFixed(2)}</span>
+        <span>
+          <span class="dir-label">開倉中 ${dirLabel}</span> @ ${p.entry_price.toFixed(2)}
+          <br/><span style="font-size:11px;">${trailBadge}</span>
+        </span>
+        <span class="mono">停損 ${p.sl_price.toFixed(2)} / 峰值 ${p.peak_price.toFixed(2)}</span>
       </div>
     `;
   }else{

@@ -68,7 +68,8 @@ def init_schema():
                         entry_price DOUBLE PRECISION NOT NULL,
                         entry_time TIMESTAMPTZ NOT NULL,
                         sl_price DOUBLE PRECISION NOT NULL,
-                        tp_price DOUBLE PRECISION NOT NULL,
+                        peak_price DOUBLE PRECISION,
+                        trailing_active BOOLEAN NOT NULL DEFAULT false,
                         chan_reason TEXT,
                         profile_reason TEXT,
                         status TEXT NOT NULL DEFAULT 'open',
@@ -78,11 +79,31 @@ def init_schema():
                         pnl_points DOUBLE PRECISION
                     );
                 """)
+                # 舊版schema用tp_price(固定停利)，改成移動停損後不再需要，
+                # 用ADD COLUMN IF NOT EXISTS確保舊資料庫升級時不會噴錯
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS peak_price DOUBLE PRECISION;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS trailing_active BOOLEAN NOT NULL DEFAULT false;
+                """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paper_trades_status
                     ON paper_trades (status);
                 """)
             conn.commit()
+
+            # 舊版部署可能還有 tp_price 欄位且是 NOT NULL(固定停利機制的殘留)，
+            # 改成移動停損後新增的資料列不會再帶tp_price，這裡放寬約束避免insert失敗。
+            # 用獨立的try/except是因為全新資料庫根本沒有這個欄位，執行會報錯是正常的，不影響整體初始化。
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("ALTER TABLE paper_trades ALTER COLUMN tp_price DROP NOT NULL;")
+                conn.commit()
+            except Exception:
+                conn.rollback()
         finally:
             _pool.putconn(conn)
 
@@ -163,8 +184,8 @@ def load_recent_trades(limit=20000):
 def insert_open_paper_trade(position):
     """
     新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
-    sl_price, tp_price, chan_reason, profile_reason。回傳新增的資料庫id，
-    沒有資料庫時回傳None(呼叫端要能接受id=None，代表這筆單只存在記憶體)。
+    sl_price, peak_price, trailing_active, chan_reason, profile_reason。
+    回傳新增的資料庫id，沒有資料庫時回傳None(呼叫端要能接受id=None，代表這筆單只存在記憶體)。
     """
     if not _enabled:
         return None
@@ -176,13 +197,13 @@ def insert_open_paper_trade(position):
                 cur.execute(
                     """
                     INSERT INTO paper_trades
-                        (direction, entry_price, entry_time, sl_price, tp_price, chan_reason, profile_reason, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
+                        (direction, entry_price, entry_time, sl_price, peak_price, trailing_active, chan_reason, profile_reason, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open')
                     RETURNING id;
                     """,
                     (
                         position["direction"], position["entry_price"], position["entry_time"],
-                        position["sl_price"], position["tp_price"],
+                        position["sl_price"], position.get("peak_price"), position.get("trailing_active", False),
                         position.get("chan_reason"), position.get("profile_reason"),
                     ),
                 )
@@ -194,6 +215,33 @@ def insert_open_paper_trade(position):
     except Exception as e:
         logger.error(f"新增模擬單失敗: {e}")
         return None
+
+
+def update_paper_trade_stop(trade_id, sl_price, peak_price, trailing_active):
+    """
+    移動停損更新：每次追蹤引擎調整停損價位時呼叫，讓服務重啟後能從資料庫正確
+    恢復目前的移動停損進度，不會重置回entry時的初始停損。trade_id是None時直接跳過。
+    """
+    if not _enabled or trade_id is None:
+        return
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE paper_trades
+                    SET sl_price = %s, peak_price = %s, trailing_active = %s
+                    WHERE id = %s AND status = 'open';
+                    """,
+                    (sl_price, peak_price, trailing_active, trade_id),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"更新移動停損失敗: {e}")
 
 
 def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points):
@@ -231,7 +279,7 @@ def get_open_paper_trade():
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, direction, entry_price, entry_time, sl_price, tp_price,
+                    SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                            chan_reason, profile_reason
                     FROM paper_trades
                     WHERE status = 'open'
@@ -247,8 +295,8 @@ def get_open_paper_trade():
         return {
             "id": row[0], "direction": row[1], "entry_price": row[2],
             "entry_time": row[3].isoformat() if row[3] else None,
-            "sl_price": row[4], "tp_price": row[5],
-            "chan_reason": row[6], "profile_reason": row[7],
+            "sl_price": row[4], "peak_price": row[5], "trailing_active": row[6],
+            "chan_reason": row[7], "profile_reason": row[8],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")
