@@ -1,5 +1,5 @@
 """
-模擬單(paper trading)追蹤引擎 —— 即時版本。
+模擬單(paper trading)追蹤引擎 —— 即時版本，支援多週期平行追蹤。
 
 實際的開倉/移動停損/出場判斷規則都在 app/trading_core.py (純函式，
 跟資料庫、背景執行緒無關)，這個檔案只負責：
@@ -9,6 +9,10 @@
 
 回測(app/backtest.py)呼叫的是同一套 trading_core 純函式，
 確保「即時模擬單」和「歷史回測」用的是完全一樣的交易規則。
+
+多週期平行追蹤：PaperTradingEngine用interval_seconds參數化，可以同時
+建立多個實例(例如1分K跟5分K)各自獨立追蹤、各自累積績效，彼此不會互相
+干擾，資料庫裡用interval_seconds欄位區分每筆紀錄屬於哪個週期。
 """
 
 import os
@@ -27,14 +31,14 @@ logger = logging.getLogger("paper_trading")
 PAPER_POLL_SECONDS = int(os.getenv("PAPER_POLL_SECONDS", "15"))
 # 停損/移動停損預設值拉寬(原本3點對黃金的日內雜訊來說太緊，正常波動就會誤觸發，
 # 詳見README修正記錄)。這幾個數字之後如果想換成ATR動態版本，只要在這裡替換
-# 成算出來的動態值即可，不用動其他地方的邏輯。
+# 成算出來的動態值即可，不用動其他地方的邏輯。這組參數目前1分K/5分K共用同一套，
+# 之後如果想讓不同週期各自有不同風控參數，可以改成依interval_seconds查表。
 PAPER_SL_POINTS = float(os.getenv("PAPER_SL_POINTS", "5.0"))
 PAPER_TRAIL_TRIGGER_POINTS = float(os.getenv("PAPER_TRAIL_TRIGGER_POINTS", "6.0"))
 PAPER_TRAIL_DISTANCE_POINTS = float(os.getenv("PAPER_TRAIL_DISTANCE_POINTS", "5.0"))
 # 訊號反轉需要連續看到幾次才真的出場(避免訊號瞬間閃爍一次就洗出場)
 PAPER_REVERSAL_CONFIRM_COUNT = int(os.getenv("PAPER_REVERSAL_CONFIRM_COUNT", "2"))
 
-DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
 
@@ -42,7 +46,10 @@ MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼�
 
 
 class PaperTradingEngine:
-    def __init__(self):
+    def __init__(self, interval_seconds=60, label=None):
+        self.interval_seconds = interval_seconds
+        self.label = label or f"{interval_seconds}秒K線"
+
         self._lock = threading.Lock()
         self._position = None
         self._closed_trades_memory = deque(maxlen=MAX_MEMORY_TRADES)
@@ -58,7 +65,7 @@ class PaperTradingEngine:
     def start(self):
         if not self._seeded_from_db:
             with self._lock:
-                self._position = db.get_open_paper_trade()
+                self._position = db.get_open_paper_trade(interval_seconds=self.interval_seconds)
             self._seeded_from_db = True
 
         if self._thread and self._thread.is_alive():
@@ -66,7 +73,7 @@ class PaperTradingEngine:
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
-        logger.info("模擬單追蹤引擎已啟動(移動停損模式)")
+        logger.info(f"模擬單追蹤引擎已啟動({self.label}，移動停損模式)")
 
     def stop(self):
         self._stop_flag.set()
@@ -76,14 +83,14 @@ class PaperTradingEngine:
             try:
                 self._tick()
             except Exception as e:
-                logger.error(f"模擬單檢查失敗: {e}")
+                logger.error(f"模擬單檢查失敗({self.label}): {e}")
             self._stop_flag.wait(PAPER_POLL_SECONDS)
 
     def _tick(self):
         self._last_tick_at = datetime.now(timezone.utc)
 
         result = compute_full_signal(
-            interval_seconds=DEFAULT_INTERVAL_SECONDS,
+            interval_seconds=self.interval_seconds,
             bucket_size=DEFAULT_BUCKET_SIZE,
             trade_limit=DEFAULT_TRADE_LIMIT,
         )
@@ -123,13 +130,17 @@ class PaperTradingEngine:
             chan_reason=signal_result["chan"]["reason"],
             profile_reason=signal_result["profile"]["reason"],
         )
+        position["interval_seconds"] = self.interval_seconds
         db_id = db.insert_open_paper_trade(position)
         position["id"] = db_id
 
         with self._lock:
             self._position = position
 
-        logger.info(f"模擬單開倉: {position['direction']} @ {current_price:.2f} (初始SL:{position['sl_price']:.2f})")
+        logger.info(
+            f"模擬單開倉({self.label}): {position['direction']} @ {current_price:.2f} "
+            f"(初始SL:{position['sl_price']:.2f})"
+        )
 
     def _close_position(self, position, exit_price, exit_reason):
         exit_time = datetime.now(timezone.utc).isoformat()
@@ -142,17 +153,18 @@ class PaperTradingEngine:
             self._position = None
 
         logger.info(
-            f"模擬單平倉: {position['direction']} @ {exit_price:.2f} "
+            f"模擬單平倉({self.label}): {position['direction']} @ {exit_price:.2f} "
             f"({exit_reason}, 損益:{closed_record['pnl_points']:+.2f})"
         )
 
     def get_summary(self, limit=50):
         """
         績效摘要：總筆數、勝率、總損益、獲利因子、最大回撤、目前開倉狀態、
-        最近N筆紀錄、以及對照「達標門檻」的評估結果。
+        最近N筆紀錄、以及對照「達標門檻」的評估結果。只回傳這個引擎自己
+        (自己的interval_seconds)的資料，不會混到其他週期的紀錄。
         """
         if db.is_enabled():
-            trades = db.get_closed_paper_trades(limit=max(limit, 500))
+            trades = db.get_closed_paper_trades(limit=max(limit, 500), interval_seconds=self.interval_seconds)
         else:
             trades = list(self._closed_trades_memory)[::-1]
 
@@ -164,6 +176,8 @@ class PaperTradingEngine:
 
         return {
             **stats,
+            "interval_seconds": self.interval_seconds,
+            "label": self.label,
             "open_position": position,
             "recent_trades": trades[:limit],
             "sl_points": PAPER_SL_POINTS,
@@ -173,5 +187,16 @@ class PaperTradingEngine:
         }
 
 
-# 單例，供 main.py 匯入使用
-paper_trading = PaperTradingEngine()
+# 兩個平行運作的實例：1分K(原本就有的)和5分K(新增，可直接對照績效)。
+# PAPER_TRADING_ENGINES讓main.py能依interval_seconds查到對應的引擎。
+paper_trading_1m = PaperTradingEngine(interval_seconds=60, label="1分K")
+paper_trading_5m = PaperTradingEngine(interval_seconds=300, label="5分K")
+
+PAPER_TRADING_ENGINES = {
+    60: paper_trading_1m,
+    300: paper_trading_5m,
+}
+
+# 保留舊名稱指向1分K引擎，避免其他還沒更新的地方(例如health_monitor.py)
+# import時直接壞掉；health_monitor.py之後會更新成明確檢查兩個引擎。
+paper_trading = paper_trading_1m

@@ -26,8 +26,8 @@ gold-scalper/
 │   ├── analysis.py          # K線聚合 / 分價量表 / 纏論分型-筆-中樞-背馳
 │   ├── signal.py            # 訊號引擎：綜合纏論+分價量表，產出分階段多空判斷
 │   ├── signal_engine.py     # 統一的訊號計算邏輯，供API/Telegram通知/模擬單共用
-│   ├── notifier.py          # Telegram通知：訊號升級時發送，含防重複邏輯
-│   ├── paper_trading.py     # 模擬單追蹤：呼叫trading_core/trading_stats，含DB持久化
+│   ├── notifier.py          # Telegram通知：訊號升級時發送(1分K+5分K平行檢查)，含防重複邏輯
+│   ├── paper_trading.py     # 模擬單追蹤：PaperTradingEngine參數化支援1分K/5分K平行追蹤
 │   ├── trading_core.py      # 純交易邏輯：開倉/移動停損/出場判斷(即時+回測共用)
 │   ├── trading_stats.py     # 績效統計 + 達標門檻評估(即時+回測共用)
 │   ├── backtest.py          # 歷史回測：抓Binance歷史K線，walk-forward重播驗證策略
@@ -482,3 +482,35 @@ dashboard會顯示目前這次回測用的取樣間隔。
 停損不受確認機制影響立即出場，全部符合預期。
 
 `/backtest/run` 新增 `reversal_confirm_count` 參數，預設值也跟即時模擬單一致(2)。
+
+## 1分K / 5分K 平行追蹤
+
+想直接對照1分K和5分K的實際表現，不用二選一，改成兩套獨立引擎同時運作：
+
+**改動範圍：**
+- `paper_trading.py`：`PaperTradingEngine`改成用`interval_seconds`參數化，
+  建立兩個實例`paper_trading_1m`(60秒)和`paper_trading_5m`(300秒)，各自獨立
+  維護倉位狀態、各自累積績效，互不干擾。`PAPER_TRADING_ENGINES`字典讓其他
+  模組能依週期查到對應引擎。
+- `db.py`：`paper_trades`資料表新增`interval_seconds`欄位，區分每筆紀錄屬於
+  哪個週期(舊資料庫升級時既有紀錄自動歸類成1分K/60秒，這樣不會誤判)。
+- `notifier.py`：改成同一個背景執行緒依序檢查兩個週期，各自獨立防重複，
+  Telegram訊息會標註是【1分K】還是【5分K】觸發的。
+- `health_monitor.py`：模擬單心跳檢查改成對每個引擎各自監控，告警訊息會
+  標明是哪個週期的引擎出問題。
+- `main.py`：`/paper-trading/summary`新增`interval_seconds`參數(預設60)，
+  指定要看哪個引擎的績效。
+
+**已測試驗證：** 兩個引擎能同時開出方向相反的倉位互不干擾、通知邏輯各自
+獨立判斷觸發(一個在訊號階段會發送，另一個在關注階段不會)。
+
+**Dashboard：**
+- 模擬單績效面板最上方新增週期切換選單(1分K追蹤 / 5分K追蹤)，切換後看到
+  的是對應引擎完全獨立的績效數字
+- 歷史回測面板也新增週期選單，可以直接測5分K的回測表現，不用等即時追蹤
+  累積樣本
+
+**關於5分K什麼時候能看到有意義的即時績效：** 取決於市場出現多少次「訊號」
+等級的訊號，這跟時間長短沒有絕對關係(震盪盤可能很久都沒有訊號，趨勢盤
+可能很快就有)。建議先用歷史回測(選5分K週期)快速看過去表現，比乾等即時
+數據累積更有效率。

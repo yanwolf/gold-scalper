@@ -84,7 +84,8 @@ def init_schema():
                         exit_price DOUBLE PRECISION,
                         exit_time TIMESTAMPTZ,
                         exit_reason TEXT,
-                        pnl_points DOUBLE PRECISION
+                        pnl_points DOUBLE PRECISION,
+                        interval_seconds INTEGER NOT NULL DEFAULT 60
                     );
                 """)
                 # 舊版schema用tp_price(固定停利)，改成移動停損後不再需要，
@@ -97,9 +98,19 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS trailing_active BOOLEAN NOT NULL DEFAULT false;
                 """)
+                # 支援1分K/5分K平行追蹤：舊資料庫的既有紀錄都當作1分K(60秒)的歷史，
+                # 這樣升級後不會把舊資料誤判成5分K的紀錄
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS interval_seconds INTEGER NOT NULL DEFAULT 60;
+                """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paper_trades_status
                     ON paper_trades (status);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_paper_trades_interval
+                    ON paper_trades (interval_seconds, status);
                 """)
             conn.commit()
 
@@ -199,7 +210,8 @@ def load_recent_trades(limit=20000):
 def insert_open_paper_trade(position):
     """
     新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
-    sl_price, peak_price, trailing_active, chan_reason, profile_reason。
+    sl_price, peak_price, trailing_active, chan_reason, profile_reason, interval_seconds
+    (哪個K線週期的追蹤引擎開的倉，用來區分1分K/5分K等平行追蹤的紀錄)。
     回傳新增的資料庫id，沒有資料庫時回傳None(呼叫端要能接受id=None，代表這筆單只存在記憶體)。
     """
     if not _enabled:
@@ -212,14 +224,16 @@ def insert_open_paper_trade(position):
                 cur.execute(
                     """
                     INSERT INTO paper_trades
-                        (direction, entry_price, entry_time, sl_price, peak_price, trailing_active, chan_reason, profile_reason, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                        (direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
+                         chan_reason, profile_reason, status, interval_seconds)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s)
                     RETURNING id;
                     """,
                     (
                         position["direction"], position["entry_price"], position["entry_time"],
                         position["sl_price"], position.get("peak_price"), position.get("trailing_active", False),
                         position.get("chan_reason"), position.get("profile_reason"),
+                        position.get("interval_seconds", 60),
                     ),
                 )
                 new_id = cur.fetchone()[0]
@@ -284,8 +298,11 @@ def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points):
         logger.error(f"平倉模擬單失敗: {e}")
 
 
-def get_open_paper_trade():
-    """服務啟動時呼叫：查有沒有還沒平倉的模擬單(正常情況下最多一筆)，用來回填記憶體狀態。"""
+def get_open_paper_trade(interval_seconds=60):
+    """
+    服務啟動時呼叫：查有沒有還沒平倉的模擬單(每個interval_seconds各自最多一筆)，
+    用來回填記憶體狀態。interval_seconds區分是1分K追蹤引擎還是5分K追蹤引擎在查。
+    """
     if not _enabled:
         return None
 
@@ -295,12 +312,12 @@ def get_open_paper_trade():
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
-                           chan_reason, profile_reason
+                           chan_reason, profile_reason, interval_seconds
                     FROM paper_trades
-                    WHERE status = 'open'
+                    WHERE status = 'open' AND interval_seconds = %s
                     ORDER BY entry_time DESC
                     LIMIT 1;
-                """)
+                """, (interval_seconds,))
                 row = cur.fetchone()
         finally:
             _pool.putconn(conn)
@@ -311,15 +328,15 @@ def get_open_paper_trade():
             "id": row[0], "direction": row[1], "entry_price": row[2],
             "entry_time": row[3].isoformat() if row[3] else None,
             "sl_price": row[4], "peak_price": row[5], "trailing_active": row[6],
-            "chan_reason": row[7], "profile_reason": row[8],
+            "chan_reason": row[7], "profile_reason": row[8], "interval_seconds": row[9],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")
         return None
 
 
-def get_closed_paper_trades(limit=500):
-    """撈最近N筆已平倉的模擬單，由新到舊排序，給績效統計用。"""
+def get_closed_paper_trades(limit=500, interval_seconds=60):
+    """撈最近N筆已平倉的模擬單(限定某個K線週期)，由新到舊排序，給績效統計用。"""
     if not _enabled:
         return []
 
@@ -332,11 +349,11 @@ def get_closed_paper_trades(limit=500):
                     SELECT direction, entry_price, entry_time, exit_price, exit_time,
                            exit_reason, pnl_points, chan_reason, profile_reason
                     FROM paper_trades
-                    WHERE status = 'closed'
+                    WHERE status = 'closed' AND interval_seconds = %s
                     ORDER BY exit_time DESC
                     LIMIT %s;
                     """,
-                    (limit,),
+                    (interval_seconds, limit),
                 )
                 rows = cur.fetchall()
         finally:

@@ -27,7 +27,7 @@ import logging
 from datetime import datetime, timezone
 
 from app.binance_client import binance_streamer
-from app.paper_trading import paper_trading
+from app.paper_trading import PAPER_TRADING_ENGINES
 from app import notifier as notifier_module
 from app import db
 
@@ -50,10 +50,14 @@ class HealthMonitor:
         self._alert_active = {
             "binance_connection": False,
             "trade_data_stall": False,
-            "paper_trading_stall": False,
             "notifier_thread_dead": False,
             "db_write_failure": False,
         }
+        # 模擬單心跳告警是每個週期引擎各自獨立一個key(例如paper_trading_stall_60、
+        # paper_trading_stall_300)，用迴圈動態產生，這樣新增第三個週期引擎時
+        # 不用回頭改這裡
+        for interval_seconds in PAPER_TRADING_ENGINES:
+            self._alert_active[f"paper_trading_stall_{interval_seconds}"] = False
 
         self._last_checked_at = None
 
@@ -82,7 +86,8 @@ class HealthMonitor:
 
         self._check_binance_connection(now)
         self._check_trade_data_flow(now)
-        self._check_paper_trading_heartbeat(now)
+        for interval_seconds, engine in PAPER_TRADING_ENGINES.items():
+            self._check_paper_trading_heartbeat(now, interval_seconds, engine)
         self._check_notifier_thread()
         self._check_db_write_health()
 
@@ -161,8 +166,8 @@ class HealthMonitor:
             "Binance逐筆成交資料已恢復正常更新",
         )
 
-    def _check_paper_trading_heartbeat(self, now):
-        last_tick = paper_trading.last_tick_at
+    def _check_paper_trading_heartbeat(self, now, interval_seconds, engine):
+        last_tick = engine.last_tick_at
         if last_tick is None:
             # 服務剛啟動、還沒執行過第一次tick，不算異常
             is_problem = False
@@ -171,11 +176,11 @@ class HealthMonitor:
             is_problem = stalled_seconds >= HEALTH_PAPER_STALL_THRESHOLD_SECONDS
 
         self._set_alert(
-            "paper_trading_stall",
+            f"paper_trading_stall_{interval_seconds}",
             is_problem,
-            f"模擬單追蹤引擎已經超過{HEALTH_PAPER_STALL_THRESHOLD_SECONDS}秒沒有執行檢查，"
+            f"模擬單追蹤引擎({engine.label})已經超過{HEALTH_PAPER_STALL_THRESHOLD_SECONDS}秒沒有執行檢查，"
             f"可能背景執行緒已經停止運作",
-            "模擬單追蹤引擎已恢復正常運作",
+            f"模擬單追蹤引擎({engine.label})已恢復正常運作",
         )
 
     def _check_notifier_thread(self):

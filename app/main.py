@@ -24,7 +24,7 @@ from app.binance_client import binance_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
 from app.signal_engine import compute_full_signal
 from app.notifier import notifier
-from app.paper_trading import paper_trading
+from app.paper_trading import PAPER_TRADING_ENGINES
 from app.health_monitor import health_monitor
 from app import backtest as backtest_module
 from app import db
@@ -46,7 +46,8 @@ async def startup_event():
     streamer.start()
     binance_streamer.start()
     notifier.start()
-    paper_trading.start()
+    for engine in PAPER_TRADING_ENGINES.values():
+        engine.start()  # 1分K跟5分K兩個引擎平行啟動，各自獨立追蹤
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
 
 
@@ -55,7 +56,8 @@ async def shutdown_event():
     streamer.stop()
     binance_streamer.stop()
     notifier.stop()
-    paper_trading.stop()
+    for engine in PAPER_TRADING_ENGINES.values():
+        engine.stop()
     health_monitor.stop()
 
 
@@ -132,13 +134,19 @@ async def notify_detect_chat_id():
 
 
 @app.get("/paper-trading/summary")
-async def paper_trading_summary(limit: int = 50):
+async def paper_trading_summary(limit: int = 50, interval_seconds: int = 60):
     """
     模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、最大回撤、
     目前開倉狀態、最近N筆紀錄、以及對照「達標門檻」的評估結果。
     用來在正式接軌Pepperstone MT5自動下單前，評估這套訊號邏輯值不值得真的接execution。
+
+    interval_seconds指定要看哪個K線週期的引擎(目前支援60=1分K、300=5分K，
+    兩個是平行運作、各自獨立的追蹤引擎，方便直接對照績效)。
     """
-    return paper_trading.get_summary(limit=limit)
+    engine = PAPER_TRADING_ENGINES.get(interval_seconds)
+    if engine is None:
+        return {"error": f"沒有interval_seconds={interval_seconds}的追蹤引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
+    return engine.get_summary(limit=limit)
 
 
 @app.get("/backtest/run")

@@ -389,6 +389,13 @@
 <div class="panel">
   <div class="section-title" style="margin-top:0;">模擬單績效（尚未接自動下單）</div>
 
+  <div class="controls" style="margin-bottom:12px;">
+    <select id="paperInterval">
+      <option value="60" selected>1分K追蹤</option>
+      <option value="300">5分K追蹤</option>
+    </select>
+  </div>
+
   <div id="paperOpenPosition"></div>
 
   <div id="paperReadiness"></div>
@@ -413,6 +420,10 @@
   </div>
 
   <div class="controls">
+    <select id="backtestInterval">
+      <option value="60" selected>1分K</option>
+      <option value="300">5分K</option>
+    </select>
     <select id="backtestDays">
       <option value="1">回測 1 天</option>
       <option value="2" selected>回測 2 天</option>
@@ -461,6 +472,8 @@ const els = {
   paperTradeList: document.getElementById('paperTradeList'),
   paperMaxDrawdown: document.getElementById('paperMaxDrawdown'),
   paperReadiness: document.getElementById('paperReadiness'),
+  paperInterval: document.getElementById('paperInterval'),
+  backtestInterval: document.getElementById('backtestInterval'),
   backtestDays: document.getElementById('backtestDays'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
@@ -968,7 +981,8 @@ function renderPaperTrading(data){
 
 async function fetchPaperTrading(){
   try{
-    const res = await fetch('/paper-trading/summary?limit=30');
+    const intervalSeconds = els.paperInterval.value;
+    const res = await fetch(`/paper-trading/summary?limit=30&interval_seconds=${intervalSeconds}`);
     if(!res.ok) throw new Error(`模擬單API回傳錯誤 (${res.status})`);
     const data = await res.json();
     renderPaperTrading(data);
@@ -979,17 +993,19 @@ async function fetchPaperTrading(){
 
 fetchPaperTrading();
 setInterval(fetchPaperTrading, 15000);
+els.paperInterval.addEventListener('change', fetchPaperTrading);
 
 // --- 歷史回測 ---
 
 els.backtestRunBtn.addEventListener('click', async () => {
   const days = els.backtestDays.value;
+  const intervalSeconds = els.backtestInterval.value;
   els.backtestRunBtn.disabled = true;
   els.backtestRunBtn.textContent = '回測中...';
   els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
 
   try{
-    const res = await fetch(`/backtest/run?days=${days}`);
+    const res = await fetch(`/backtest/run?days=${days}&interval_seconds=${intervalSeconds}`);
     if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
     const data = await res.json();
 

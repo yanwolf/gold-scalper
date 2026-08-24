@@ -6,11 +6,15 @@ Telegram 通知模組（純通知/觀察階段，不涉及下單）。
 「訊號」時透過Telegram Bot發送通知。避免同一個訊號重複狂發，只在「階段或
 方向有變化」時才通知。
 
+支援多週期平行檢查(目前是1分K跟5分K)：同一個背景執行緒每個週期都跑一次，
+各自獨立防重複(用字典分開追蹤每個週期的_last_notified_key)，訊息會標註
+是哪個週期觸發的，方便在Telegram上分辨。
+
 這是接軌未來MT5自動下單前的中間步驟：先驗證訊號品質，觀察一陣子確認
 判斷邏輯夠準之後，再把這裡的通知邏輯換成/追加真正的下單邏輯(EA執行)。
 
 沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID時，這個模組會靜默停用，
-不影響其他功能，設計原則跟db.py、goldapi等模組一致。
+不影響其他功能，設計原則跟db.py等模組一致。
 """
 
 import os
@@ -24,8 +28,9 @@ from app.signal_engine import compute_full_signal
 
 logger = logging.getLogger("notifier")
 
-DEFAULT_INTERVAL_SECONDS = 60  # 1分鐘K線，跟dashboard預設一致(先用短週期驗證進出場時機，
-                               # 5分鐘K線需要收集較久才夠判斷，之後穩定後可以再拉長)
+# 要檢查的K線週期清單，每個(秒數, 顯示標籤)都會在同一個背景執行緒裡依序檢查一次
+NOTIFY_INTERVALS = [(60, "1分K"), (300, "5分K")]
+
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
 
@@ -36,9 +41,9 @@ class TelegramNotifier:
     def __init__(self):
         self._thread = None
         self._stop_flag = threading.Event()
-        self._last_notified_key = None  # 記錄上次通知的(stage, direction)，避免重複發送
+        self._last_notified_key = {}   # {interval_seconds: "stage_direction"}，各週期獨立防重複
+        self._last_notified_at = {}    # {interval_seconds: ISO時間字串}
         self._muted = False  # 暫停通知開關(記憶體狀態，服務重啟會重置回False)
-        self._last_notified_at = None
 
     @property
     def is_enabled(self):
@@ -55,11 +60,14 @@ class TelegramNotifier:
 
     @property
     def status(self):
+        most_recent = max(self._last_notified_at.values(), default=None)
         return {
             "enabled": self.is_enabled,
             "muted": self._muted,
-            "last_notified_at": self._last_notified_at,
+            "last_notified_at": most_recent,
+            "last_notified_at_by_interval": dict(self._last_notified_at),
             "poll_seconds": NOTIFY_POLL_SECONDS,
+            "intervals": [label for _, label in NOTIFY_INTERVALS],
         }
 
     def set_muted(self, muted: bool):
@@ -74,7 +82,7 @@ class TelegramNotifier:
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
-        logger.info("Telegram 通知功能已啟動")
+        logger.info("Telegram 通知功能已啟動(1分K + 5分K)")
 
     def stop(self):
         self._stop_flag.set()
@@ -83,14 +91,15 @@ class TelegramNotifier:
         while not self._stop_flag.is_set():
             try:
                 if not self._muted:
-                    self._check_and_notify()
+                    for interval_seconds, label in NOTIFY_INTERVALS:
+                        self._check_and_notify(interval_seconds, label)
             except Exception as e:
                 logger.error(f"訊號檢查/通知失敗: {e}")
             self._stop_flag.wait(NOTIFY_POLL_SECONDS)
 
-    def _check_and_notify(self):
+    def _check_and_notify(self, interval_seconds, label):
         result = compute_full_signal(
-            interval_seconds=DEFAULT_INTERVAL_SECONDS,
+            interval_seconds=interval_seconds,
             bucket_size=DEFAULT_BUCKET_SIZE,
             trade_limit=DEFAULT_TRADE_LIMIT,
         )
@@ -100,21 +109,21 @@ class TelegramNotifier:
         key = f"{stage}_{direction}"
 
         # 只有階段升級成「訊號」、且跟上次通知的內容不同(階段或方向有變化)才發送，
-        # 避免同一個訊號每30秒重複狂發
-        if stage == "訊號" and key != self._last_notified_key:
-            success, _ = self._send_telegram_message(self._format_signal_message(result))
+        # 避免同一個訊號每30秒重複狂發。每個週期的防重複狀態各自獨立。
+        if stage == "訊號" and key != self._last_notified_key.get(interval_seconds):
+            success, _ = self._send_telegram_message(self._format_signal_message(result, label))
             if success:
-                self._last_notified_key = key
-                self._last_notified_at = datetime.now(timezone.utc).isoformat()
+                self._last_notified_key[interval_seconds] = key
+                self._last_notified_at[interval_seconds] = datetime.now(timezone.utc).isoformat()
         elif stage != "訊號":
-            # 訊號降級了，重置記錄，下次再升級成訊號時才會是「新的」通知
-            self._last_notified_key = None
+            # 訊號降級了，重置這個週期的記錄，下次再升級成訊號時才會是「新的」通知
+            self._last_notified_key.pop(interval_seconds, None)
 
-    def _format_signal_message(self, result):
+    def _format_signal_message(self, result, label):
         direction_label = {"bullish": "看多 ▲", "bearish": "看空 ▼"}.get(result["direction"], "")
         now_str = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
         return (
-            f"🟡 黃金訊號：{direction_label}\n"
+            f"🟡 黃金訊號【{label}】：{direction_label}\n"
             f"時間：{now_str}\n"
             f"現價：{result['current_price']:.2f}\n\n"
             f"纏論：{result['chan']['reason']}\n"
@@ -146,7 +155,7 @@ class TelegramNotifier:
     def send_raw_message(self, text):
         """
         給其他模組(例如health_monitor.py)重用同一個Telegram連線發送任意文字用，
-        不會動到訊號通知自己的防重複狀態(_last_notified_key)，兩者完全獨立。
+        不會動到訊號通知自己的防重複狀態，兩者完全獨立。
         """
         return self._send_telegram_message(text)
 
