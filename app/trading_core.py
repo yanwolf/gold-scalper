@@ -16,6 +16,8 @@ def open_position(direction, current_price, entry_time, sl_points, chan_reason=N
     """
     開一筆新倉位。sl_points是初始保護停損的距離(多單=進場價-sl_points，空單反向)。
     peak_price一開始等於進場價，trailing_active一開始是False(移動停損尚未啟動)。
+    pending_reversal_direction/count是給訊號反轉「連續確認」機制用的狀態，
+    一開始都是空的(還沒看過任何反向訊號)。
     """
     sl_price = current_price - sl_points if direction == "bullish" else current_price + sl_points
     return {
@@ -27,6 +29,8 @@ def open_position(direction, current_price, entry_time, sl_points, chan_reason=N
         "trailing_active": False,
         "chan_reason": chan_reason,
         "profile_reason": profile_reason,
+        "pending_reversal_direction": None,
+        "pending_reversal_count": 0,
     }
 
 
@@ -73,9 +77,19 @@ def update_trailing_stop(position, current_price, trail_trigger_points, trail_di
     return changed
 
 
-def check_exit(position, current_price, signal_stage, signal_direction):
+def check_exit(position, current_price, signal_stage, signal_direction, reversal_confirm_count=2):
     """
-    出場規則：觸及停損(初始或移動後) 或 訊號反轉，先到先出。
+    出場規則：觸及停損(初始或移動後，價格觸發，不需要確認、立刻出場)
+    或 訊號反轉(需要連續reversal_confirm_count次檢查都看到同一個反向訊號才算數，
+    避免訊號瞬間閃爍一次就把倉位洗出場)，先到先出。
+
+    「連續確認」用position裡的pending_reversal_direction/pending_reversal_count
+    追蹤跨檢查週期的狀態：
+    - 看到反向訊號且跟上次記錄的方向一樣 -> 計數+1，達標才真的出場
+    - 看到反向訊號但跟上次記錄的方向不同(訊號又換了方向) -> 重新從1開始算
+    - 沒看到反向訊號(訊號消失、變中性、或轉回同方向) -> 計數歸零，反轉訊號streak中斷
+
+    這個函式會直接修改傳入的position字典(維護pending_reversal狀態)，
     回傳出場原因字串，沒觸發任何條件則回傳None。
     """
     direction = position["direction"]
@@ -87,8 +101,21 @@ def check_exit(position, current_price, signal_stage, signal_direction):
         if current_price >= position["sl_price"]:
             return "觸及移動停損" if position["trailing_active"] else "觸及停損"
 
-    if signal_stage == "訊號" and signal_direction and signal_direction != direction:
-        return "訊號反轉"
+    is_opposite_signal = signal_stage == "訊號" and signal_direction and signal_direction != direction
+
+    if is_opposite_signal:
+        if position.get("pending_reversal_direction") == signal_direction:
+            position["pending_reversal_count"] = position.get("pending_reversal_count", 0) + 1
+        else:
+            position["pending_reversal_direction"] = signal_direction
+            position["pending_reversal_count"] = 1
+
+        if position["pending_reversal_count"] >= reversal_confirm_count:
+            return "訊號反轉"
+    else:
+        # 反向訊號streak中斷(訊號消失、變中性、或轉回原方向)，重新歸零
+        position["pending_reversal_direction"] = None
+        position["pending_reversal_count"] = 0
 
     return None
 

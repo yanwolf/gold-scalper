@@ -35,9 +35,11 @@ MAX_KLINES_PER_REQUEST = 1500
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
-DEFAULT_SL_POINTS = 3.0
-DEFAULT_TRAIL_TRIGGER_POINTS = 3.0
-DEFAULT_TRAIL_DISTANCE_POINTS = 3.0
+# 跟paper_trading.py保持一致的預設值(拉寬過的版本，原因見README修正記錄)
+DEFAULT_SL_POINTS = 5.0
+DEFAULT_TRAIL_TRIGGER_POINTS = 6.0
+DEFAULT_TRAIL_DISTANCE_POINTS = 5.0
+DEFAULT_REVERSAL_CONFIRM_COUNT = 2
 
 MAX_BACKTEST_DAYS = 7  # 天數上限，避免單次回測跑太久(纏論分析在大量K棒上會變慢)
 TARGET_STEP_COUNT = 1200  # 重播步數的目標上限，天數越長會自動拉大取樣間隔(stride)來控制在這附近
@@ -115,6 +117,7 @@ def run_backtest(
     sl_points=DEFAULT_SL_POINTS,
     trail_trigger_points=DEFAULT_TRAIL_TRIGGER_POINTS,
     trail_distance_points=DEFAULT_TRAIL_DISTANCE_POINTS,
+    reversal_confirm_count=DEFAULT_REVERSAL_CONFIRM_COUNT,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -168,7 +171,10 @@ def run_backtest(
 
         if position:
             trading_core.update_trailing_stop(position, current_price, trail_trigger_points, trail_distance_points)
-            exit_reason = trading_core.check_exit(position, current_price, result["stage"], result["direction"])
+            exit_reason = trading_core.check_exit(
+                position, current_price, result["stage"], result["direction"],
+                reversal_confirm_count=reversal_confirm_count,
+            )
             if exit_reason:
                 exit_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
                 closed = trading_core.close_position(position, current_price, exit_reason, exit_time_iso)
@@ -202,4 +208,5 @@ def run_backtest(
         "sl_points": sl_points,
         "trail_trigger_points": trail_trigger_points,
         "trail_distance_points": trail_distance_points,
+        "reversal_confirm_count": reversal_confirm_count,
     }

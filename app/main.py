@@ -147,9 +147,10 @@ async def backtest_run(
     interval_seconds: int = 60,
     bucket_size: float = 1.0,
     trade_limit: int = 3000,
-    sl_points: float = 3.0,
-    trail_trigger_points: float = 3.0,
-    trail_distance_points: float = 3.0,
+    sl_points: float = 5.0,
+    trail_trigger_points: float = 6.0,
+    trail_distance_points: float = 5.0,
+    reversal_confirm_count: int = 2,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -172,6 +173,7 @@ async def backtest_run(
         sl_points=sl_points,
         trail_trigger_points=trail_trigger_points,
         trail_distance_points=trail_distance_points,
+        reversal_confirm_count=reversal_confirm_count,
     )
 
 

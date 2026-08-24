@@ -25,9 +25,14 @@ from app.trading_stats import compute_stats, assess_readiness
 logger = logging.getLogger("paper_trading")
 
 PAPER_POLL_SECONDS = int(os.getenv("PAPER_POLL_SECONDS", "15"))
-PAPER_SL_POINTS = float(os.getenv("PAPER_SL_POINTS", "3.0"))
-PAPER_TRAIL_TRIGGER_POINTS = float(os.getenv("PAPER_TRAIL_TRIGGER_POINTS", "3.0"))
-PAPER_TRAIL_DISTANCE_POINTS = float(os.getenv("PAPER_TRAIL_DISTANCE_POINTS", "3.0"))
+# 停損/移動停損預設值拉寬(原本3點對黃金的日內雜訊來說太緊，正常波動就會誤觸發，
+# 詳見README修正記錄)。這幾個數字之後如果想換成ATR動態版本，只要在這裡替換
+# 成算出來的動態值即可，不用動其他地方的邏輯。
+PAPER_SL_POINTS = float(os.getenv("PAPER_SL_POINTS", "5.0"))
+PAPER_TRAIL_TRIGGER_POINTS = float(os.getenv("PAPER_TRAIL_TRIGGER_POINTS", "6.0"))
+PAPER_TRAIL_DISTANCE_POINTS = float(os.getenv("PAPER_TRAIL_DISTANCE_POINTS", "5.0"))
+# 訊號反轉需要連續看到幾次才真的出場(避免訊號瞬間閃爍一次就洗出場)
+PAPER_REVERSAL_CONFIRM_COUNT = int(os.getenv("PAPER_REVERSAL_CONFIRM_COUNT", "2"))
 
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
@@ -98,7 +103,10 @@ class PaperTradingEngine:
                     position.get("id"), position["sl_price"], position["peak_price"], position["trailing_active"]
                 )
 
-            exit_reason = trading_core.check_exit(position, current_price, result["stage"], result["direction"])
+            exit_reason = trading_core.check_exit(
+                position, current_price, result["stage"], result["direction"],
+                reversal_confirm_count=PAPER_REVERSAL_CONFIRM_COUNT,
+            )
             if exit_reason:
                 self._close_position(position, current_price, exit_reason)
                 position = None
