@@ -17,6 +17,7 @@ import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.oanda_client import streamer
 from app.binance_client import binance_streamer
@@ -46,6 +47,20 @@ async def shutdown_event():
     streamer.stop()
     binance_streamer.stop()
     goldapi_streamer.stop()
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    分價量表視覺化頁面。直接跟API同源(same-origin)提供，避免瀏覽器/App沙盒
+    環境擋掉跨網域fetch的問題(手機瀏覽器對第三方頁面打外部API常常會被擋)。
+    """
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "dashboard.html"))
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/dashboard")
 
 
 @app.get("/health")

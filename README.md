@@ -101,3 +101,12 @@ Binance 近期把 WebSocket 資料流拆成 `/public`、`/market`、`/private` �
 `binance_client.py` 已經修正為兩條獨立連線分別接 `/public` 和 `/market`。
 
 `/health` 的 `binance_stream` 現在多了 `public_connected` 和 `market_connected` 兩個欄位，方便未來若又有類似問題時快速定位是哪條路由出狀況。`trade_count` 應該會隨時間持續增加，如果部署後過一段時間還是0，先檢查這兩個欄位是否都是 `true`。
+
+## 分價量表視覺化頁面
+
+新增 `GET /dashboard`（打開服務網址根目錄 `/` 也會自動跳轉過去），直接由後端同源提供，
+不用另外貼API網址，也不會遇到瀏覽器/手機App沙盒環境擋跨網域fetch的問題
+（先前用獨立HTML檔案透過Claude Artifact連線時遇到的「Load failed」就是這個原因）。
+
+頁面內容在 `app/static/dashboard.html`，深色交易終端風格，紅色=現價之上的阻力區、
+綠色=現價之下的支撐區，金色外框那一列是POC（成交量最大價位），每10秒自動刷新。
