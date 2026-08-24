@@ -90,3 +90,14 @@ GoldAPI目前還沒接進分析模組做「對齊校正」，那部分邏輯尚�
 - 分型/筆/中樞用標準教學版簡化規則實作，已用合成資料測試過能正常產出結果
 - 背馳判斷用MACD柱狀圖面積比較「同方向筆」的動能是否縮小，屬於簡化版，還沒處理盤整背馳、趨勢背馳的細分類
 - 目前只抓「三筆重疊」的基本中樞，還沒做中樞延伸/擴張的判斷邏輯
+
+## 修正記錄：Binance WebSocket 路由分流 (2026)
+
+Binance 近期把 WebSocket 資料流拆成 `/public`、`/market`、`/private` 三個路由：
+- `bookTicker`（報價）屬於 `/public`
+- `aggTrade`（逐筆成交）屬於 `/market`
+
+沒有指定路由的舊式連線只會收到 `/public` 的資料，`/market` 底下的頻道會被**靜默丟棄**（不報錯，就是收不到）。
+`binance_client.py` 已經修正為兩條獨立連線分別接 `/public` 和 `/market`。
+
+`/health` 的 `binance_stream` 現在多了 `public_connected` 和 `market_connected` 兩個欄位，方便未來若又有類似問題時快速定位是哪條路由出狀況。`trade_count` 應該會隨時間持續增加，如果部署後過一段時間還是0，先檢查這兩個欄位是否都是 `true`。

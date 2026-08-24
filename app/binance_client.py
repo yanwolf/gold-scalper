@@ -1,13 +1,15 @@
 """
 Binance Futures XAUUSDT 即時報價 + 逐筆成交 streaming 模組。
 
-架構刻意跟 oanda_client.py 對稱（同樣是背景 thread、同樣的共享狀態介面），
-方便 main.py 用同一套模式接多個資料源。
+架構刻意跟 oanda_client.py 對稱（同樣是背景 thread、同樣的共享狀態介面）。
 
-這裡用 Binance 的「combined stream」端點同時訂閱兩種資料：
-- bookTicker：最佳買賣報價（給 /price/latest 這類快速讀取用）
-- aggTrade：逐筆成交（含真實成交量），這是分價量表和K線聚合的關鍵，
-  單純 bookTicker 只有報價、沒有成交量，做不出真正的 volume profile。
+重要背景（2026年Binance WebSocket改版）：
+Binance 把 WebSocket 資料流分成 /public、/market、/private 三個路由。
+- bookTicker（最佳買賣報價）屬於 /public
+- aggTrade（逐筆成交，含真實成交量）屬於 /market
+沒有指定路由的舊式連線方式現在只會收到 /public 的資料，/market 底下的頻道
+會被靜默丟棄（不會報錯，只是收不到資料），所以這裡拆成兩條獨立連線，
+分別接 /public 和 /market，避免同一個問題再發生。
 
 都不需要 API Key，公開市場資料。
 """
@@ -22,10 +24,91 @@ from datetime import datetime, timezone
 import websocket  # pip package: websocket-client
 
 SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").lower()
-WS_URL = f"wss://fstream.binance.com/stream?streams={SYMBOL}@bookTicker/{SYMBOL}@aggTrade"
+
+PUBLIC_WS_URL = f"wss://fstream.binance.com/public/stream?streams={SYMBOL}@bookTicker"
+MARKET_WS_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@aggTrade"
 
 MAX_TICK_HISTORY = 2000
 MAX_TRADE_HISTORY = 20000  # 逐筆成交量比報價更新頻繁，保留更多筆給分析模組用
+
+
+class _SingleStreamConnection:
+    """
+    共用的單條 WebSocket 連線邏輯（斷線自動重連），
+    給 public(bookTicker) 和 market(aggTrade) 各開一個實例，互不干擾。
+    """
+
+    def __init__(self, url, on_data_callback):
+        self._url = url
+        self._on_data_callback = on_data_callback
+        self._connected = False
+        self._last_error = None
+        self._thread = None
+        self._ws_app = None
+        self._stop_flag = threading.Event()
+        self._status_lock = threading.Lock()
+
+    @property
+    def connected(self):
+        with self._status_lock:
+            return self._connected
+
+    @property
+    def last_error(self):
+        with self._status_lock:
+            return self._last_error
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_flag.clear()
+        self._thread = threading.Thread(target=self._run_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._ws_app:
+            self._ws_app.close()
+
+    def _run_forever(self):
+        while not self._stop_flag.is_set():
+            try:
+                self._connect_once()
+            except Exception as e:
+                with self._status_lock:
+                    self._connected = False
+                    self._last_error = str(e)
+            if not self._stop_flag.is_set():
+                time.sleep(5)
+
+    def _connect_once(self):
+        def on_open(ws):
+            with self._status_lock:
+                self._connected = True
+                self._last_error = None
+
+        def on_message(ws, message):
+            envelope = json.loads(message)
+            data = envelope.get("data", envelope)  # combined stream才有data包裝，保險起見兩種都處理
+            self._on_data_callback(data)
+
+        def on_error(ws, error):
+            with self._status_lock:
+                self._connected = False
+                self._last_error = str(error)
+
+        def on_close(ws, close_status_code, close_msg):
+            with self._status_lock:
+                self._connected = False
+
+        self._ws_app = websocket.WebSocketApp(
+            self._url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        self._ws_app.run_forever(ping_interval=20, ping_timeout=10)
 
 
 class BinanceGoldStreamer:
@@ -34,18 +117,18 @@ class BinanceGoldStreamer:
         self._latest_price = None
         self._tick_history = deque(maxlen=MAX_TICK_HISTORY)
         self._trade_history = deque(maxlen=MAX_TRADE_HISTORY)
-        self._connected = False
-        self._last_error = None
-        self._thread = None
-        self._ws_app = None
-        self._stop_flag = threading.Event()
+
+        self._public_conn = _SingleStreamConnection(PUBLIC_WS_URL, self._handle_book_ticker)
+        self._market_conn = _SingleStreamConnection(MARKET_WS_URL, self._handle_agg_trade)
 
     @property
     def status(self):
         with self._lock:
             return {
-                "connected": self._connected,
-                "last_error": self._last_error,
+                "connected": self._public_conn.connected and self._market_conn.connected,
+                "public_connected": self._public_conn.connected,
+                "market_connected": self._market_conn.connected,
+                "last_error": self._public_conn.last_error or self._market_conn.last_error,
                 "latest_price": self._latest_price,
                 "tick_count": len(self._tick_history),
                 "trade_count": len(self._trade_history),
@@ -64,81 +147,36 @@ class BinanceGoldStreamer:
         with self._lock:
             return list(self._trade_history)[-limit:]
 
+    def _handle_book_ticker(self, data):
+        tick = {
+            "time": data.get("E"),
+            "instrument": data.get("s", SYMBOL.upper()),
+            "bid": data.get("b"),
+            "ask": data.get("a"),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._lock:
+            self._latest_price = tick
+            self._tick_history.append(tick)
+
+    def _handle_agg_trade(self, data):
+        # aggTrade 欄位: p=成交價, q=成交量, T=成交時間(ms), m=是否為賣方主動成交(maker)
+        trade = {
+            "time": data.get("T"),
+            "price": float(data.get("p", 0)),
+            "qty": float(data.get("q", 0)),
+            "is_buyer_maker": data.get("m"),
+        }
+        with self._lock:
+            self._trade_history.append(trade)
+
     def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_flag.clear()
-        self._thread = threading.Thread(target=self._run_forever, daemon=True)
-        self._thread.start()
+        self._public_conn.start()
+        self._market_conn.start()
 
     def stop(self):
-        self._stop_flag.set()
-        if self._ws_app:
-            self._ws_app.close()
-
-    def _run_forever(self):
-        """外層迴圈：斷線自動重連，邏輯跟 OANDA streamer 保持一致。"""
-        while not self._stop_flag.is_set():
-            try:
-                self._connect_once()
-            except Exception as e:
-                with self._lock:
-                    self._connected = False
-                    self._last_error = str(e)
-            if not self._stop_flag.is_set():
-                time.sleep(5)
-
-    def _connect_once(self):
-        def on_open(ws):
-            with self._lock:
-                self._connected = True
-                self._last_error = None
-
-        def on_message(ws, message):
-            envelope = json.loads(message)
-            stream_name = envelope.get("stream", "")
-            data = envelope.get("data", {})
-
-            if stream_name.endswith("@bookTicker"):
-                tick = {
-                    "time": data.get("E"),
-                    "instrument": data.get("s", SYMBOL.upper()),
-                    "bid": data.get("b"),
-                    "ask": data.get("a"),
-                    "received_at": datetime.now(timezone.utc).isoformat(),
-                }
-                with self._lock:
-                    self._latest_price = tick
-                    self._tick_history.append(tick)
-
-            elif stream_name.endswith("@aggTrade"):
-                # aggTrade 欄位: p=成交價, q=成交量, T=成交時間(ms), m=是否為賣方主動成交(maker)
-                trade = {
-                    "time": data.get("T"),
-                    "price": float(data.get("p", 0)),
-                    "qty": float(data.get("q", 0)),
-                    "is_buyer_maker": data.get("m"),
-                }
-                with self._lock:
-                    self._trade_history.append(trade)
-
-        def on_error(ws, error):
-            with self._lock:
-                self._connected = False
-                self._last_error = str(error)
-
-        def on_close(ws, close_status_code, close_msg):
-            with self._lock:
-                self._connected = False
-
-        self._ws_app = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-        self._ws_app.run_forever(ping_interval=20, ping_timeout=10)
+        self._public_conn.stop()
+        self._market_conn.stop()
 
 
 # 單例，供 main.py 匯入使用
