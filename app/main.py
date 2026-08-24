@@ -159,29 +159,37 @@ async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 20000):
     }
 
 
+CHAN_LOOKBACK_TRADES = 20000  # 纏論固定用較大的回看範圍，確保K棒數量足夠做分型/筆/中樞判斷，
+                              # 不能被使用者在分價量表選的「近N筆」(可能只有1000~3000筆)拖累
+
+
 @app.get("/signal/latest")
-async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, trade_limit: int = 20000):
+async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, trade_limit: int = 3000):
     """
     綜合訊號：纏論(中樞突破/背馳) + 分價量表(POC/Value Area)，
     兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。
     這是未來要接給MT5 EA輪詢的endpoint，先在這裡驗證邏輯，之後格式穩定了
     可以直接給EA用WebRequest()定期打這支API。
 
-    重要：這個endpoint只呼叫一次 get_recent_trades()，chan_data和profile_data
-    都是從同一份trades快照算出來的。dashboard應該只打這一支API取得完整資料，
-    不要再分別打 /analysis/chan 和 /analysis/volume-profile，否則因為Binance
-    報價持續在動，兩次獨立呼叫抓到的「最近N筆成交」範圍會不一樣，算出來的
-    POC/中樞會對不上(這是先前版本POC不同步的真正原因)。
+    重要設計：這個endpoint只呼叫一次 get_recent_trades()(取固定的大範圍
+    CHAN_LOOKBACK_TRADES)，chan_data用完整這份資料算，profile_data則從裡面
+    切出使用者指定的trade_limit(較小範圍，符合分價量表想看「近期」熱區的需求)。
+    兩者都是同一份trades快照的子集，保證同步，不會因為分開呼叫API、
+    Binance報價持續在動而導致兩邊「最近N筆」範圍對不上。
+
+    trade_limit在這裡只影響分價量表的取樣範圍，不影響纏論；纏論一律用
+    CHAN_LOOKBACK_TRADES，避免K棒數量不足導致分型/筆/中樞判斷不出來。
     """
-    trades = binance_streamer.get_recent_trades(limit=trade_limit)
+    trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
     candles = build_candles(trades, interval_seconds=interval_seconds)
     chan_data = analyze_chan(candles)
 
-    profile = compute_volume_profile(trades, bucket_size=bucket_size)
+    profile_trades = trades[-trade_limit:] if trade_limit < len(trades) else trades
+    profile = compute_volume_profile(profile_trades, bucket_size=bucket_size)
     poc_info = poc_and_value_area(profile)
     profile_data = {
         "bucket_size": bucket_size,
-        "trade_count": len(trades),
+        "trade_count": len(profile_trades),
         "profile": profile,
         **poc_info,
     }
