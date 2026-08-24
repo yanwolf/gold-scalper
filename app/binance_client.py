@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 
 import websocket  # pip package: websocket-client
 
+from app import db
+
 SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").lower()
 
 PUBLIC_WS_URL = f"wss://fstream.binance.com/public/stream?streams={SYMBOL}@bookTicker"
@@ -30,6 +32,7 @@ MARKET_WS_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@aggTr
 
 MAX_TICK_HISTORY = 2000
 MAX_TRADE_HISTORY = 20000  # 逐筆成交量比報價更新頻繁，保留更多筆給分析模組用
+DB_FLUSH_INTERVAL_SECONDS = 20  # 多久把新累積的逐筆成交寫進資料庫一次
 
 
 class _SingleStreamConnection:
@@ -117,9 +120,14 @@ class BinanceGoldStreamer:
         self._latest_price = None
         self._tick_history = deque(maxlen=MAX_TICK_HISTORY)
         self._trade_history = deque(maxlen=MAX_TRADE_HISTORY)
+        self._unflushed_trades = []  # 累積尚未寫入資料庫的新成交，由 flush thread 定期清空
+        self._seeded_from_db = False
 
         self._public_conn = _SingleStreamConnection(PUBLIC_WS_URL, self._handle_book_ticker)
         self._market_conn = _SingleStreamConnection(MARKET_WS_URL, self._handle_agg_trade)
+
+        self._flush_thread = None
+        self._flush_stop_flag = threading.Event()
 
     @property
     def status(self):
@@ -132,6 +140,7 @@ class BinanceGoldStreamer:
                 "latest_price": self._latest_price,
                 "tick_count": len(self._tick_history),
                 "trade_count": len(self._trade_history),
+                "db_persistence_enabled": db.is_enabled(),
             }
 
     def get_latest(self):
@@ -169,14 +178,40 @@ class BinanceGoldStreamer:
         }
         with self._lock:
             self._trade_history.append(trade)
+            self._unflushed_trades.append(trade)
+
+    def _flush_loop(self):
+        """定期把累積的新成交批次寫進資料庫，不是每筆都馬上寫，減少資料庫負擔。"""
+        while not self._flush_stop_flag.is_set():
+            self._flush_stop_flag.wait(DB_FLUSH_INTERVAL_SECONDS)
+            with self._lock:
+                to_flush = self._unflushed_trades
+                self._unflushed_trades = []
+            if to_flush:
+                db.insert_trades(to_flush)
 
     def start(self):
+        # 這裡才做歷史資料回填(而不是__init__)，因為main.py會先呼叫db.init_schema()
+        # 建立好資料庫連線，才呼叫streamer.start()，順序上要確保db已經就緒
+        if not self._seeded_from_db:
+            seeded = db.load_recent_trades(limit=MAX_TRADE_HISTORY)
+            if seeded:
+                with self._lock:
+                    self._trade_history.extend(seeded)
+            self._seeded_from_db = True
+
         self._public_conn.start()
         self._market_conn.start()
+
+        if db.is_enabled() and not (self._flush_thread and self._flush_thread.is_alive()):
+            self._flush_stop_flag.clear()
+            self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+            self._flush_thread.start()
 
     def stop(self):
         self._public_conn.stop()
         self._market_conn.stop()
+        self._flush_stop_flag.set()
 
 
 # 單例，供 main.py 匯入使用

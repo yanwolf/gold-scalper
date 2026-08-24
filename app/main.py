@@ -23,6 +23,7 @@ from app.oanda_client import streamer
 from app.binance_client import binance_streamer
 from app.goldapi_client import goldapi_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
+from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
 
@@ -37,6 +38,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    db.init_schema()  # 要在 binance_streamer.start() 之前，回填歷史資料時才讀得到
     streamer.start()
     binance_streamer.start()
     goldapi_streamer.start()
@@ -71,6 +73,7 @@ async def health():
     """
     return {
         "service": "ok",
+        "database_persistence_enabled": db.is_enabled(),
         "oanda_stream": streamer.status,
         "binance_stream": binance_streamer.status,
         "goldapi_stream": goldapi_streamer.status,
