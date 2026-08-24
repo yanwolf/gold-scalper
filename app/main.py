@@ -166,20 +166,38 @@ async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, t
     兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。
     這是未來要接給MT5 EA輪詢的endpoint，先在這裡驗證邏輯，之後格式穩定了
     可以直接給EA用WebRequest()定期打這支API。
+
+    重要：這個endpoint只呼叫一次 get_recent_trades()，chan_data和profile_data
+    都是從同一份trades快照算出來的。dashboard應該只打這一支API取得完整資料，
+    不要再分別打 /analysis/chan 和 /analysis/volume-profile，否則因為Binance
+    報價持續在動，兩次獨立呼叫抓到的「最近N筆成交」範圍會不一樣，算出來的
+    POC/中樞會對不上(這是先前版本POC不同步的真正原因)。
     """
     trades = binance_streamer.get_recent_trades(limit=trade_limit)
     candles = build_candles(trades, interval_seconds=interval_seconds)
     chan_data = analyze_chan(candles)
 
     profile = compute_volume_profile(trades, bucket_size=bucket_size)
-    profile_data = poc_and_value_area(profile)
+    poc_info = poc_and_value_area(profile)
+    profile_data = {
+        "bucket_size": bucket_size,
+        "trade_count": len(trades),
+        "profile": profile,
+        **poc_info,
+    }
 
     latest_tick = binance_streamer.get_latest()
     current_price = None
     if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
         current_price = (float(latest_tick["bid"]) + float(latest_tick["ask"])) / 2
 
-    result = generate_signal(chan_data, profile_data, current_price)
+    result = generate_signal(chan_data, poc_info, current_price)
+    result["chan_detail"] = {
+        "interval_seconds": interval_seconds,
+        "source_candle_count": len(candles),
+        **chan_data,
+    }
+    result["profile_detail"] = profile_data
     return result
 
 

@@ -160,3 +160,26 @@ Dashboard 訊號面板下方新增了即時K線圖，用 TradingView 開源的 `
 
 這個圖表庫是純前端的CDN引用，不影響後端架構，如果之後CDN連線有問題(較少見)，
 可以改成把lightweight-charts的檔案下載下來放進`app/static/`一起提供。
+
+## 修正記錄：訊號面板與分價量表POC數字不同步
+
+`fetchSignal()` 原本把 `/signal/latest` 的 `trade_limit` 參數寫死成20000，
+但下方分價量表面板用的是使用者自己選的「近N筆」下拉選單(1000/3000/6000)，
+兩邊取樣範圍不同，算出來的POC/VAH/VAL自然對不上。已修正成兩處共用同一個
+`els.tradeLimit` 的值，確保訊號框跟分價量表、K線圖上疊加的水平線永遠是同一組數字。
+
+## 修正記錄：架構性修正 — 統一成單一資料快照
+
+前一版的修正(讓trade_limit參數對齊)只解決了表面症狀，實際上還會不同步：
+因為訊號框跟分價量表面板是**分開打兩支API**，Binance報價持續在跳動，
+兩次獨立呼叫`get_recent_trades()`的時間點不同，「最近N筆成交」這個窗口
+會跟著往前推移，算出來的POC自然對不上——尤其在價格快速變動時特別明顯。
+
+**根本修正**：`/signal/latest` 現在在後端只呼叫一次`get_recent_trades()`，
+`chan_detail`(完整纏論分析)和`profile_detail`(完整分價量表)都是從同一份
+trades快照算出來的，一併包在回應裡回傳。前端 `fetchAndRender()` 也跟著
+簡化成只打這一支API，分價量表、纏論分析、訊號框、K線圖上的水平線全部
+從同一份回應取資料渲染，不再各自獨立打API，架構上保證永遠同步。
+
+`/analysis/chan`、`/analysis/volume-profile` 這兩支獨立endpoint還留著
+(給之後debug或其他用途單獨查看用)，但dashboard本身已經不再使用它們。

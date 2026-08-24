@@ -495,18 +495,6 @@ function renderChan(data){
   `;
 }
 
-async function fetchChan(){
-  const interval = els.chanInterval.value;
-  try{
-    const res = await fetch(`/analysis/chan?interval_seconds=${interval}&trade_limit=20000`);
-    if(!res.ok) throw new Error(`纏論分析API回傳錯誤 (${res.status})`);
-    const data = await res.json();
-    renderChan(data);
-  }catch(err){
-    els.chanContent.innerHTML = `<div class="error">載入失敗：${err.message}</div>`;
-  }
-}
-
 function renderSignal(data){
   const stage = data.stage || '中性';
   const direction = data.direction; // 'bullish' | 'bearish' | null
@@ -542,52 +530,45 @@ function renderSignal(data){
   els.signalReasons.innerHTML = parts.join('');
 }
 
-async function fetchSignal(){
-  const interval = els.chanInterval.value;
-  const bucketSize = els.bucketSize.value;
-  try{
-    const res = await fetch(`/signal/latest?interval_seconds=${interval}&bucket_size=${bucketSize}&trade_limit=20000`);
-    if(!res.ok) throw new Error(`訊號API回傳錯誤 (${res.status})`);
-    const data = await res.json();
-    renderSignal(data);
-  }catch(err){
-    els.signalStage.textContent = '載入失敗';
-    els.signalDir.textContent = '';
-    els.signalReasons.innerHTML = `<div class="signal-reason">${err.message}</div>`;
-  }
-}
-
+/*
+ * 核心設計：整頁只打一次 /signal/latest，分價量表、纏論分析、訊號框、
+ * K線圖上的水平線，全部從這一份回應裡取資料渲染。
+ *
+ * 原因：Binance報價持續在動，如果分開打多支API(各自的/analysis/chan、
+ * /analysis/volume-profile...)，每支API各自呼叫 get_recent_trades()時
+ * 抓到的「最近N筆成交」範圍會因為呼叫時間點不同而不一樣，算出來的
+ * POC/中樞就會對不上——這正是先前版本各面板數字不同步的根本原因。
+ * /signal/latest後端只呼叫一次 get_recent_trades()，chan_detail和
+ * profile_detail都是從同一份快照算出來的，前端只要用這一份資料就能
+ * 保證所有面板永遠同步。
+ */
 async function fetchAndRender(){
+  const interval = els.chanInterval.value;
   const bucketSize = els.bucketSize.value;
   const tradeLimit = els.tradeLimit.value;
 
   try{
-    // 相對路徑，因為這個頁面現在跟API是同一個服務、同一個網域，不用再貼網址
-    const [profileRes, priceRes] = await Promise.all([
-      fetch(`/analysis/volume-profile?bucket_size=${bucketSize}&trade_limit=${tradeLimit}`),
-      fetch(`/price/latest/binance`),
-    ]);
+    const res = await fetch(`/signal/latest?interval_seconds=${interval}&bucket_size=${bucketSize}&trade_limit=${tradeLimit}`);
+    if(!res.ok) throw new Error(`訊號API回傳錯誤 (${res.status})`);
+    const data = await res.json();
 
-    if(!profileRes.ok) throw new Error(`分價量表API回傳錯誤 (${profileRes.status})`);
-    const profileData = await profileRes.json();
-
-    let currentPrice = null;
-    if(priceRes.ok){
-      const priceData = await priceRes.json();
-      if(priceData && priceData.bid && priceData.ask){
-        currentPrice = (parseFloat(priceData.bid) + parseFloat(priceData.ask)) / 2;
-        els.currentPrice.textContent = currentPrice.toFixed(2);
-      }
+    const currentPrice = data.current_price;
+    if(currentPrice != null){
+      els.currentPrice.textContent = currentPrice.toFixed(2);
     }
 
-    renderProfile(profileData, currentPrice);
-    await fetchChan();
-    await fetchSignal();
-    await fetchCandles(profileData, currentPrice);
+    renderProfile(data.profile_detail, currentPrice);
+    renderChan(data.chan_detail);
+    renderSignal(data);
+    await fetchCandles(data.profile_detail, currentPrice);
+
     setLive(true);
     setStatus(`上次更新：${new Date().toLocaleTimeString('zh-TW')}`);
   }catch(err){
     renderError(`載入失敗：${err.message}`);
+    els.signalStage.textContent = '載入失敗';
+    els.signalDir.textContent = '';
+    els.signalReasons.innerHTML = `<div class="signal-reason">${err.message}</div>`;
     setStatus('載入失敗，請確認後端服務是否正常運作', true);
   }
 }
@@ -600,7 +581,7 @@ function startPolling(){
 
 els.bucketSize.addEventListener('change', fetchAndRender);
 els.tradeLimit.addEventListener('change', fetchAndRender);
-els.chanInterval.addEventListener('change', () => { fetchChan(); fetchSignal(); fetchCandles(); });
+els.chanInterval.addEventListener('change', fetchAndRender);
 
 startPolling();
 </script>
