@@ -181,6 +181,47 @@
     width: 100%; height: 320px; border-radius: 8px; overflow: hidden;
   }
 
+  .notify-status-row{
+    display:flex; align-items:center; gap: 8px; font-size: 13px;
+  }
+  .notify-dot{
+    width:8px; height:8px; border-radius:50%; background: var(--muted); display:inline-block;
+  }
+  .notify-dot.on{ background: var(--support); box-shadow: 0 0 6px var(--support); }
+  .notify-dot.off{ background: var(--resistance); box-shadow: 0 0 6px var(--resistance); }
+  .notify-dot.muted{ background: var(--gold); box-shadow: 0 0 6px var(--gold); }
+
+  .btn-secondary{
+    background: var(--panel); border: 1px solid var(--grid); color: var(--text);
+    padding: 8px 12px; border-radius: 6px; font-size: 12.5px; cursor: pointer;
+  }
+  .btn-secondary:active{ transform: scale(0.97); }
+  .btn-secondary.active-mute{ border-color: var(--gold); color: var(--gold); }
+
+  .notify-result{
+    margin-top: 10px; font-size: 12.5px; padding: 0 2px;
+  }
+  .notify-result.success{ color: var(--support); }
+  .notify-result.error{ color: var(--resistance); }
+
+  .notify-chat-list{ display:flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+  .notify-chat-item{
+    display:flex; justify-content: space-between; align-items:center;
+    background: #131a2a; border-radius: 6px; padding: 8px 10px; font-size: 12px;
+  }
+  .notify-chat-item .chat-info{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .notify-chat-item .chat-name{ color: var(--text); font-weight: 700; }
+  .notify-chat-item .chat-text{ color: var(--muted); margin-left: 6px; }
+  .notify-chat-item button{
+    background: var(--gold); color: #1a1200; border: none; border-radius: 4px;
+    padding: 4px 8px; font-size: 11px; font-weight: 700; cursor: pointer; white-space: nowrap;
+    margin-left: 8px;
+  }
+
+  .notify-help{
+    margin-top: 14px; font-size: 11.5px; color: var(--muted); line-height: 1.6;
+  }
+
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
 </style>
 </head>
@@ -268,6 +309,31 @@
   </div>
 </div>
 
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">Telegram 通知設定</div>
+
+  <div class="notify-status-row">
+    <span class="notify-dot" id="notifyDot"></span>
+    <span id="notifyStatusText">檢查中...</span>
+  </div>
+
+  <div class="controls" style="margin-top:12px;">
+    <button id="notifyTestBtn" class="btn-secondary">傳送測試通知</button>
+    <button id="notifyMuteBtn" class="btn-secondary">暫停通知</button>
+    <button id="notifyDetectBtn" class="btn-secondary">尋找我的 Chat ID</button>
+  </div>
+
+  <div id="notifyResult" class="notify-result"></div>
+  <div id="notifyChatList" class="notify-chat-list"></div>
+
+  <div class="notify-help">
+    還沒設定過？到 Telegram 搜尋 <b>@BotFather</b> 建立bot拿Token，跟bot說一句話後按上面
+    「尋找我的 Chat ID」，把Token和Chat ID填進Zeabur的環境變數
+    <span class="mono">TELEGRAM_BOT_TOKEN</span> / <span class="mono">TELEGRAM_CHAT_ID</span>
+    即可(改完環境變數需要重新部署才會生效)。
+  </div>
+</div>
+
 <footer id="statusLine">尚未連線</footer>
 
 <script>
@@ -288,6 +354,13 @@ const els = {
   signalStage: document.getElementById('signalStage'),
   signalDir: document.getElementById('signalDir'),
   signalReasons: document.getElementById('signalReasons'),
+  notifyDot: document.getElementById('notifyDot'),
+  notifyStatusText: document.getElementById('notifyStatusText'),
+  notifyTestBtn: document.getElementById('notifyTestBtn'),
+  notifyMuteBtn: document.getElementById('notifyMuteBtn'),
+  notifyDetectBtn: document.getElementById('notifyDetectBtn'),
+  notifyResult: document.getElementById('notifyResult'),
+  notifyChatList: document.getElementById('notifyChatList'),
 };
 
 // --- K線圖初始化 (lightweight-charts) ---
@@ -582,6 +655,100 @@ function startPolling(){
 els.bucketSize.addEventListener('change', fetchAndRender);
 els.tradeLimit.addEventListener('change', fetchAndRender);
 els.chanInterval.addEventListener('change', fetchAndRender);
+
+// --- Telegram 通知設定面板 ---
+
+function showNotifyResult(msg, isError){
+  els.notifyResult.textContent = msg;
+  els.notifyResult.className = `notify-result ${isError ? 'error' : 'success'}`;
+}
+
+async function refreshNotifyStatus(){
+  try{
+    const res = await fetch('/notify/status');
+    if(!res.ok) throw new Error(`狀態查詢失敗 (${res.status})`);
+    const data = await res.json();
+
+    if(!data.enabled){
+      els.notifyDot.className = 'notify-dot off';
+      els.notifyStatusText.textContent = '尚未設定 Bot Token / Chat ID';
+      els.notifyMuteBtn.style.display = 'none';
+    }else if(data.muted){
+      els.notifyDot.className = 'notify-dot muted';
+      els.notifyStatusText.textContent = '已連接，通知已暫停';
+      els.notifyMuteBtn.style.display = '';
+      els.notifyMuteBtn.textContent = '恢復通知';
+      els.notifyMuteBtn.classList.add('active-mute');
+    }else{
+      els.notifyDot.className = 'notify-dot on';
+      const lastNotified = data.last_notified_at
+        ? `，上次通知：${new Date(data.last_notified_at).toLocaleString('zh-TW')}`
+        : '，尚無通知紀錄';
+      els.notifyStatusText.textContent = `已連接，每${data.poll_seconds}秒檢查一次${lastNotified}`;
+      els.notifyMuteBtn.style.display = '';
+      els.notifyMuteBtn.textContent = '暫停通知';
+      els.notifyMuteBtn.classList.remove('active-mute');
+    }
+  }catch(err){
+    els.notifyDot.className = 'notify-dot off';
+    els.notifyStatusText.textContent = `狀態查詢失敗：${err.message}`;
+  }
+}
+
+els.notifyTestBtn.addEventListener('click', async () => {
+  els.notifyTestBtn.disabled = true;
+  showNotifyResult('傳送中...', false);
+  try{
+    const res = await fetch('/notify/test', { method: 'POST' });
+    const data = await res.json();
+    if(data.success){
+      showNotifyResult('測試通知已送出，check一下Telegram', false);
+    }else{
+      showNotifyResult(`傳送失敗：${data.error || '未知錯誤'}`, true);
+    }
+  }catch(err){
+    showNotifyResult(`傳送失敗：${err.message}`, true);
+  }
+  els.notifyTestBtn.disabled = false;
+});
+
+els.notifyMuteBtn.addEventListener('click', async () => {
+  const currentlyMuted = els.notifyMuteBtn.classList.contains('active-mute');
+  const nextMuted = !currentlyMuted;
+  try{
+    await fetch(`/notify/toggle?muted=${nextMuted}`, { method: 'POST' });
+    await refreshNotifyStatus();
+  }catch(err){
+    showNotifyResult(`切換失敗：${err.message}`, true);
+  }
+});
+
+els.notifyDetectBtn.addEventListener('click', async () => {
+  els.notifyDetectBtn.disabled = true;
+  els.notifyChatList.innerHTML = '<div class="empty" style="padding:10px 0;">查詢中...</div>';
+  try{
+    const res = await fetch('/notify/detect-chat-id');
+    const data = await res.json();
+    if(data.error){
+      els.notifyChatList.innerHTML = `<div class="notify-result error">${data.error}</div>`;
+    }else if(!data.chats || data.chats.length === 0){
+      els.notifyChatList.innerHTML = '<div class="empty" style="padding:10px 0;">還沒偵測到任何對話，先在Telegram跟你的bot說一句話再試一次</div>';
+    }else{
+      els.notifyChatList.innerHTML = data.chats.map(c => `
+        <div class="notify-chat-item">
+          <span class="chat-info"><span class="chat-name">${c.name}</span><span class="chat-text">${c.last_text || ''}</span></span>
+          <button onclick="navigator.clipboard.writeText('${c.chat_id}'); this.textContent='已複製'">複製 ID ${c.chat_id}</button>
+        </div>
+      `).join('');
+    }
+  }catch(err){
+    els.notifyChatList.innerHTML = `<div class="notify-result error">查詢失敗：${err.message}</div>`;
+  }
+  els.notifyDetectBtn.disabled = false;
+});
+
+refreshNotifyStatus();
+setInterval(refreshNotifyStatus, 30000);
 
 startPolling();
 </script>

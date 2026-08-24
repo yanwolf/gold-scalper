@@ -23,6 +23,7 @@ from app.oanda_client import streamer
 from app.binance_client import binance_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
 from app.signal import generate_signal
+from app.notifier import notifier
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -41,12 +42,14 @@ async def startup_event():
     db.init_schema()  # 要在 binance_streamer.start() 之前，回填歷史資料時才讀得到
     streamer.start()
     binance_streamer.start()
+    notifier.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     streamer.stop()
     binance_streamer.stop()
+    notifier.stop()
 
 
 @app.get("/dashboard")
@@ -72,9 +75,42 @@ async def health():
     return {
         "service": "ok",
         "database_persistence_enabled": db.is_enabled(),
+        "telegram_notifier_enabled": notifier.is_enabled,
         "oanda_stream": streamer.status,
         "binance_stream": binance_streamer.status,
     }
+
+
+# ---------------------------------------------------------------------------
+# Telegram 通知設定 endpoint：給dashboard的通知設定面板用
+# ---------------------------------------------------------------------------
+
+@app.get("/notify/status")
+async def notify_status():
+    return notifier.status
+
+
+@app.post("/notify/test")
+async def notify_test():
+    """從dashboard按「傳送測試通知」時打這支，回傳是否成功、失敗原因是什麼。"""
+    success, error = notifier.send_test_message()
+    return {"success": success, "error": error}
+
+
+@app.post("/notify/toggle")
+async def notify_toggle(muted: bool):
+    """暫停/恢復通知。這是記憶體狀態，服務重啟會重置回「未暫停」，不是永久設定。"""
+    notifier.set_muted(muted)
+    return notifier.status
+
+
+@app.get("/notify/detect-chat-id")
+async def notify_detect_chat_id():
+    """
+    列出最近有跟這個bot說過話的對話，方便使用者在dashboard上直接找到自己的chat_id，
+    不用手動組Telegram API網址去看JSON。只需要TELEGRAM_BOT_TOKEN就能用。
+    """
+    return notifier.detect_recent_chats()
 
 
 @app.get("/price/latest")

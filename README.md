@@ -194,3 +194,50 @@ trades快照算出來的，一併包在回應裡回傳。前端 `fetchAndRender(
 但纏論固定用較大的回看範圍 `CHAN_LOOKBACK_TRADES`(20000筆)，分價量表則從這份
 資料裡再切出使用者指定的 `trade_limit`(較小範圍，符合「看近期熱區」的設計本意)。
 兩者是同一份快照的不同切片，既同步、又各自有適合的資料量。
+
+## Telegram 訊號通知（純通知/觀察階段）
+
+`app/notifier.py` 背景每30秒(可用`NOTIFY_POLL_SECONDS`調整)直接在後端計算一次訊號
+(重用analysis/signal的邏輯，不透過HTTP)，當階段變成「訊號」時透過Telegram Bot
+發送通知到手機。**目前只通知，不會自動下單**，這是接軌未來Pepperstone MT5自動執行前
+的觀察階段，先驗證訊號品質。
+
+**設定步驟(手機可完成)：**
+1. Telegram搜尋 `@BotFather`，傳送 `/newbot`，照指示取得一組 **Bot Token**
+2. 跟你剛建立的bot隨便傳一句話(觸發對話)
+3. 瀏覽器打開 `https://api.telegram.org/bot<你的TOKEN>/getUpdates`，
+   從回傳JSON裡的 `message.chat.id` 找到你的 **Chat ID**
+4. 在Zeabur環境變數新增：
+   ```
+   TELEGRAM_BOT_TOKEN=你的bot token
+   TELEGRAM_CHAT_ID=你的chat id
+   ```
+5. 重新部署後打 `/health`，確認 `telegram_notifier_enabled` 是 `true`
+
+**防重複通知邏輯：** 只有訊號「新升級成訊號階段」或「訊號方向反轉」時才會發送，
+同一個訊號不會每30秒重複騷擾。已用模擬情境測試過這個邏輯。
+
+**未來要接真正下單時的路徑：** 這個模組目前只做`_send_telegram_message()`，
+之後正式接Pepperstone MT5執行時，可以在同樣的判斷點(訊號升級/反轉時)，
+改成呼叫真正的下單邏輯(或是維持通知，另外讓MT5 EA自己輪詢`/signal/latest`
+做下單判斷，兩者可以並存)。
+
+## Dashboard 新增：Telegram 通知設定面板
+
+不用再手動打Telegram API網址查JSON，dashboard最下方新增了「Telegram 通知設定」面板：
+
+- **連線狀態燈號**：綠色=已連接且運作中、金色=已連接但暫停中、紅色=尚未設定Token/Chat ID
+- **傳送測試通知**：立刻打一則測試訊息到你的Telegram，確認設定是否正確
+- **暫停/恢復通知**：不用重新部署就能暫停(這是記憶體狀態，服務重啟會重置回「未暫停」)
+- **尋找我的 Chat ID**：呼叫Telegram的`getUpdates`，列出最近跟你的bot說過話的對話，
+  按一下就能複製對應的Chat ID，不用自己組網址、找JSON欄位
+
+**新增的API endpoint**(`app/notifier.py` + `main.py`)：
+- `GET /notify/status` — 連線/暫停狀態、上次通知時間
+- `POST /notify/test` — 傳送測試通知
+- `POST /notify/toggle?muted=true|false` — 暫停/恢復
+- `GET /notify/detect-chat-id` — 列出最近的對話，找Chat ID用
+
+流程還是一樣：Token/Chat ID本身要透過Zeabur環境變數設定(`TELEGRAM_BOT_TOKEN`、
+`TELEGRAM_CHAT_ID`)，dashboard面板負責「找到正確的Chat ID」和「驗證設定有沒有生效」，
+不會把Bot Token直接暴露在前端頁面上(安全考量，Token只存在後端環境變數)。
