@@ -21,7 +21,6 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from app.oanda_client import streamer
 from app.binance_client import binance_streamer
-from app.goldapi_client import goldapi_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
 from app import db
 
@@ -41,14 +40,12 @@ async def startup_event():
     db.init_schema()  # 要在 binance_streamer.start() 之前，回填歷史資料時才讀得到
     streamer.start()
     binance_streamer.start()
-    goldapi_streamer.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     streamer.stop()
     binance_streamer.stop()
-    goldapi_streamer.stop()
 
 
 @app.get("/dashboard")
@@ -69,14 +66,13 @@ async def root():
 async def health():
     """
     Zeabur 或任何平台的健康檢查都可以打這個 endpoint。
-    同時回報三個資料源的連線狀態，方便快速判斷是哪一邊出問題。
+    同時回報資料源的連線狀態，方便快速判斷是哪一邊出問題。
     """
     return {
         "service": "ok",
         "database_persistence_enabled": db.is_enabled(),
         "oanda_stream": streamer.status,
         "binance_stream": binance_streamer.status,
-        "goldapi_stream": goldapi_streamer.status,
     }
 
 
@@ -108,24 +104,9 @@ async def recent_ticks_binance(limit: int = 200):
     return binance_streamer.get_recent_ticks(limit=limit)
 
 
-@app.get("/price/latest/goldapi")
-async def latest_price_goldapi():
-    """
-    低頻confirmation訊號源（GoldAPI.io，REST輪詢，非即時streaming）。
-    跟 Binance 的 tick 級資料交叉比對用，不當作極短線主要判斷依據。
-    """
-    return goldapi_streamer.get_latest() or {"message": "尚未收到任何報價，請稍後再試"}
-
-
-@app.get("/price/recent/goldapi")
-async def recent_ticks_goldapi(limit: int = 200):
-    return goldapi_streamer.get_recent_ticks(limit=limit)
-
-
 # ---------------------------------------------------------------------------
 # 分析模組 endpoint：K線 / 分價量表 / 纏論分型-筆-中樞-背馳
-# 資料源固定用 Binance 的逐筆成交（真實成交量），GoldAPI 只用來對齊校正，
-# 對齊校正邏輯本身還沒實作，先留 TODO，目前 GoldAPI 資料走 /price/latest/goldapi 單獨查看。
+# 資料源固定用 Binance 的逐筆成交（真實成交量）。
 # ---------------------------------------------------------------------------
 
 @app.get("/analysis/candles")
