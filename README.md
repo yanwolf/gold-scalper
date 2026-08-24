@@ -71,3 +71,22 @@ MT5 官方 Python 套件只能在 Windows、且跟正在執行的 MT5 終端機�
 - 分價量表、纏論中樞/背馳邏輯尚未實作，建議獨立成 `app/analysis.py`，優先以 Binance 資料開發，GoldAPI做交叉驗證。
 - Binance XAUUSDT 是衍生品合成價格，不是實體黃金或COMEX期貨本身，只作為目前的開發用資料源，不應該當作最終下單依據。
 - OANDA API憑證申請卡在需要桌機完成的設定頁面，之後有機會用電腦時再回頭補上。
+
+## 分析模組（分價量表 / 纏論）
+
+新增 `app/analysis.py`，資料源固定用 Binance 的逐筆成交(aggTrade)，因為只有這條線有真實成交量。
+`binance_client.py` 因此也從單純訂閱 bookTicker 改成 combined stream，同時訂閱 bookTicker(報價) + aggTrade(逐筆成交)。
+
+三個新 endpoint：
+
+- `GET /analysis/candles?interval_seconds=300` — K線聚合，預設5分鐘，改參數就能切其他週期(例如60=1分鐘)
+- `GET /analysis/volume-profile?bucket_size=1.0` — 分價量表，含POC(成交量最大價位)和Value Area(70%成交量區間)
+- `GET /analysis/chan?interval_seconds=300` — 纏論分析：分型 -> 筆 -> 中樞 -> 背馳判斷，預設用5分鐘K線
+
+GoldAPI目前還沒接進分析模組做「對齊校正」，那部分邏輯尚未實作，先留著只用Binance資料驗證整套分析流程能不能動起來。
+
+### 纏論邏輯的實作範圍(第一版)
+
+- 分型/筆/中樞用標準教學版簡化規則實作，已用合成資料測試過能正常產出結果
+- 背馳判斷用MACD柱狀圖面積比較「同方向筆」的動能是否縮小，屬於簡化版，還沒處理盤整背馳、趨勢背馳的細分類
+- 目前只抓「三筆重疊」的基本中樞，還沒做中樞延伸/擴張的判斷邏輯
