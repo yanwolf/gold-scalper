@@ -27,7 +27,10 @@ gold-scalper/
 │   ├── signal.py            # 訊號引擎：綜合纏論+分價量表，產出分階段多空判斷
 │   ├── signal_engine.py     # 統一的訊號計算邏輯，供API/Telegram通知/模擬單共用
 │   ├── notifier.py          # Telegram通知：訊號升級時發送，含防重複邏輯
-│   ├── paper_trading.py     # 模擬單追蹤：虛擬開倉/停損停利/訊號反轉出場、績效統計
+│   ├── paper_trading.py     # 模擬單追蹤：呼叫trading_core/trading_stats，含DB持久化
+│   ├── trading_core.py      # 純交易邏輯：開倉/移動停損/出場判斷(即時+回測共用)
+│   ├── trading_stats.py     # 績效統計 + 達標門檻評估(即時+回測共用)
+│   ├── backtest.py          # 歷史回測：抓Binance歷史K線，walk-forward重播驗證策略
 │   └── static/
 │       └── dashboard.html  # 視覺化頁面，由後端同源提供
 ├── Dockerfile
@@ -309,3 +312,57 @@ Telegram通知、模擬單追蹤三邊都呼叫同一份邏輯，不會再有改
 
 Dashboard的開倉狀態卡片也更新了，會顯示「移動停損已啟動」/「尚未啟動」的狀態徽章，
 以及目前的停損價位和峰值價格。
+
+## 歷史回測 + 績效統計升級 + 達標門檻
+
+這次新增三塊互相搭配的功能，目的是不用乾等即時模擬單累積樣本，就能先評估
+這套訊號邏輯值不值得正式接軌Pepperstone MT5執行。
+
+### 架構重構：共用交易邏輯
+
+新增 `app/trading_core.py`（純函式：開倉/移動停損更新/出場判斷/平倉計算，
+不碰資料庫、不碰背景執行緒）和 `app/trading_stats.py`（績效統計 + 達標門檻評估）。
+`paper_trading.py`(即時模擬單) 和 `backtest.py`(歷史回測) 都呼叫同一套這些函式，
+保證兩邊的交易規則和統計口徑完全一致。
+
+`signal_engine.py` 也拆成 `compute_signal_from_trades()`(純計算，可餵歷史資料)
+和 `compute_full_signal()`(即時版本，包裝前者)，回測能重用完全相同的訊號判斷邏輯。
+
+### 歷史回測
+
+`app/backtest.py`：抓Binance期貨過去N天(上限7天)的1分鐘K線，因為K線本身沒有
+逐筆明細，用開高低收各帶1/4成交量還原成合成成交(近似值，分價量表精細度比
+即時模式粗糙一些，但足夠抓策略大方向表現)。用walk-forward方式逐根K線重播，
+每一步只用「當下時間點為止」的資料計算訊號，避免用到未來資料(look-ahead bias)。
+
+**Endpoint：** `GET /backtest/run?days=2` (可調 interval_seconds/bucket_size/
+trade_limit/sl_points/trail_trigger_points/trail_distance_points，預設值
+跟即時模擬單一致)
+
+已用合成K線資料端到端測試過整條流程：抓資料 -> 還原成交 -> 逐步重播 -> 套用
+交易規則 -> 統計績效 -> 達標門檻評估，全部正常運作。
+
+### 績效統計加最大回撤
+
+`trading_stats.compute_stats()` 現在會算最大回撤(Max Drawdown)：把交易依時間
+排序、算累積損益曲線，抓「從歷史高點回落最多」的那一段(points)。這是評估
+「連續虧損最慘會虧多少」的關鍵風險指標，即時模擬單和回測都會顯示。
+
+### 達標門檻
+
+`trading_stats.assess_readiness()` 對照以下門檻(都可用環境變數調整)，
+四項全部通過才會判定為「已達標」：
+- 樣本數 ≥ `READINESS_MIN_TRADES`(預設30筆)
+- 勝率 ≥ `READINESS_MIN_WIN_RATE`(預設40%)
+- 獲利因子 ≥ `READINESS_MIN_PROFIT_FACTOR`(預設1.3)
+- 最大回撤 ≤ `READINESS_MAX_DRAWDOWN_POINTS`(預設30 points)
+
+這不是獲利保證，只是避免樣本數太少或績效不夠穩定就貿然接真錢。
+`/paper-trading/summary` 和 `/backtest/run` 的回應都會包含 `readiness` 欄位。
+
+### Dashboard 新增
+
+- 模擬單績效面板：新增達標門檻橫幅(綠色=已達標，列出每項門檻的通過/未通過狀態)、
+  最大回撤欄位
+- 新增「歷史回測」面板：可選回測天數(1/2/3/7天)，按「執行回測」後會顯示載入中提示，
+  完成後顯示跟模擬單一致格式的績效統計、達標門檻、交易紀錄列表

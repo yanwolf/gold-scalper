@@ -25,6 +25,7 @@ from app.analysis import build_candles, compute_volume_profile, poc_and_value_ar
 from app.signal_engine import compute_full_signal
 from app.notifier import notifier
 from app.paper_trading import paper_trading
+from app import backtest as backtest_module
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -119,11 +120,39 @@ async def notify_detect_chat_id():
 @app.get("/paper-trading/summary")
 async def paper_trading_summary(limit: int = 50):
     """
-    模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、目前開倉狀態、
-    最近N筆紀錄。用來在正式接軌Pepperstone MT5自動下單前，評估這套訊號邏輯
-    值不值得真的接execution。
+    模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、最大回撤、
+    目前開倉狀態、最近N筆紀錄、以及對照「達標門檻」的評估結果。
+    用來在正式接軌Pepperstone MT5自動下單前，評估這套訊號邏輯值不值得真的接execution。
     """
     return paper_trading.get_summary(limit=limit)
+
+
+@app.get("/backtest/run")
+async def backtest_run(
+    days: int = 2,
+    interval_seconds: int = 60,
+    bucket_size: float = 1.0,
+    trade_limit: int = 3000,
+    sl_points: float = 3.0,
+    trail_trigger_points: float = 3.0,
+    trail_distance_points: float = 3.0,
+):
+    """
+    歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
+    訊號邏輯和交易規則，快速驗證策略表現，不用乾等即時模擬單累積樣本數。
+
+    這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)，
+    一般2-3天大概數十秒內會有結果。
+    """
+    return backtest_module.run_backtest(
+        days=days,
+        interval_seconds=interval_seconds,
+        bucket_size=bucket_size,
+        trade_limit=trade_limit,
+        sl_points=sl_points,
+        trail_trigger_points=trail_trigger_points,
+        trail_distance_points=trail_distance_points,
+    )
 
 
 @app.get("/price/latest")
