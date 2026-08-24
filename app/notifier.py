@@ -49,6 +49,11 @@ class TelegramNotifier:
         return self._muted
 
     @property
+    def is_thread_alive(self):
+        """給health_monitor.py檢查背景執行緒是否還活著用，不用直接碰內部屬性。"""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
     def status(self):
         return {
             "enabled": self.is_enabled,
@@ -136,6 +141,13 @@ class TelegramNotifier:
 
     def send_test_message(self):
         text = "✅ 測試通知：如果你收到這則訊息，代表Telegram通知設定成功了。"
+        return self._send_telegram_message(text)
+
+    def send_raw_message(self, text):
+        """
+        給其他模組(例如health_monitor.py)重用同一個Telegram連線發送任意文字用，
+        不會動到訊號通知自己的防重複狀態(_last_notified_key)，兩者完全獨立。
+        """
         return self._send_telegram_message(text)
 
     def detect_recent_chats(self):

@@ -44,6 +44,11 @@ class PaperTradingEngine:
         self._thread = None
         self._stop_flag = threading.Event()
         self._seeded_from_db = False
+        self._last_tick_at = None  # 給health_monitor.py檢查引擎是否還活著用
+
+    @property
+    def last_tick_at(self):
+        return self._last_tick_at
 
     def start(self):
         if not self._seeded_from_db:
@@ -70,6 +75,8 @@ class PaperTradingEngine:
             self._stop_flag.wait(PAPER_POLL_SECONDS)
 
     def _tick(self):
+        self._last_tick_at = datetime.now(timezone.utc)
+
         result = compute_full_signal(
             interval_seconds=DEFAULT_INTERVAL_SECONDS,
             bucket_size=DEFAULT_BUCKET_SIZE,

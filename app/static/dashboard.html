@@ -264,6 +264,14 @@
   .backtest-meta{ font-size: 11px; color: var(--muted); margin-bottom: 10px; }
   .loading-spinner{ color: var(--muted); font-size: 12.5px; padding: 10px 0; }
 
+  .health-alert-banner{
+    background: var(--resistance-dim); border: 1px solid var(--resistance);
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px;
+  }
+  .health-alert-banner .title{ font-weight: 700; color: var(--resistance); margin-bottom: 4px; }
+  .health-alert-banner ul{ margin: 0; padding-left: 18px; }
+  .health-alert-banner li{ margin-bottom: 2px; }
+
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
 </style>
 </head>
@@ -282,6 +290,8 @@
     <div class="lbl">最新報價</div>
   </div>
 </header>
+
+<div id="healthAlertBanner"></div>
 
 <div class="signal-panel stage-neutral" id="signalPanel">
   <div class="signal-stage-label">綜合訊號</div>
@@ -442,6 +452,7 @@ const els = {
   notifyDetectBtn: document.getElementById('notifyDetectBtn'),
   notifyResult: document.getElementById('notifyResult'),
   notifyChatList: document.getElementById('notifyChatList'),
+  healthAlertBanner: document.getElementById('healthAlertBanner'),
   paperOpenPosition: document.getElementById('paperOpenPosition'),
   paperTotal: document.getElementById('paperTotal'),
   paperWinRate: document.getElementById('paperWinRate'),
@@ -841,6 +852,44 @@ els.notifyDetectBtn.addEventListener('click', async () => {
 
 refreshNotifyStatus();
 setInterval(refreshNotifyStatus, 30000);
+
+// --- 系統健康告警橫幅 ---
+
+const HEALTH_ALERT_LABELS = {
+  binance_connection: 'Binance資料源已斷線',
+  trade_data_stall: 'Binance成交資料已停滯',
+  paper_trading_stall: '模擬單追蹤引擎心跳異常',
+  notifier_thread_dead: 'Telegram通知執行緒異常',
+  db_write_failure: '資料庫寫入失敗',
+};
+
+async function fetchHealthMonitor(){
+  try{
+    const res = await fetch('/health/monitor');
+    if(!res.ok) throw new Error(`健康監控API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    const activeKeys = Object.keys(data.active_alerts || {});
+
+    if(activeKeys.length === 0){
+      els.healthAlertBanner.innerHTML = '';
+      return;
+    }
+
+    const itemsHtml = activeKeys.map(k => `<li>${HEALTH_ALERT_LABELS[k] || k}</li>`).join('');
+    els.healthAlertBanner.innerHTML = `
+      <div class="health-alert-banner">
+        <div class="title">⚠️ 系統健康異常</div>
+        <ul>${itemsHtml}</ul>
+      </div>
+    `;
+  }catch(err){
+    // 健康監控本身查詢失敗不用太顯眼地打擾使用者，安靜跳過即可，下個週期再試
+    console.error('健康監控查詢失敗', err);
+  }
+}
+
+fetchHealthMonitor();
+setInterval(fetchHealthMonitor, 30000);
 
 // --- 模擬單績效面板 ---
 

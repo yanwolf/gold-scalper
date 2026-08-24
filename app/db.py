@@ -14,15 +14,23 @@ PostgreSQL 持久化模組。
 
 import os
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger("db")
 
 _pool = None
 _enabled = False
+_last_write_ok_at = None    # 給health_monitor.py檢查資料庫寫入是否還正常用
+_last_write_error = None
 
 
 def is_enabled():
     return _enabled
+
+
+def get_write_health():
+    """回傳最近一次寫入成功的時間、以及最近一次錯誤訊息(如果有的話)，給health_monitor.py用。"""
+    return {"last_write_ok_at": _last_write_ok_at, "last_write_error": _last_write_error}
 
 
 def init_schema():
@@ -119,7 +127,10 @@ def insert_trades(trades):
     """
     批次寫入逐筆成交。trades是 [{"time","price","qty","is_buyer_maker"}, ...]。
     寫入失敗只記錄log、不拋出例外，避免因為資料庫短暫問題影響主要的即時資料流。
+    成功/失敗都會更新 _last_write_ok_at / _last_write_error，給health_monitor.py檢查用。
     """
+    global _last_write_ok_at, _last_write_error
+
     if not _enabled or not trades:
         return
 
@@ -137,8 +148,12 @@ def insert_trades(trades):
             conn.commit()
         finally:
             _pool.putconn(conn)
+
+        _last_write_ok_at = datetime.now(timezone.utc)
+        _last_write_error = None
     except Exception as e:
         logger.error(f"寫入逐筆成交失敗: {e}")
+        _last_write_error = str(e)
 
 
 def load_recent_trades(limit=20000):

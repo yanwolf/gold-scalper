@@ -25,6 +25,7 @@ from app.analysis import build_candles, compute_volume_profile, poc_and_value_ar
 from app.signal_engine import compute_full_signal
 from app.notifier import notifier
 from app.paper_trading import paper_trading
+from app.health_monitor import health_monitor
 from app import backtest as backtest_module
 from app import db
 
@@ -46,6 +47,7 @@ async def startup_event():
     binance_streamer.start()
     notifier.start()
     paper_trading.start()
+    health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
 
 
 @app.on_event("shutdown")
@@ -54,6 +56,7 @@ async def shutdown_event():
     binance_streamer.stop()
     notifier.stop()
     paper_trading.stop()
+    health_monitor.stop()
 
 
 @app.get("/dashboard")
@@ -82,7 +85,18 @@ async def health():
         "telegram_notifier_enabled": notifier.is_enabled,
         "oanda_stream": streamer.status,
         "binance_stream": binance_streamer.status,
+        "active_health_alerts": health_monitor.get_status()["active_alerts"],
     }
+
+
+@app.get("/health/monitor")
+async def health_monitor_status():
+    """
+    背景執行緒健康監控的詳細狀態：最後檢查時間、目前有哪些告警在生效中、
+    以及每一項檢查各自的狀態。有設定Telegram的話，問題發生/恢復時會主動推播，
+    這支endpoint是給想直接查看目前狀態(不用等告警)的用途，dashboard也會顯示。
+    """
+    return health_monitor.get_status()
 
 
 # ---------------------------------------------------------------------------

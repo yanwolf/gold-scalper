@@ -31,6 +31,7 @@ gold-scalper/
 │   ├── trading_core.py      # 純交易邏輯：開倉/移動停損/出場判斷(即時+回測共用)
 │   ├── trading_stats.py     # 績效統計 + 達標門檻評估(即時+回測共用)
 │   ├── backtest.py          # 歷史回測：抓Binance歷史K線，walk-forward重播驗證策略
+│   ├── health_monitor.py    # 背景執行緒健康監控：異常時透過Telegram主動告警
 │   └── static/
 │       └── dashboard.html  # 視覺化頁面，由後端同源提供
 ├── Dockerfile
@@ -366,3 +367,35 @@ trade_limit/sl_points/trail_trigger_points/trail_distance_points，預設值
   最大回撤欄位
 - 新增「歷史回測」面板：可選回測天數(1/2/3/7天)，按「執行回測」後會顯示載入中提示，
   完成後顯示跟模擬單一致格式的績效統計、達標門檻、交易紀錄列表
+
+## 背景執行緒健康監控與告警
+
+新增 `app/health_monitor.py`，定期檢查關鍵背景元件是否正常運作，異常時透過
+Telegram主動告警（跟訊號通知共用同一個Bot，但防重複邏輯完全獨立），不用再
+自己手動查 `/health` 才會發現問題。問題恢復時也會發一則「已恢復」通知。
+
+**監控項目：**
+1. **Binance連線**：`public`/`market`兩條路由斷線超過`HEALTH_DISCONNECT_THRESHOLD_SECONDS`
+   (預設120秒) -> 告警
+2. **成交資料是否卡住**：即使顯示已連線，也可能資料實際上沒在更新(連線假死)，
+   用`trade_count`是否持續增加做二次確認，卡住超過`HEALTH_TRADE_STALL_THRESHOLD_SECONDS`
+   (預設300秒) -> 告警
+3. **模擬單追蹤引擎心跳**：太久沒執行過檢查(超過`HEALTH_PAPER_STALL_THRESHOLD_SECONDS`，
+   預設180秒) -> 可能背景執行緒掛了 -> 告警
+4. **Telegram通知執行緒**：設定了Token/ChatID卻執行緒沒有存活 -> 告警(這則告警本身
+   走獨立的Telegram發送路徑，不受影響，還是送得出去)
+5. **資料庫寫入健康度**：有接資料庫的話，最近一次寫入失敗 -> 告警
+
+**設計重點：**
+- 每種檢查都有獨立的「目前是否告警中」狀態，只在問題「剛發生」或「剛恢復」時
+  發送通知，不會每個檢查週期都重複騷擾
+- 已用模擬情境測試過所有告警的狀態轉換邏輯(發生時通知一次、持續中不重複、
+  恢復時通知一次)
+- 沒有設定Telegram也完全沒問題，狀態一樣會持續在背景檢查、記錄，只是不會主動推播，
+  可以透過 `GET /health/monitor` 隨時查看目前狀態
+
+**Endpoint：**
+- `GET /health/monitor` — 最後檢查時間、目前有哪些告警在生效中、每項檢查的完整狀態
+- `GET /health` 也新增了 `active_health_alerts` 欄位，方便一次看到全貌
+
+**Dashboard：** 最上方新增健康告警橫幅，有任何異常時會顯示紅色警示列表，正常時不顯示任何東西(不佔版面)。
