@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>黃金分價量表</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root{
     --bg: #0a0e17;
@@ -176,6 +177,10 @@
   .signal-reason.bullish .src-label{ color: var(--support); }
   .signal-reason.bearish .src-label{ color: var(--resistance); }
 
+  .candle-chart-container{
+    width: 100%; height: 320px; border-radius: 8px; overflow: hidden;
+  }
+
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
 </style>
 </head>
@@ -202,6 +207,11 @@
     <span class="dir-text" id="signalDir"></span>
   </div>
   <div class="signal-reason-grid" id="signalReasons"></div>
+</div>
+
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">K線圖（週期跟下方纏論分析共用）</div>
+  <div id="candleChart" class="candle-chart-container"></div>
 </div>
 
 <div class="controls">
@@ -279,6 +289,102 @@ const els = {
   signalDir: document.getElementById('signalDir'),
   signalReasons: document.getElementById('signalReasons'),
 };
+
+// --- K線圖初始化 (lightweight-charts) ---
+const candleChartContainer = document.getElementById('candleChart');
+const priceChart = LightweightCharts.createChart(candleChartContainer, {
+  layout: {
+    background: { color: 'transparent' },
+    textColor: '#e8ecf4',
+    fontFamily: "'JetBrains Mono', 'SF Mono', 'Courier New', monospace",
+  },
+  grid: {
+    vertLines: { color: '#1c2436' },
+    horzLines: { color: '#1c2436' },
+  },
+  timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#1c2436' },
+  rightPriceScale: { borderColor: '#1c2436' },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  height: 320,
+  width: candleChartContainer.clientWidth,
+});
+
+const candleSeries = priceChart.addCandlestickSeries({
+  upColor: '#34d399', downColor: '#e34c4c',
+  borderVisible: false,
+  wickUpColor: '#34d399', wickDownColor: '#e34c4c',
+});
+
+const volumeSeries = priceChart.addHistogramSeries({
+  priceFormat: { type: 'volume' },
+  priceScaleId: '',
+  color: '#6b769055',
+});
+volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+window.addEventListener('resize', () => {
+  priceChart.applyOptions({ width: candleChartContainer.clientWidth });
+});
+
+let activePriceLines = [];
+
+function clearPriceLines(){
+  activePriceLines.forEach(line => candleSeries.removePriceLine(line));
+  activePriceLines = [];
+}
+
+function drawPriceLines(profileData, currentPrice){
+  clearPriceLines();
+  const lineSpecs = [
+    { value: profileData.poc, color: '#d4af37', title: 'POC' },
+    { value: profileData.value_area_high, color: '#e34c4c88', title: 'VAH' },
+    { value: profileData.value_area_low, color: '#34d39988', title: 'VAL' },
+    { value: currentPrice, color: '#d4af37', title: '現價' },
+  ];
+  lineSpecs.forEach(spec => {
+    if(spec.value == null) return;
+    const line = candleSeries.createPriceLine({
+      price: spec.value,
+      color: spec.color,
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: spec.title,
+    });
+    activePriceLines.push(line);
+  });
+}
+
+async function fetchCandles(profileData, currentPrice){
+  const interval = els.chanInterval.value;
+  try{
+    const res = await fetch(`/analysis/candles?interval_seconds=${interval}&trade_limit=20000`);
+    if(!res.ok) throw new Error(`K線API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    const candles = data.candles || [];
+
+    const candleData = candles.map(c => ({
+      time: Math.floor(c.bucket_start / 1000),
+      open: c.open, high: c.high, low: c.low, close: c.close,
+    }));
+    const volumeData = candles.map(c => ({
+      time: Math.floor(c.bucket_start / 1000),
+      value: c.volume,
+      color: c.close >= c.open ? '#34d39955' : '#e34c4c55',
+    }));
+
+    candleSeries.setData(candleData);
+    volumeSeries.setData(volumeData);
+
+    if(profileData) drawPriceLines(profileData, currentPrice);
+
+    if(candleData.length > 0){
+      priceChart.timeScale().fitContent();
+    }
+  }catch(err){
+    console.error('K線圖載入失敗', err);
+  }
+}
 
 let pollTimer = null;
 
@@ -477,6 +583,7 @@ async function fetchAndRender(){
     renderProfile(profileData, currentPrice);
     await fetchChan();
     await fetchSignal();
+    await fetchCandles(profileData, currentPrice);
     setLive(true);
     setStatus(`上次更新：${new Date().toLocaleTimeString('zh-TW')}`);
   }catch(err){
@@ -493,7 +600,7 @@ function startPolling(){
 
 els.bucketSize.addEventListener('change', fetchAndRender);
 els.tradeLimit.addEventListener('change', fetchAndRender);
-els.chanInterval.addEventListener('change', () => { fetchChan(); fetchSignal(); });
+els.chanInterval.addEventListener('change', () => { fetchChan(); fetchSignal(); fetchCandles(); });
 
 startPolling();
 </script>
