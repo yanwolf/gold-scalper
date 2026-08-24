@@ -130,3 +130,21 @@ MT5 官方 Python 套件只能在 Windows、且要跟正在執行的 MT5 終端�
 沒有指定路由的舊式連線只會收到`/public`的資料，`/market`底下的頻道會被靜默丟棄(不報錯，就是
 收不到)。`binance_client.py` 已修正為兩條獨立連線分別接兩個路由，`/health` 的 `binance_stream`
 有 `public_connected` / `market_connected` 兩個欄位可以分別檢查。
+
+## 訊號引擎：綜合纏論 + 分價量表
+
+新增 `app/signal.py`，把纏論和分價量表的判斷綜合成一個分階段的多空訊號，
+不是機器學習模型，是規則式(rule-based)判斷，每條規則對應標準的纏論/Volume Profile概念，
+方便之後逐條檢視、調整權重。
+
+**判斷規則：**
+- 纏論那一側：背馳反轉(優先權較高，因為是提早示警) > 中樞突破(站上ZG看多/跌破ZD看空) > 中樞內整理(中性)
+- 分價量表那一側：站上/跌破Value Area(強訊號) > 相對POC偏移(弱訊號)
+- 綜合：兩邊方向一致+至少一邊強 -> **訊號**；兩邊方向一致但都弱，或只有單邊有方向 -> **關注**；方向衝突 -> **中性**
+
+**Endpoint：** `GET /signal/latest?interval_seconds=300&bucket_size=1.0`
+回傳 `stage`(訊號/關注/中性)、`direction`(bullish/bearish/null)，以及纏論、分價量表兩側各自的判斷理由。
+這是未來要給MT5 EA輪詢的endpoint，格式先在這裡驗證穩定，之後EA可以直接用`WebRequest()`定期打這支API。
+
+Dashboard最上方新增了訊號面板：不同階段/方向會有不同配色(訊號=強烈發光框、關注=金色、中性=素色)，
+下方列出纏論和分價量表各自的判斷理由，方便直接看懂「為什麼」給這個訊號，不是黑盒子。

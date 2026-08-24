@@ -130,6 +130,52 @@
   .bi-row .range{ color: var(--muted); }
   .bi-row .price-change{ font-weight: 700; }
 
+  .signal-panel{
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+    border: 1px solid var(--grid); position: relative; overflow: hidden;
+  }
+  .signal-panel.stage-signal.dir-bullish{
+    background: linear-gradient(135deg, #0f2318, var(--panel));
+    border-color: var(--support);
+    box-shadow: 0 0 24px var(--support-dim);
+  }
+  .signal-panel.stage-signal.dir-bearish{
+    background: linear-gradient(135deg, #2a1414, var(--panel));
+    border-color: var(--resistance);
+    box-shadow: 0 0 24px var(--resistance-dim);
+  }
+  .signal-panel.stage-watch{
+    background: linear-gradient(135deg, #1c1a0f, var(--panel));
+    border-color: var(--gold);
+  }
+  .signal-panel.stage-neutral{
+    background: var(--panel);
+  }
+  .signal-stage-label{
+    font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--muted); margin-bottom: 4px;
+  }
+  .signal-main{
+    display:flex; align-items:baseline; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .signal-main .stage-text{ font-size: 28px; font-weight: 800; }
+  .signal-main .dir-text{ font-size: 16px; font-weight: 700; }
+  .dir-bullish .dir-text{ color: var(--support); }
+  .dir-bearish .dir-text{ color: var(--resistance); }
+  .signal-reason-grid{
+    display:grid; grid-template-columns: 1fr; gap: 10px;
+  }
+  .signal-reason{
+    background: #00000030; border-radius: 8px; padding: 10px 12px; font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .signal-reason .src-label{
+    font-size: 10px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px;
+  }
+  .signal-reason.bullish .src-label{ color: var(--support); }
+  .signal-reason.bearish .src-label{ color: var(--resistance); }
+
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
 </style>
 </head>
@@ -148,6 +194,15 @@
     <div class="lbl">最新報價</div>
   </div>
 </header>
+
+<div class="signal-panel stage-neutral" id="signalPanel">
+  <div class="signal-stage-label">綜合訊號</div>
+  <div class="signal-main">
+    <span class="stage-text" id="signalStage">載入中...</span>
+    <span class="dir-text" id="signalDir"></span>
+  </div>
+  <div class="signal-reason-grid" id="signalReasons"></div>
+</div>
 
 <div class="controls">
   <select id="bucketSize">
@@ -219,6 +274,10 @@ const els = {
   statVAL: document.getElementById('statVAL'),
   statCount: document.getElementById('statCount'),
   statusLine: document.getElementById('statusLine'),
+  signalPanel: document.getElementById('signalPanel'),
+  signalStage: document.getElementById('signalStage'),
+  signalDir: document.getElementById('signalDir'),
+  signalReasons: document.getElementById('signalReasons'),
 };
 
 let pollTimer = null;
@@ -342,6 +401,56 @@ async function fetchChan(){
   }
 }
 
+function renderSignal(data){
+  const stage = data.stage || '中性';
+  const direction = data.direction; // 'bullish' | 'bearish' | null
+
+  const stageClassMap = { '訊號': 'stage-signal', '關注': 'stage-watch', '中性': 'stage-neutral' };
+  const dirClass = direction ? `dir-${direction}` : '';
+  els.signalPanel.className = `signal-panel ${stageClassMap[stage] || 'stage-neutral'} ${dirClass}`;
+
+  els.signalStage.textContent = stage;
+
+  const dirLabelMap = { bullish: '看多 ▲', bearish: '看空 ▼' };
+  els.signalDir.textContent = direction ? dirLabelMap[direction] : '';
+
+  const parts = [];
+  if(data.chan){
+    const c = data.chan;
+    parts.push(`
+      <div class="signal-reason ${c.bias}">
+        <div class="src-label">纏論</div>
+        <div>${c.reason}</div>
+      </div>
+    `);
+  }
+  if(data.profile){
+    const p = data.profile;
+    parts.push(`
+      <div class="signal-reason ${p.bias}">
+        <div class="src-label">分價量表</div>
+        <div>${p.reason}</div>
+      </div>
+    `);
+  }
+  els.signalReasons.innerHTML = parts.join('');
+}
+
+async function fetchSignal(){
+  const interval = els.chanInterval.value;
+  const bucketSize = els.bucketSize.value;
+  try{
+    const res = await fetch(`/signal/latest?interval_seconds=${interval}&bucket_size=${bucketSize}&trade_limit=20000`);
+    if(!res.ok) throw new Error(`訊號API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    renderSignal(data);
+  }catch(err){
+    els.signalStage.textContent = '載入失敗';
+    els.signalDir.textContent = '';
+    els.signalReasons.innerHTML = `<div class="signal-reason">${err.message}</div>`;
+  }
+}
+
 async function fetchAndRender(){
   const bucketSize = els.bucketSize.value;
   const tradeLimit = els.tradeLimit.value;
@@ -367,6 +476,7 @@ async function fetchAndRender(){
 
     renderProfile(profileData, currentPrice);
     await fetchChan();
+    await fetchSignal();
     setLive(true);
     setStatus(`上次更新：${new Date().toLocaleTimeString('zh-TW')}`);
   }catch(err){
@@ -383,7 +493,7 @@ function startPolling(){
 
 els.bucketSize.addEventListener('change', fetchAndRender);
 els.tradeLimit.addEventListener('change', fetchAndRender);
-els.chanInterval.addEventListener('change', fetchChan);
+els.chanInterval.addEventListener('change', () => { fetchChan(); fetchSignal(); });
 
 startPolling();
 </script>

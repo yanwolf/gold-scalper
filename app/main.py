@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from app.oanda_client import streamer
 from app.binance_client import binance_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
+from app.signal import generate_signal
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -156,6 +157,30 @@ async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 20000):
         "source_candle_count": len(candles),
         **result,
     }
+
+
+@app.get("/signal/latest")
+async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, trade_limit: int = 20000):
+    """
+    綜合訊號：纏論(中樞突破/背馳) + 分價量表(POC/Value Area)，
+    兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。
+    這是未來要接給MT5 EA輪詢的endpoint，先在這裡驗證邏輯，之後格式穩定了
+    可以直接給EA用WebRequest()定期打這支API。
+    """
+    trades = binance_streamer.get_recent_trades(limit=trade_limit)
+    candles = build_candles(trades, interval_seconds=interval_seconds)
+    chan_data = analyze_chan(candles)
+
+    profile = compute_volume_profile(trades, bucket_size=bucket_size)
+    profile_data = poc_and_value_area(profile)
+
+    latest_tick = binance_streamer.get_latest()
+    current_price = None
+    if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
+        current_price = (float(latest_tick["bid"]) + float(latest_tick["ask"])) / 2
+
+    result = generate_signal(chan_data, profile_data, current_price)
+    return result
 
 
 @app.websocket("/ws/price")
