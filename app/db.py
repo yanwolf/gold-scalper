@@ -61,12 +61,33 @@ def init_schema():
                     CREATE INDEX IF NOT EXISTS idx_gold_trades_time
                     ON gold_trades (trade_time);
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS paper_trades (
+                        id BIGSERIAL PRIMARY KEY,
+                        direction TEXT NOT NULL,
+                        entry_price DOUBLE PRECISION NOT NULL,
+                        entry_time TIMESTAMPTZ NOT NULL,
+                        sl_price DOUBLE PRECISION NOT NULL,
+                        tp_price DOUBLE PRECISION NOT NULL,
+                        chan_reason TEXT,
+                        profile_reason TEXT,
+                        status TEXT NOT NULL DEFAULT 'open',
+                        exit_price DOUBLE PRECISION,
+                        exit_time TIMESTAMPTZ,
+                        exit_reason TEXT,
+                        pnl_points DOUBLE PRECISION
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_paper_trades_status
+                    ON paper_trades (status);
+                """)
             conn.commit()
         finally:
             _pool.putconn(conn)
 
         _enabled = True
-        logger.info("資料庫連線成功，gold_trades 資料表已就緒")
+        logger.info("資料庫連線成功，gold_trades / paper_trades 資料表已就緒")
     except Exception as e:
         logger.error(f"資料庫初始化失敗，退回記憶體模式: {e}")
         _pool = None
@@ -132,4 +153,143 @@ def load_recent_trades(limit=20000):
         ]
     except Exception as e:
         logger.error(f"讀取歷史成交失敗: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 模擬單(paper trading)持久化函式
+# ---------------------------------------------------------------------------
+
+def insert_open_paper_trade(position):
+    """
+    新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
+    sl_price, tp_price, chan_reason, profile_reason。回傳新增的資料庫id，
+    沒有資料庫時回傳None(呼叫端要能接受id=None，代表這筆單只存在記憶體)。
+    """
+    if not _enabled:
+        return None
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO paper_trades
+                        (direction, entry_price, entry_time, sl_price, tp_price, chan_reason, profile_reason, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
+                    RETURNING id;
+                    """,
+                    (
+                        position["direction"], position["entry_price"], position["entry_time"],
+                        position["sl_price"], position["tp_price"],
+                        position.get("chan_reason"), position.get("profile_reason"),
+                    ),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+            return new_id
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"新增模擬單失敗: {e}")
+        return None
+
+
+def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points):
+    """把一筆開倉中的模擬單標記為已平倉。trade_id是None時(該筆單沒有db id)直接跳過。"""
+    if not _enabled or trade_id is None:
+        return
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE paper_trades
+                    SET status = 'closed', exit_price = %s, exit_time = %s,
+                        exit_reason = %s, pnl_points = %s
+                    WHERE id = %s;
+                    """,
+                    (exit_price, exit_time, exit_reason, pnl_points, trade_id),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"平倉模擬單失敗: {e}")
+
+
+def get_open_paper_trade():
+    """服務啟動時呼叫：查有沒有還沒平倉的模擬單(正常情況下最多一筆)，用來回填記憶體狀態。"""
+    if not _enabled:
+        return None
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, direction, entry_price, entry_time, sl_price, tp_price,
+                           chan_reason, profile_reason
+                    FROM paper_trades
+                    WHERE status = 'open'
+                    ORDER BY entry_time DESC
+                    LIMIT 1;
+                """)
+                row = cur.fetchone()
+        finally:
+            _pool.putconn(conn)
+
+        if not row:
+            return None
+        return {
+            "id": row[0], "direction": row[1], "entry_price": row[2],
+            "entry_time": row[3].isoformat() if row[3] else None,
+            "sl_price": row[4], "tp_price": row[5],
+            "chan_reason": row[6], "profile_reason": row[7],
+        }
+    except Exception as e:
+        logger.error(f"讀取開倉中模擬單失敗: {e}")
+        return None
+
+
+def get_closed_paper_trades(limit=500):
+    """撈最近N筆已平倉的模擬單，由新到舊排序，給績效統計用。"""
+    if not _enabled:
+        return []
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT direction, entry_price, entry_time, exit_price, exit_time,
+                           exit_reason, pnl_points, chan_reason, profile_reason
+                    FROM paper_trades
+                    WHERE status = 'closed'
+                    ORDER BY exit_time DESC
+                    LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+
+        return [
+            {
+                "direction": r[0], "entry_price": r[1],
+                "entry_time": r[2].isoformat() if r[2] else None,
+                "exit_price": r[3],
+                "exit_time": r[4].isoformat() if r[4] else None,
+                "exit_reason": r[5], "pnl_points": r[6],
+                "chan_reason": r[7], "profile_reason": r[8],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"讀取模擬單歷史失敗: {e}")
         return []

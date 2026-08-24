@@ -222,6 +222,33 @@
     margin-top: 14px; font-size: 11.5px; color: var(--muted); line-height: 1.6;
   }
 
+  .paper-position-card{
+    border-radius: 8px; padding: 12px 14px; font-size: 12.5px;
+    border: 1px solid var(--grid); display:flex; justify-content: space-between; align-items:center;
+  }
+  .paper-position-card.bullish{ border-color: var(--support); background: var(--support-dim); }
+  .paper-position-card.bearish{ border-color: var(--resistance); background: var(--resistance-dim); }
+  .paper-position-card .dir-label{ font-weight: 700; }
+  .paper-position-card.bullish .dir-label{ color: var(--support); }
+  .paper-position-card.bearish .dir-label{ color: var(--resistance); }
+  .paper-position-empty{
+    color: var(--muted); font-size: 12.5px; padding: 10px 0;
+  }
+
+  .paper-trade-row{
+    display:grid; grid-template-columns: 40px 1fr auto; align-items:center; gap: 10px;
+    padding: 7px 10px; border-radius: 6px; background: #131a2a; font-size: 11.5px;
+  }
+  .paper-trade-row .dir{
+    font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 4px; text-align:center;
+  }
+  .paper-trade-row .dir.bullish{ background: var(--support-dim); color: var(--support); }
+  .paper-trade-row .dir.bearish{ background: var(--resistance-dim); color: var(--resistance); }
+  .paper-trade-row .meta{ color: var(--muted); }
+  .paper-trade-row .pnl{ font-weight: 700; text-align: right; white-space: nowrap; }
+  .paper-trade-row .pnl.win{ color: var(--support); }
+  .paper-trade-row .pnl.loss{ color: var(--resistance); }
+
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
 </style>
 </head>
@@ -334,6 +361,22 @@
   </div>
 </div>
 
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">模擬單績效（尚未接自動下單）</div>
+
+  <div id="paperOpenPosition"></div>
+
+  <div class="stat-row" id="paperStatRow" style="margin-top:10px;">
+    <div class="stat"><div class="lbl">總筆數</div><div class="val mono" id="paperTotal">--</div></div>
+    <div class="stat"><div class="lbl">勝率</div><div class="val mono" id="paperWinRate">--</div></div>
+    <div class="stat"><div class="lbl">總損益(points)</div><div class="val mono" id="paperTotalPnl">--</div></div>
+    <div class="stat"><div class="lbl">獲利因子</div><div class="val mono" id="paperProfitFactor">--</div></div>
+  </div>
+
+  <div class="section-title" style="margin-top:16px;">最近成交紀錄</div>
+  <div id="paperTradeList" class="bi-list"></div>
+</div>
+
 <footer id="statusLine">尚未連線</footer>
 
 <script>
@@ -361,6 +404,12 @@ const els = {
   notifyDetectBtn: document.getElementById('notifyDetectBtn'),
   notifyResult: document.getElementById('notifyResult'),
   notifyChatList: document.getElementById('notifyChatList'),
+  paperOpenPosition: document.getElementById('paperOpenPosition'),
+  paperTotal: document.getElementById('paperTotal'),
+  paperWinRate: document.getElementById('paperWinRate'),
+  paperTotalPnl: document.getElementById('paperTotalPnl'),
+  paperProfitFactor: document.getElementById('paperProfitFactor'),
+  paperTradeList: document.getElementById('paperTradeList'),
 };
 
 // --- K線圖初始化 (lightweight-charts) ---
@@ -749,6 +798,63 @@ els.notifyDetectBtn.addEventListener('click', async () => {
 
 refreshNotifyStatus();
 setInterval(refreshNotifyStatus, 30000);
+
+// --- 模擬單績效面板 ---
+
+function renderPaperTrading(data){
+  if(data.open_position){
+    const p = data.open_position;
+    const dirLabel = p.direction === 'bullish' ? '看多 ▲' : '看空 ▼';
+    els.paperOpenPosition.innerHTML = `
+      <div class="paper-position-card ${p.direction}">
+        <span><span class="dir-label">開倉中 ${dirLabel}</span> @ ${p.entry_price.toFixed(2)}</span>
+        <span class="mono">SL ${p.sl_price.toFixed(2)} / TP ${p.tp_price.toFixed(2)}</span>
+      </div>
+    `;
+  }else{
+    els.paperOpenPosition.innerHTML = '<div class="paper-position-empty">目前空手，等待下一個訊號</div>';
+  }
+
+  els.paperTotal.textContent = data.total_trades ?? '--';
+  els.paperWinRate.textContent = data.total_trades ? `${data.win_rate}%` : '--';
+  els.paperTotalPnl.textContent = data.total_trades != null ? data.total_pnl_points.toFixed(2) : '--';
+  els.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
+
+  const trades = data.recent_trades || [];
+  if(trades.length === 0){
+    els.paperTradeList.innerHTML = '<div class="empty">尚無已平倉紀錄</div>';
+    return;
+  }
+
+  els.paperTradeList.innerHTML = trades.map(t => {
+    const dirLabel = t.direction === 'bullish' ? '多' : '空';
+    const isWin = t.pnl_points > 0;
+    const pnlClass = isWin ? 'win' : 'loss';
+    const pnlText = `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}`;
+    const exitTime = t.exit_time ? new Date(t.exit_time).toLocaleTimeString('zh-TW') : '';
+    return `
+      <div class="paper-trade-row">
+        <span class="dir ${t.direction}">${dirLabel}</span>
+        <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）</span>
+        <span class="pnl ${pnlClass}">${pnlText}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+async function fetchPaperTrading(){
+  try{
+    const res = await fetch('/paper-trading/summary?limit=30');
+    if(!res.ok) throw new Error(`模擬單API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    renderPaperTrading(data);
+  }catch(err){
+    els.paperTradeList.innerHTML = `<div class="error">載入失敗：${err.message}</div>`;
+  }
+}
+
+fetchPaperTrading();
+setInterval(fetchPaperTrading, 15000);
 
 startPolling();
 </script>

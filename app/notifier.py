@@ -20,13 +20,10 @@ from datetime import datetime, timezone
 
 import requests
 
-from app.binance_client import binance_streamer
-from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
-from app.signal import generate_signal
+from app.signal_engine import compute_full_signal
 
 logger = logging.getLogger("notifier")
 
-CHAN_LOOKBACK_TRADES = 20000  # 跟main.py的/signal/latest保持一致，纏論需要較大回看範圍
 DEFAULT_INTERVAL_SECONDS = 60  # 1分鐘K線，跟dashboard預設一致(先用短週期驗證進出場時機，
                                # 5分鐘K線需要收集較久才夠判斷，之後穩定後可以再拉長)
 DEFAULT_BUCKET_SIZE = 1.0
@@ -87,20 +84,11 @@ class TelegramNotifier:
             self._stop_flag.wait(NOTIFY_POLL_SECONDS)
 
     def _check_and_notify(self):
-        trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
-        candles = build_candles(trades, interval_seconds=DEFAULT_INTERVAL_SECONDS)
-        chan_data = analyze_chan(candles)
-
-        profile_trades = trades[-DEFAULT_TRADE_LIMIT:] if DEFAULT_TRADE_LIMIT < len(trades) else trades
-        profile = compute_volume_profile(profile_trades, bucket_size=DEFAULT_BUCKET_SIZE)
-        poc_info = poc_and_value_area(profile)
-
-        latest_tick = binance_streamer.get_latest()
-        current_price = None
-        if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
-            current_price = (float(latest_tick["bid"]) + float(latest_tick["ask"])) / 2
-
-        result = generate_signal(chan_data, poc_info, current_price)
+        result = compute_full_signal(
+            interval_seconds=DEFAULT_INTERVAL_SECONDS,
+            bucket_size=DEFAULT_BUCKET_SIZE,
+            trade_limit=DEFAULT_TRADE_LIMIT,
+        )
 
         stage = result["stage"]
         direction = result["direction"]

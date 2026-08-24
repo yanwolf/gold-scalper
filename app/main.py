@@ -22,8 +22,9 @@ from fastapi.responses import FileResponse, RedirectResponse
 from app.oanda_client import streamer
 from app.binance_client import binance_streamer
 from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
-from app.signal import generate_signal
+from app.signal_engine import compute_full_signal
 from app.notifier import notifier
+from app.paper_trading import paper_trading
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -43,6 +44,7 @@ async def startup_event():
     streamer.start()
     binance_streamer.start()
     notifier.start()
+    paper_trading.start()
 
 
 @app.on_event("shutdown")
@@ -50,6 +52,7 @@ async def shutdown_event():
     streamer.stop()
     binance_streamer.stop()
     notifier.stop()
+    paper_trading.stop()
 
 
 @app.get("/dashboard")
@@ -111,6 +114,16 @@ async def notify_detect_chat_id():
     不用手動組Telegram API網址去看JSON。只需要TELEGRAM_BOT_TOKEN就能用。
     """
     return notifier.detect_recent_chats()
+
+
+@app.get("/paper-trading/summary")
+async def paper_trading_summary(limit: int = 50):
+    """
+    模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、目前開倉狀態、
+    最近N筆紀錄。用來在正式接軌Pepperstone MT5自動下單前，評估這套訊號邏輯
+    值不值得真的接execution。
+    """
+    return paper_trading.get_summary(limit=limit)
 
 
 @app.get("/price/latest")
@@ -195,54 +208,15 @@ async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 20000):
     }
 
 
-CHAN_LOOKBACK_TRADES = 20000  # 纏論固定用較大的回看範圍，確保K棒數量足夠做分型/筆/中樞判斷，
-                              # 不能被使用者在分價量表選的「近N筆」(可能只有1000~3000筆)拖累
-
-
 @app.get("/signal/latest")
 async def signal_latest(interval_seconds: int = 60, bucket_size: float = 1.0, trade_limit: int = 3000):
     """
     綜合訊號：纏論(中樞突破/背馳) + 分價量表(POC/Value Area)，
     兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。
-    這是未來要接給MT5 EA輪詢的endpoint，先在這裡驗證邏輯，之後格式穩定了
-    可以直接給EA用WebRequest()定期打這支API。
-
-    重要設計：這個endpoint只呼叫一次 get_recent_trades()(取固定的大範圍
-    CHAN_LOOKBACK_TRADES)，chan_data用完整這份資料算，profile_data則從裡面
-    切出使用者指定的trade_limit(較小範圍，符合分價量表想看「近期」熱區的需求)。
-    兩者都是同一份trades快照的子集，保證同步，不會因為分開呼叫API、
-    Binance報價持續在動而導致兩邊「最近N筆」範圍對不上。
-
-    trade_limit在這裡只影響分價量表的取樣範圍，不影響纏論；纏論一律用
-    CHAN_LOOKBACK_TRADES，避免K棒數量不足導致分型/筆/中樞判斷不出來。
+    這是未來要接給MT5 EA輪詢的endpoint，也是Telegram通知、模擬單追蹤共用的
+    核心邏輯(見 app/signal_engine.py)，三邊都保證用同一份計算結果。
     """
-    trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
-    candles = build_candles(trades, interval_seconds=interval_seconds)
-    chan_data = analyze_chan(candles)
-
-    profile_trades = trades[-trade_limit:] if trade_limit < len(trades) else trades
-    profile = compute_volume_profile(profile_trades, bucket_size=bucket_size)
-    poc_info = poc_and_value_area(profile)
-    profile_data = {
-        "bucket_size": bucket_size,
-        "trade_count": len(profile_trades),
-        "profile": profile,
-        **poc_info,
-    }
-
-    latest_tick = binance_streamer.get_latest()
-    current_price = None
-    if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
-        current_price = (float(latest_tick["bid"]) + float(latest_tick["ask"])) / 2
-
-    result = generate_signal(chan_data, poc_info, current_price)
-    result["chan_detail"] = {
-        "interval_seconds": interval_seconds,
-        "source_candle_count": len(candles),
-        **chan_data,
-    }
-    result["profile_detail"] = profile_data
-    return result
+    return compute_full_signal(interval_seconds=interval_seconds, bucket_size=bucket_size, trade_limit=trade_limit)
 
 
 @app.websocket("/ws/price")

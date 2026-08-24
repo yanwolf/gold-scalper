@@ -19,11 +19,15 @@
 gold-scalper/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py            # FastAPI 進入點：health / REST / WebSocket / dashboard
-│   ├── oanda_client.py    # 背景執行緒，OANDA streaming（暫緩，缺憑證時顯示連線失敗，不影響其他資料源）
-│   ├── binance_client.py  # 背景執行緒，Binance XAUUSDT WebSocket（主力資料源）+ 定期寫入資料庫
-│   ├── db.py               # PostgreSQL 持久化：schema、批次寫入、歷史回填
-│   ├── analysis.py         # K線聚合 / 分價量表 / 纏論分型-筆-中樞-背馳
+│   ├── main.py             # FastAPI 進入點：health / REST / WebSocket / dashboard
+│   ├── oanda_client.py     # 背景執行緒，OANDA streaming（暫緩，缺憑證時顯示連線失敗，不影響其他資料源）
+│   ├── binance_client.py   # 背景執行緒，Binance XAUUSDT WebSocket（主力資料源）+ 定期寫入資料庫
+│   ├── db.py                # PostgreSQL 持久化：schema、批次寫入、歷史回填、模擬單紀錄
+│   ├── analysis.py          # K線聚合 / 分價量表 / 纏論分型-筆-中樞-背馳
+│   ├── signal.py            # 訊號引擎：綜合纏論+分價量表，產出分階段多空判斷
+│   ├── signal_engine.py     # 統一的訊號計算邏輯，供API/Telegram通知/模擬單共用
+│   ├── notifier.py          # Telegram通知：訊號升級時發送，含防重複邏輯
+│   ├── paper_trading.py     # 模擬單追蹤：虛擬開倉/停損停利/訊號反轉出場、績效統計
 │   └── static/
 │       └── dashboard.html  # 視覺化頁面，由後端同源提供
 ├── Dockerfile
@@ -252,3 +256,34 @@ trades快照算出來的，一併包在回應裡回傳。前端 `fetchAndRender(
 
 之後想切回5分鐘或15分鐘，dashboard上直接切換下拉選單即可即時查看；
 Telegram背景通知的判斷週期則需要改`DEFAULT_INTERVAL_SECONDS`後重新部署才會生效。
+
+## 模擬單績效追蹤（正式接自動下單前的驗證階段）
+
+新增 `app/paper_trading.py`，在訊號階段升級成「訊號」時虛擬開一筆倉位(不是真的
+下單)，之後每15秒(可用`PAPER_POLL_SECONDS`調整)比對現價，用以下規則出場：
+1. 觸及停損(預設3美元，`PAPER_SL_POINTS`可調)
+2. 觸及停利(預設6美元，風報比1:2，`PAPER_TP_POINTS`可調)
+3. 訊號反轉：出現方向相反的「訊號」時視為原倉位理由不再成立，出場
+
+同一時間只維護一筆模擬倉位，不做加倉/多筆並存。不需要任何額外設定，服務啟動
+就會自動開始記錄(用保守預設風控參數)，有接資料庫的話會持久化到`paper_trades`
+資料表(服務重啟不會遺失紀錄)，沒接資料庫則退回記憶體模式(最多保留500筆)。
+
+**Endpoint：** `GET /paper-trading/summary?limit=30`
+回傳總筆數、勝率、總損益(points)、獲利因子、平均獲利/虧損、目前開倉狀態、
+最近N筆已平倉紀錄。
+
+Dashboard最下方新增「模擬單績效」面板：目前開倉狀態(方向/進場價/SL/TP)、
+四個核心績效指標、最近成交紀錄列表(進出價、出場原因、盈虧色標)。
+
+**這階段的目的：** 累積一段時間的模擬單數據後，用勝率、獲利因子、期望值
+評估這套訊號邏輯值不值得真的接Pepperstone MT5自動下單。如果數據不理想，
+可以回頭調整訊號規則(`app/signal.py`)或風控參數，不用碰到真錢。
+
+## 架構重構：統一訊號計算邏輯
+
+新增 `app/signal_engine.py`，把原本在`main.py`(/signal/latest)和`notifier.py`
+(Telegram通知判斷)裡各自重複的「抓trades -> 建K線 -> 纏論分析 -> 分價量表 ->
+綜合訊號」邏輯統一成一個函式`compute_full_signal()`，現在`/signal/latest`、
+Telegram通知、模擬單追蹤三邊都呼叫同一份邏輯，不會再有改一個地方忘了改
+另一個地方的風險。
