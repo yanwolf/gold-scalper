@@ -6,8 +6,9 @@
 
 監控項目：
 1. Binance連線(public/market兩條路由)：斷線超過門檻時間 -> 告警
-2. Binance逐筆成交資料是否還在更新：即使顯示connected，也可能資料卡住不動
-   (例如連線狀態異常但沒被偵測到)，用trade_count是否持續增加來double check
+2. Binance逐筆成交資料是否還在更新：看「最新一筆成交的時間」離現在多久，
+   不是看trade_count(這個數字在成交量累積超過緩衝區上限後會卡住不變，
+   之前用trade_count判斷曾經誤報過，見下方修正記錄)
 3. 模擬單追蹤引擎的心跳：太久沒有執行過_tick() -> 可能執行緒掛了或卡住
 4. Telegram通知執行緒：如果有設定Token/ChatID卻執行緒沒有存活 -> 告警
 5. 資料庫寫入健康度：如果有接資料庫，最近一次寫入是失敗的 -> 告警
@@ -45,9 +46,6 @@ class HealthMonitor:
 
         # 每種檢查各自的狀態追蹤
         self._binance_disconnected_since = None
-        self._last_trade_count = None
-        self._last_trade_count_changed_at = None
-        self._trade_stall_alerted = False
 
         self._alert_active = {
             "binance_connection": False,
@@ -135,19 +133,20 @@ class HealthMonitor:
     def _check_trade_data_flow(self, now):
         """
         即使顯示connected，也可能資料實際上卡住沒在更新(例如連線狀態沒被正確偵測到)，
-        用trade_count是否持續增加做二次確認。
+        用「最新一筆成交的實際時間」離現在多久來判斷，不是用trade_count——
+        trade_count在成交量累積超過緩衝區上限(MAX_TRADE_HISTORY)後會卡住不再變化，
+        用它來判斷會誤報「停滯」，即使資料其實仍在正常更新(修正記錄見README)。
         """
         status = binance_streamer.status
-        current_count = status["trade_count"]
+        latest_trade_time_ms = status.get("latest_trade_time")
 
-        if self._last_trade_count is None or current_count != self._last_trade_count:
-            self._last_trade_count = current_count
-            self._last_trade_count_changed_at = now
+        if latest_trade_time_ms is None:
+            # 還沒收到過任何成交(例如剛啟動)，不算異常，等下一輪再看
             is_problem = False
         else:
-            stalled_seconds = (now - self._last_trade_count_changed_at).total_seconds() \
-                if self._last_trade_count_changed_at else 0
-            # 只有在號稱已連線、但資料卻完全沒動的情況下才視為異常，
+            latest_trade_dt = datetime.fromtimestamp(latest_trade_time_ms / 1000, tz=timezone.utc)
+            stalled_seconds = (now - latest_trade_dt).total_seconds()
+            # 只有在號稱已連線、但最新成交時間卻已經是很久以前的情況下才視為異常，
             # 已知斷線的情況交給上面_check_binance_connection處理，避免重複告警
             is_problem = (
                 status["public_connected"] and status["market_connected"]

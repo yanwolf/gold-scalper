@@ -132,6 +132,7 @@ class BinanceGoldStreamer:
     @property
     def status(self):
         with self._lock:
+            latest_trade_time = self._trade_history[-1]["time"] if self._trade_history else None
             return {
                 "connected": self._public_conn.connected and self._market_conn.connected,
                 "public_connected": self._public_conn.connected,
@@ -140,8 +141,21 @@ class BinanceGoldStreamer:
                 "latest_price": self._latest_price,
                 "tick_count": len(self._tick_history),
                 "trade_count": len(self._trade_history),
+                "latest_trade_time": latest_trade_time,  # epoch ms，給health_monitor.py判斷資料是否停滯用
                 "db_persistence_enabled": db.is_enabled(),
             }
+
+    def get_latest_trade_time(self):
+        """
+        最新一筆成交的時間戳(epoch ms)。用來判斷資料是否真的停滯——
+        trade_count在成交量累積超過MAX_TRADE_HISTORY上限後會卡住不再變化
+        (因為deque滿了，新增一筆就會擠掉最舊一筆，總數不變)，不能拿來當作
+        「資料是否還在更新」的判斷依據，要看最新一筆的實際時間才準確。
+        """
+        with self._lock:
+            if self._trade_history:
+                return self._trade_history[-1]["time"]
+            return None
 
     def get_latest(self):
         with self._lock:
