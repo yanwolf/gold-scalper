@@ -1,49 +1,38 @@
 """
-Telegram 通知模組（純通知/觀察階段，不涉及下單）。
+Telegram 通知模組。
 
-用途：背景執行緒定期(預設30秒)在後端直接計算訊號(重用analysis/signal的邏輯，
-不透過HTTP呼叫自己的/signal/latest，避免多一層網路開銷)，當訊號階段變成
-「訊號」時透過Telegram Bot發送通知。避免同一個訊號重複狂發，只在「階段或
-方向有變化」時才通知。
+設計改版(修正記錄見README)：原本這裡自己背景執行緒每30秒獨立重算一次訊號，
+只要訊號階段達到「訊號」就發通知——這跟「模擬單引擎實際有沒有開倉」是
+兩條分開的邏輯，容易對不上(例如震盪濾網擋掉了進場，但通知端不知道濾網
+存在，還是會發「訊號」通知，使用者收到通知卻在模擬單面板上找不到對應的
+交易紀錄)。
 
-支援多週期平行檢查(目前是1分K跟5分K)：同一個背景執行緒每個週期都跑一次，
-各自獨立防重複(用字典分開追蹤每個週期的_last_notified_key)，訊息會標註
-是哪個週期觸發的，方便在Telegram上分辨。
-
-這是接軌未來MT5自動下單前的中間步驟：先驗證訊號品質，觀察一陣子確認
-判斷邏輯夠準之後，再把這裡的通知邏輯換成/追加真正的下單邏輯(EA執行)。
+改成事件驅動：模擬單引擎(paper_trading.py)實際「開倉」或「平倉」時，直接
+呼叫這裡的notify_trade_event()發送通知，不再自己獨立計算訊號。這樣通知
+內容永遠精確對應模擬單實際的操作，格式也改成類似「下單進場/平倉」的呈現
+方式(價格、方向、損益)，而不是抽象的「偵測到訊號」——這也是未來接軌真正
+的MT5自動下單後，通知格式基本上不用再改的原因，先在模擬階段就用同樣的
+呈現邏輯。
 
 沒有設定TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID時，這個模組會靜默停用，
 不影響其他功能，設計原則跟db.py等模組一致。
 """
 
 import os
-import threading
 import logging
 from datetime import datetime, timezone
 
 import requests
 
-from app.signal_engine import compute_full_signal
-
 logger = logging.getLogger("notifier")
 
-# 要檢查的K線週期清單，每個(秒數, 顯示標籤)都會在同一個背景執行緒裡依序檢查一次
-NOTIFY_INTERVALS = [(60, "1分K"), (300, "5分K"), (900, "15分K")]
-
-DEFAULT_BUCKET_SIZE = 1.0
-DEFAULT_TRADE_LIMIT = 3000
-
-NOTIFY_POLL_SECONDS = int(os.getenv("NOTIFY_POLL_SECONDS", "30"))
+DIRECTION_LABELS = {"bullish": "多單 ▲", "bearish": "空單 ▼"}
 
 
 class TelegramNotifier:
     def __init__(self):
-        self._thread = None
-        self._stop_flag = threading.Event()
-        self._last_notified_key = {}   # {interval_seconds: "stage_direction"}，各週期獨立防重複
-        self._last_notified_at = {}    # {interval_seconds: ISO時間字串}
         self._muted = False  # 暫停通知開關(記憶體狀態，服務重啟會重置回False)
+        self._last_notified_at = None  # 最近一次成功發送通知的時間，給dashboard顯示用
 
     @property
     def is_enabled(self):
@@ -54,82 +43,71 @@ class TelegramNotifier:
         return self._muted
 
     @property
-    def is_thread_alive(self):
-        """給health_monitor.py檢查背景執行緒是否還活著用，不用直接碰內部屬性。"""
-        return self._thread is not None and self._thread.is_alive()
-
-    @property
     def status(self):
-        most_recent = max(self._last_notified_at.values(), default=None)
         return {
             "enabled": self.is_enabled,
             "muted": self._muted,
-            "last_notified_at": most_recent,
-            "last_notified_at_by_interval": dict(self._last_notified_at),
-            "poll_seconds": NOTIFY_POLL_SECONDS,
-            "intervals": [label for _, label in NOTIFY_INTERVALS],
+            "last_notified_at": self._last_notified_at,
+            "mode": "事件驅動(模擬單實際進場/出場時才通知)",
         }
 
     def set_muted(self, muted: bool):
         self._muted = muted
 
     def start(self):
-        if not self.is_enabled:
+        """
+        改成事件驅動後不再需要自己的背景執行緒(不用獨立輪詢訊號)，
+        這個方法保留是為了main.py啟動流程的介面一致，不用特別改呼叫端。
+        """
+        if self.is_enabled:
+            logger.info("Telegram 通知功能已啟用(事件驅動：模擬單進場/出場時通知)")
+        else:
             logger.info("未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，通知功能停用")
-            return
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_flag.clear()
-        self._thread = threading.Thread(target=self._run_forever, daemon=True)
-        self._thread.start()
-        logger.info("Telegram 通知功能已啟動(1分K + 5分K)")
 
     def stop(self):
-        self._stop_flag.set()
+        """同上，事件驅動模式下沒有背景執行緒需要停止，保留是為了介面一致。"""
+        pass
 
-    def _run_forever(self):
-        while not self._stop_flag.is_set():
-            try:
-                if not self._muted:
-                    for interval_seconds, label in NOTIFY_INTERVALS:
-                        self._check_and_notify(interval_seconds, label)
-            except Exception as e:
-                logger.error(f"訊號檢查/通知失敗: {e}")
-            self._stop_flag.wait(NOTIFY_POLL_SECONDS)
+    def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None):
+        """
+        模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
-    def _check_and_notify(self, interval_seconds, label):
-        result = compute_full_signal(
-            interval_seconds=interval_seconds,
-            bucket_size=DEFAULT_BUCKET_SIZE,
-            trade_limit=DEFAULT_TRADE_LIMIT,
-        )
+        action: "open" 或 "close"
+        label: K線週期標籤，例如"1分K"/"5分K"/"15分K"
+        direction: "bullish" 或 "bearish"
+        price: 進場價或出場價
+        exit_reason/pnl_points: 只有action="close"時才需要提供
+        """
+        if self._muted:
+            return
 
-        stage = result["stage"]
-        direction = result["direction"]
-        key = f"{stage}_{direction}"
-
-        # 只有階段升級成「訊號」、且跟上次通知的內容不同(階段或方向有變化)才發送，
-        # 避免同一個訊號每30秒重複狂發。每個週期的防重複狀態各自獨立。
-        if stage == "訊號" and key != self._last_notified_key.get(interval_seconds):
-            success, _ = self._send_telegram_message(self._format_signal_message(result, label))
-            if success:
-                self._last_notified_key[interval_seconds] = key
-                self._last_notified_at[interval_seconds] = datetime.now(timezone.utc).isoformat()
-        elif stage != "訊號":
-            # 訊號降級了，重置這個週期的記錄，下次再升級成訊號時才會是「新的」通知
-            self._last_notified_key.pop(interval_seconds, None)
-
-    def _format_signal_message(self, result, label):
-        direction_label = {"bullish": "看多 ▲", "bearish": "看空 ▼"}.get(result["direction"], "")
+        direction_label = DIRECTION_LABELS.get(direction, direction)
         now_str = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
-        return (
-            f"🟡 黃金訊號【{label}】：{direction_label}\n"
-            f"時間：{now_str}\n"
-            f"現價：{result['current_price']:.2f}\n\n"
-            f"纏論：{result['chan']['reason']}\n"
-            f"分價量表：{result['profile']['reason']}\n\n"
-            f"（目前僅通知，未自動下單）"
-        )
+
+        if action == "open":
+            text = (
+                f"🟢 黃金模擬單【{label}】進場\n"
+                f"方向：{direction_label}\n"
+                f"時間：{now_str}\n"
+                f"價格：{price:.2f}\n\n"
+                f"（目前僅模擬單，未接自動下單）"
+            )
+        else:
+            pnl_sign = "+" if (pnl_points or 0) >= 0 else ""
+            pnl_emoji = "🟢" if (pnl_points or 0) >= 0 else "🔴"
+            text = (
+                f"{pnl_emoji} 黃金模擬單【{label}】出場\n"
+                f"方向：{direction_label}\n"
+                f"時間：{now_str}\n"
+                f"價格：{price:.2f}\n"
+                f"出場原因：{exit_reason}\n"
+                f"損益：{pnl_sign}{pnl_points:.2f} points\n\n"
+                f"（目前僅模擬單，未接自動下單）"
+            )
+
+        success, _ = self._send_telegram_message(text)
+        if success:
+            self._last_notified_at = datetime.now(timezone.utc).isoformat()
 
     def _send_telegram_message(self, text):
         """回傳 (success: bool, error_message: str|None)，方便API endpoint把結果回報給前端。"""
@@ -155,7 +133,7 @@ class TelegramNotifier:
     def send_raw_message(self, text):
         """
         給其他模組(例如health_monitor.py)重用同一個Telegram連線發送任意文字用，
-        不會動到訊號通知自己的防重複狀態，兩者完全獨立。
+        不會動到交易事件通知自己的狀態，兩者完全獨立。
         """
         return self._send_telegram_message(text)
 

@@ -50,7 +50,6 @@ class HealthMonitor:
         self._alert_active = {
             "binance_connection": False,
             "trade_data_stall": False,
-            "notifier_thread_dead": False,
             "db_write_failure": False,
         }
         # 模擬單心跳告警是每個週期引擎各自獨立一個key(例如paper_trading_stall_60、
@@ -88,7 +87,6 @@ class HealthMonitor:
         self._check_trade_data_flow(now)
         for interval_seconds, engine in PAPER_TRADING_ENGINES.items():
             self._check_paper_trading_heartbeat(now, interval_seconds, engine)
-        self._check_notifier_thread()
         self._check_db_write_health()
 
     def _set_alert(self, key, is_problem, problem_message, recovered_message):
@@ -181,22 +179,6 @@ class HealthMonitor:
             f"模擬單追蹤引擎({engine.label})已經超過{HEALTH_PAPER_STALL_THRESHOLD_SECONDS}秒沒有執行檢查，"
             f"可能背景執行緒已經停止運作",
             f"模擬單追蹤引擎({engine.label})已恢復正常運作",
-        )
-
-    def _check_notifier_thread(self):
-        # 只有在設定了Token/ChatID(代表使用者期望這個功能要運作)時才檢查，
-        # 沒設定的話thread本來就不會啟動，不算異常
-        if not notifier_module.notifier.is_enabled:
-            is_problem = False
-        else:
-            is_problem = not notifier_module.notifier.is_thread_alive
-
-        self._set_alert(
-            "notifier_thread_dead",
-            is_problem,
-            "Telegram訊號通知的背景執行緒似乎已經停止運作(這則告警本身走的是獨立的發送路徑，"
-            "不受影響，所以還能送達)，建議檢查Zeabur服務日誌",
-            "Telegram訊號通知背景執行緒已恢復運作",
         )
 
     def _check_db_write_health(self):

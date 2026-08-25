@@ -539,6 +539,11 @@
 
 <div class="panel">
   <div class="section-title" style="margin-top:0;">Telegram 通知設定</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
+    模擬單引擎(1分K/5分K/15分K)實際進場或出場時才會通知，內容包含方向、
+    價格、出場原因、損益，格式類似真正的下單通知——不是每次偵測到訊號
+    就發送，避免訊號在門檻邊界來回閃爍時被誤判成新訊號而重複騷擾。
+  </div>
 
   <div class="notify-status-row">
     <span class="notify-dot" id="notifyDot"></span>
@@ -972,7 +977,7 @@ async function refreshNotifyStatus(){
       const lastNotified = data.last_notified_at
         ? `，上次通知：${new Date(data.last_notified_at).toLocaleString('zh-TW')}`
         : '，尚無通知紀錄';
-      els.notifyStatusText.textContent = `已連接，每${data.poll_seconds}秒檢查一次${lastNotified}`;
+      els.notifyStatusText.textContent = `已連接，模擬單實際進場/出場時會通知${lastNotified}`;
       els.notifyMuteBtn.style.display = '';
       els.notifyMuteBtn.textContent = '暫停通知';
       els.notifyMuteBtn.classList.remove('active-mute');

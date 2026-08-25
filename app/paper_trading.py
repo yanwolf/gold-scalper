@@ -25,6 +25,7 @@ from app.signal_engine import compute_full_signal
 from app import db
 from app import trading_core
 from app import settings as settings_module
+from app import notifier as notifier_module
 from app.trading_stats import compute_stats, assess_readiness
 
 logger = logging.getLogger("paper_trading")
@@ -163,6 +164,16 @@ class PaperTradingEngine:
             f"(初始SL:{position['sl_price']:.2f})"
         )
 
+        # 事件驅動通知：真的開倉了才通知(而不是每次檢測到訊號就通知)，
+        # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)
+        try:
+            notifier_module.notifier.notify_trade_event(
+                action="open", label=self.label,
+                direction=position["direction"], price=current_price,
+            )
+        except Exception as e:
+            logger.error(f"開倉通知發送失敗({self.label}): {e}")
+
     def _close_position(self, position, exit_price, exit_reason):
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = trading_core.close_position(position, exit_price, exit_reason, exit_time)
@@ -177,6 +188,15 @@ class PaperTradingEngine:
             f"模擬單平倉({self.label}): {position['direction']} @ {exit_price:.2f} "
             f"({exit_reason}, 損益:{closed_record['pnl_points']:+.2f})"
         )
+
+        try:
+            notifier_module.notifier.notify_trade_event(
+                action="close", label=self.label,
+                direction=position["direction"], price=exit_price,
+                exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
+            )
+        except Exception as e:
+            logger.error(f"平倉通知發送失敗({self.label}): {e}")
 
     def get_summary(self, limit=50):
         """
