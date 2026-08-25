@@ -235,6 +235,16 @@
     color: var(--muted); font-size: 12.5px; padding: 10px 0;
   }
 
+  .paper-position-live{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 14px; margin-top: -1px; font-size: 12.5px;
+    background: #10182a; border: 1px solid var(--grid); border-top: none;
+    border-radius: 0 0 8px 8px; font-family: 'JetBrains Mono', monospace;
+  }
+  .paper-position-live .pnl{ font-weight: 700; }
+  .paper-position-live .pnl.win{ color: var(--support); }
+  .paper-position-live .pnl.loss{ color: var(--resistance); }
+
   .active-config-card{
     background: #131a2a; border: 1px solid var(--grid); border-radius: 8px;
     padding: 10px 14px; margin-bottom: 12px; font-size: 11.5px; line-height: 1.7;
@@ -604,6 +614,10 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   });
 });
 
+// 最新報價的全域快取，給模擬單卡片算「未實現損益」用，不用另外多打一次API，
+// 沿用主畫面/signal/latest已經抓到的現價，兩邊資料來源保持一致
+let lastKnownPrice = null;
+
 const els = {
   bucketSize: document.getElementById('bucketSize'),
   tradeLimit: document.getElementById('tradeLimit'),
@@ -921,6 +935,7 @@ async function fetchAndRender(){
     const currentPrice = data.current_price;
     if(currentPrice != null){
       els.currentPrice.textContent = currentPrice.toFixed(2);
+      lastKnownPrice = currentPrice;
     }
 
     renderProfile(data.profile_detail, currentPrice);
@@ -1196,6 +1211,24 @@ function renderPaperTrading(data){
     const trailBadge = p.trailing_active
       ? `<span style="color:var(--gold);">移動停損已啟動</span>`
       : `<span style="color:var(--muted);">尚未啟動移動停損</span>`;
+
+    // 用全域快取的最新報價(跟主畫面同一份資料來源)算未實現損益，
+    // 不用再多滑到最上面看現價才能判斷這一單目前是賺是賠
+    let livePriceHtml = '';
+    if(lastKnownPrice != null){
+      const unrealizedPnl = p.direction === 'bullish'
+        ? lastKnownPrice - p.entry_price
+        : p.entry_price - lastKnownPrice;
+      const pnlClass = unrealizedPnl >= 0 ? 'win' : 'loss';
+      const pnlSign = unrealizedPnl >= 0 ? '+' : '';
+      livePriceHtml = `
+        <div class="paper-position-live">
+          <span>現價 <span class="mono">${lastKnownPrice.toFixed(2)}</span></span>
+          <span class="pnl ${pnlClass}">${pnlSign}${unrealizedPnl.toFixed(2)}</span>
+        </div>
+      `;
+    }
+
     els.paperOpenPosition.innerHTML = `
       <div class="paper-position-card ${p.direction}">
         <span>
@@ -1204,6 +1237,7 @@ function renderPaperTrading(data){
         </span>
         <span class="mono">停損 ${p.sl_price.toFixed(2)} / 峰值 ${p.peak_price.toFixed(2)}</span>
       </div>
+      ${livePriceHtml}
     `;
   }else{
     els.paperOpenPosition.innerHTML = '<div class="paper-position-empty">目前空手，等待下一個訊號</div>';
