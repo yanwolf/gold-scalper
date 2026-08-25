@@ -20,7 +20,7 @@ from app.analysis import (
 )
 from app.signal import generate_signal
 
-CHAN_LOOKBACK_TRADES = 60000  # 纏論固定用較大回看範圍，確保K棒數量足夠，不受trade_limit影響
+CHAN_LOOKBACK_TRADES = 100000  # 纏論固定用較大回看範圍，確保K棒數量足夠，不受trade_limit影響
                               # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
                               # 也沒用，實際能用的資料量是兩者取較小值)
 

@@ -29,7 +29,7 @@ from app.signal_engine import compute_full_signal
 logger = logging.getLogger("notifier")
 
 # 要檢查的K線週期清單，每個(秒數, 顯示標籤)都會在同一個背景執行緒裡依序檢查一次
-NOTIFY_INTERVALS = [(60, "1分K"), (300, "5分K")]
+NOTIFY_INTERVALS = [(60, "1分K"), (300, "5分K"), (900, "15分K")]
 
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000

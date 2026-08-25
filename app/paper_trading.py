@@ -213,14 +213,17 @@ class PaperTradingEngine:
         }
 
 
-# 兩個平行運作的實例：1分K(原本就有的)和5分K(新增，可直接對照績效)。
-# PAPER_TRADING_ENGINES讓main.py能依interval_seconds查到對應的引擎。
+# 三個平行運作的實例：1分K/5分K/15分K，各自獨立追蹤、可直接對照績效。
+# PAPER_TRADING_ENGINES讓main.py能依interval_seconds查到對應的引擎，
+# health_monitor.py也是直接遍歷這個字典做心跳監控，新增引擎不用改健康監控邏輯。
 paper_trading_1m = PaperTradingEngine(interval_seconds=60, label="1分K")
 paper_trading_5m = PaperTradingEngine(interval_seconds=300, label="5分K")
+paper_trading_15m = PaperTradingEngine(interval_seconds=900, label="15分K")
 
 PAPER_TRADING_ENGINES = {
     60: paper_trading_1m,
     300: paper_trading_5m,
+    900: paper_trading_15m,
 }
 
 # 保留舊名稱指向1分K引擎，避免其他還沒更新的地方(例如health_monitor.py)

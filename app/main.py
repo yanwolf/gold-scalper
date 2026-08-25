@@ -169,7 +169,7 @@ async def update_settings(payload: dict = Body(...)):
 
 
 @app.get("/paper-trading/summary")
-async def paper_trading_summary(limit: int = 50, interval_seconds: int = 60):
+async def paper_trading_summary(limit: int = 50, interval_seconds: int = 300):
     """
     模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、最大回撤、
     目前開倉狀態、最近N筆紀錄、以及對照「達標門檻」的評估結果。
@@ -187,7 +187,7 @@ async def paper_trading_summary(limit: int = 50, interval_seconds: int = 60):
 @app.get("/backtest/run")
 async def backtest_run(
     days: int = 2,
-    interval_seconds: int = 60,
+    interval_seconds: int = 300,
     bucket_size: float = 1.0,
     trade_limit: int = 3000,
     sl_points: Optional[float] = None,
@@ -224,7 +224,7 @@ async def backtest_run(
 
 
 @app.post("/backtest/sweep")
-async def backtest_sweep_start(days: int = 2, interval_seconds: int = 60):
+async def backtest_sweep_start(days: int = 2, interval_seconds: int = 300):
     """
     參數掃描：對模擬單風控參數做「一次改一個參數」的敏感度測試，一次跑多組回測，
     自動比較哪個參數方向、哪個數值表現比較好，不用手動一個一個試。
@@ -284,7 +284,7 @@ async def recent_ticks_binance(limit: int = 200):
 # ---------------------------------------------------------------------------
 
 @app.get("/analysis/candles")
-async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 60000):
+async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 100000):
     """
     K線聚合。預設5分鐘一根，資料源是 Binance 的逐筆成交(aggTrade)。
     interval_seconds 可調整週期，例如 60 就是1分鐘K線，方便之後往下切。
@@ -299,7 +299,7 @@ async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 60000
 
 
 @app.get("/analysis/volume-profile")
-async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 60000):
+async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 100000):
     """
     分價量表。bucket_size 是每個價格箱的寬度(單位:USD)，例如0.5會分得更細。
     trade_limit 控制回看多少筆逐筆成交，數字越大涵蓋的時間範圍越長。
@@ -316,7 +316,7 @@ async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 6
 
 
 @app.get("/analysis/chan")
-async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 60000):
+async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 100000):
     """
     纏論分析：分型 -> 筆 -> 中樞 -> 背馳判斷。
     預設用5分鐘K線(interval_seconds=300)，之後要往下切1分鐘只要改參數即可，
@@ -333,7 +333,7 @@ async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 60000):
 
 
 @app.get("/signal/latest")
-async def signal_latest(interval_seconds: int = 60, bucket_size: float = 1.0, trade_limit: int = 3000):
+async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, trade_limit: int = 3000):
     """
     綜合訊號：纏論(中樞突破/背馳) + 分價量表(POC/Value Area)，
     兩者方向一致且至少一邊夠強才會是「訊號」，否則是「關注」或「中性」。

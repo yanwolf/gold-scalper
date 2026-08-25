@@ -37,7 +37,11 @@ DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
 
-MAX_BACKTEST_DAYS = 7  # 天數上限，避免單次回測跑太久(纏論分析在大量K棒上會變慢)
+MAX_BACKTEST_DAYS = 30  # 天數上限，從7天拉長到30天，為之後測試更長週期(例如1小時K)預留空間。
+                        # 運算時間本身不會因為天數變長而爆炸(TARGET_STEP_COUNT的取樣間隔機制
+                        # 會自動控制重播步數)，唯一會變長的是抓歷史K線的階段(要打更多次Binance
+                        # API分頁請求)，這段是網路等待、不是佔用CPU運算，不會卡住伺服器
+                        # (回測本來就是丟到背景執行緒跑，見main.py的asyncio.to_thread)。
 TARGET_STEP_COUNT = 1200  # 重播步數的目標上限，天數越長會自動拉大取樣間隔(stride)來控制在這附近
 
 
