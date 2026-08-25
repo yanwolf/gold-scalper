@@ -183,6 +183,12 @@ class PaperTradingEngine:
         績效摘要：總筆數、勝率、總損益、獲利因子、最大回撤、目前開倉狀態、
         最近N筆紀錄、以及對照「達標門檻」的評估結果。只回傳這個引擎自己
         (自己的interval_seconds)的資料，不會混到其他週期的紀錄。
+
+        active_settings回傳目前生效中的「完整」設定快照(不是只挑幾個固定
+        點數欄位)，讓dashboard能準確顯示「現在到底在跑什麼策略」——包含
+        是固定點數模式還是ATR動態模式、震盪濾網開沒開、反轉確認次數等，
+        不會像舊版只回傳固定點數欄位、卻沒說明ATR模式其實已經覆蓋掉這些值
+        的情況(修正記錄見README)。
         """
         if db.is_enabled():
             trades = db.get_closed_paper_trades(limit=max(limit, 500), interval_seconds=self.interval_seconds)
@@ -195,17 +201,13 @@ class PaperTradingEngine:
         with self._lock:
             position = self._position
 
-        s = settings_module.get_settings()
-
         return {
             **stats,
             "interval_seconds": self.interval_seconds,
             "label": self.label,
             "open_position": position,
             "recent_trades": trades[:limit],
-            "sl_points": s["paper_sl_points"],
-            "trail_trigger_points": s["paper_trail_trigger_points"],
-            "trail_distance_points": s["paper_trail_distance_points"],
+            "active_settings": settings_module.get_settings(),
             "readiness": readiness,
         }
 

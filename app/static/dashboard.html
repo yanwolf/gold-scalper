@@ -235,6 +235,22 @@
     color: var(--muted); font-size: 12.5px; padding: 10px 0;
   }
 
+  .active-config-card{
+    background: #131a2a; border: 1px solid var(--grid); border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 12px; font-size: 11.5px; line-height: 1.7;
+  }
+  .active-config-card .cfg-title{
+    font-size: 10px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;
+  }
+  .active-config-card .cfg-row{
+    display: flex; justify-content: space-between; gap: 10px;
+  }
+  .active-config-card .cfg-label{ color: var(--muted); }
+  .active-config-card .cfg-value{ font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .active-config-card .cfg-value.on{ color: var(--gold); }
+  .active-config-card .cfg-value.off{ color: var(--muted); }
+
   .paper-trade-row{
     display:grid; grid-template-columns: 40px 1fr auto; align-items:center; gap: 10px;
     padding: 7px 10px; border-radius: 6px; background: #131a2a; font-size: 11.5px;
@@ -437,6 +453,8 @@
       <option value="300">5分K追蹤</option>
     </select>
   </div>
+
+  <div id="paperActiveConfig"></div>
 
   <div id="paperOpenPosition"></div>
 
@@ -1040,7 +1058,42 @@ function renderTradeList(el, trades){
   }).join('');
 }
 
+function renderActiveConfig(el, activeSettings, label){
+  if(!el || !activeSettings) { if(el) el.innerHTML = ''; return; }
+  const s = activeSettings;
+
+  let stopModeHtml;
+  if(s.paper_use_atr_stops){
+    stopModeHtml = `
+      <div class="cfg-row"><span class="cfg-label">停損模式</span><span class="cfg-value on">ATR動態</span></div>
+      <div class="cfg-row"><span class="cfg-label">ATR初始停損倍數</span><span class="cfg-value">${s.paper_atr_sl_multiplier}x</span></div>
+      <div class="cfg-row"><span class="cfg-label">ATR觸發/跟隨倍數</span><span class="cfg-value">${s.paper_atr_trigger_multiplier}x / ${s.paper_atr_trail_multiplier}x</span></div>
+    `;
+  }else{
+    stopModeHtml = `
+      <div class="cfg-row"><span class="cfg-label">停損模式</span><span class="cfg-value off">固定點數</span></div>
+      <div class="cfg-row"><span class="cfg-label">初始停損</span><span class="cfg-value">${s.paper_sl_points} pts</span></div>
+      <div class="cfg-row"><span class="cfg-label">觸發/跟隨距離</span><span class="cfg-value">${s.paper_trail_trigger_points} / ${s.paper_trail_distance_points} pts</span></div>
+    `;
+  }
+
+  const chopHtml = s.paper_use_chop_filter
+    ? `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value on">開啟(門檻 ${s.paper_chop_threshold})</span></div>`
+    : `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value off">關閉</span></div>`;
+
+  el.innerHTML = `
+    <div class="active-config-card">
+      <div class="cfg-title">目前策略設定（${label}）</div>
+      ${stopModeHtml}
+      <div class="cfg-row"><span class="cfg-label">訊號反轉確認次數</span><span class="cfg-value">${s.paper_reversal_confirm_count}</span></div>
+      ${chopHtml}
+    </div>
+  `;
+}
+
 function renderPaperTrading(data){
+  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label);
+
   if(data.open_position){
     const p = data.open_position;
     const dirLabel = p.direction === 'bullish' ? '看多 ▲' : '看空 ▼';
@@ -1132,6 +1185,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
         回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根K線 ／ 還原成 ${data.synthetic_trade_count} 筆合成成交
         ／ 實際重播 ${data.replay_step_count} 步${data.replay_stride > 1 ? `(取樣間隔 ${data.replay_stride}，天數較長時自動降低精細度以控制運算時間)` : ''}
       </div>
+      <div id="backtestActiveConfig"></div>
       ${readinessDiv.innerHTML}
       <div class="stat-row" style="margin-top:10px;">
         <div class="stat"><div class="lbl">總筆數</div><div class="val mono">${data.total_trades}</div></div>
@@ -1144,6 +1198,24 @@ els.backtestRunBtn.addEventListener('click', async () => {
       <div class="section-title" style="margin-top:16px;">回測交易紀錄</div>
       <div id="backtestTradeList" class="bi-list"></div>
     `;
+
+    // 回測回傳的是扁平欄位(sl_points/use_atr等)，不是像/paper-trading/summary
+    // 那樣包在active_settings裡，這裡轉換成同樣格式重用renderActiveConfig()，
+    // 讓「這次回測實際用了什麼參數」跟「模擬單面板目前設定」用同一套呈現方式，
+    // 方便直接比對兩者是否一致。
+    const backtestActiveSettings = {
+      paper_use_atr_stops: data.use_atr ? 1 : 0,
+      paper_sl_points: data.sl_points,
+      paper_trail_trigger_points: data.trail_trigger_points,
+      paper_trail_distance_points: data.trail_distance_points,
+      paper_atr_sl_multiplier: data.atr_sl_multiplier,
+      paper_atr_trigger_multiplier: data.atr_trigger_multiplier,
+      paper_atr_trail_multiplier: data.atr_trail_multiplier,
+      paper_reversal_confirm_count: data.reversal_confirm_count,
+      paper_use_chop_filter: data.use_chop_filter ? 1 : 0,
+      paper_chop_threshold: data.chop_threshold,
+    };
+    renderActiveConfig(document.getElementById('backtestActiveConfig'), backtestActiveSettings, `${data.backtest_days}天回測`);
 
     renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
     renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades);
