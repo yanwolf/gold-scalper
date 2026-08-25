@@ -264,6 +264,28 @@
   .backtest-meta{ font-size: 11px; color: var(--muted); margin-bottom: 10px; }
   .loading-spinner{ color: var(--muted); font-size: 12.5px; padding: 10px 0; }
 
+  .settings-field{
+    margin-bottom: 14px;
+  }
+  .settings-field label{
+    display: block; font-size: 12.5px; font-weight: 700; margin-bottom: 3px;
+  }
+  .settings-field .field-help{
+    font-size: 11px; color: var(--muted); margin-bottom: 6px; line-height: 1.5;
+  }
+  .settings-field input{
+    width: 100%; background: var(--panel); border: 1px solid var(--grid); color: var(--text);
+    padding: 8px 10px; border-radius: 6px; font-size: 13px; font-family: 'JetBrains Mono', monospace;
+  }
+  .settings-field input:focus{ outline: none; border-color: var(--gold); }
+  .settings-save-row{
+    display: flex; gap: 8px; margin-top: 16px; align-items: center;
+  }
+  .settings-save-row .btn-primary{
+    background: var(--gold); color: #1a1200; font-weight: 700; border: none;
+    padding: 9px 16px; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+
   .health-alert-banner{
     background: var(--resistance-dim); border: 1px solid var(--resistance);
     border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px;
@@ -436,6 +458,22 @@
   <div id="backtestResult" style="margin-top:14px;"></div>
 </div>
 
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">策略參數設定</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
+    調整模擬單風控參數和達標門檻，不用進Zeabur後台改環境變數。修改需要密碼
+    (第一次使用前要先到Zeabur設定一次 <span class="mono">SETTINGS_PASSWORD</span>)。
+  </div>
+
+  <div id="settingsLockedView">
+    <button id="settingsUnlockBtn" class="btn-secondary">🔒 輸入密碼以編輯</button>
+  </div>
+
+  <div id="settingsForm" style="display:none;"></div>
+
+  <div id="settingsResult" class="notify-result"></div>
+</div>
+
 <footer id="statusLine">尚未連線</footer>
 
 <script>
@@ -477,6 +515,10 @@ const els = {
   backtestDays: document.getElementById('backtestDays'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
+  settingsLockedView: document.getElementById('settingsLockedView'),
+  settingsUnlockBtn: document.getElementById('settingsUnlockBtn'),
+  settingsForm: document.getElementById('settingsForm'),
+  settingsResult: document.getElementById('settingsResult'),
 };
 
 // --- K線圖初始化 (lightweight-charts) ---
@@ -1041,6 +1083,101 @@ els.backtestRunBtn.addEventListener('click', async () => {
 
   els.backtestRunBtn.disabled = false;
   els.backtestRunBtn.textContent = '執行回測';
+});
+
+// --- 策略參數設定面板 ---
+
+let settingsPassword = null;  // 只存在這次頁面session的記憶體裡，不會寫進任何儲存空間
+let settingsMeta = null;
+
+function showSettingsResult(msg, isError){
+  els.settingsResult.textContent = msg;
+  els.settingsResult.className = `notify-result ${isError ? 'error' : 'success'}`;
+}
+
+function renderSettingsForm(values, meta){
+  settingsMeta = meta;
+  const fieldsHtml = Object.entries(meta).map(([key, m]) => `
+    <div class="settings-field">
+      <label for="setting-${key}">${m.label}</label>
+      <div class="field-help">${m.help}</div>
+      <input type="number" id="setting-${key}" data-key="${key}"
+             value="${values[key]}" step="${m.step}" min="${m.min}" max="${m.max}" />
+    </div>
+  `).join('');
+
+  els.settingsForm.innerHTML = `
+    ${fieldsHtml}
+    <div class="settings-save-row">
+      <button id="settingsSaveBtn" class="btn-primary">儲存變更</button>
+      <button id="settingsLockBtn" class="btn-secondary">🔒 鎖定</button>
+    </div>
+  `;
+
+  document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
+  document.getElementById('settingsLockBtn').addEventListener('click', () => {
+    settingsPassword = null;
+    els.settingsForm.style.display = 'none';
+    els.settingsLockedView.style.display = '';
+    els.settingsResult.textContent = '';
+  });
+}
+
+async function fetchSettingsView(){
+  try{
+    const res = await fetch('/settings');
+    if(!res.ok) throw new Error(`設定API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    renderSettingsForm(data.values, data.meta);
+  }catch(err){
+    els.settingsForm.innerHTML = `<div class="error">載入失敗：${err.message}</div>`;
+  }
+}
+
+async function saveSettings(){
+  const values = {};
+  Object.keys(settingsMeta).forEach(key => {
+    const input = document.getElementById(`setting-${key}`);
+    if(input) values[key] = parseFloat(input.value);
+  });
+
+  const saveBtn = document.getElementById('settingsSaveBtn');
+  saveBtn.disabled = true;
+  showSettingsResult('儲存中...', false);
+
+  try{
+    const res = await fetch('/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: settingsPassword, values }),
+    });
+    const data = await res.json();
+
+    if(data.success){
+      showSettingsResult('已儲存，下次背景檢查就會套用新參數', false);
+      renderSettingsForm(data.values, settingsMeta);
+    }else{
+      showSettingsResult(`儲存失敗：${data.error}`, true);
+      if(data.error && data.error.includes('密碼')){
+        // 密碼錯誤，退回鎖定畫面重新輸入，避免一直用錯誤密碼重試
+        settingsPassword = null;
+        els.settingsForm.style.display = 'none';
+        els.settingsLockedView.style.display = '';
+      }
+    }
+  }catch(err){
+    showSettingsResult(`儲存失敗：${err.message}`, true);
+  }
+  saveBtn.disabled = false;
+}
+
+els.settingsUnlockBtn.addEventListener('click', async () => {
+  const pwd = prompt('請輸入設定密碼(SETTINGS_PASSWORD)：');
+  if(pwd === null || pwd === '') return;
+  settingsPassword = pwd;
+  els.settingsLockedView.style.display = 'none';
+  els.settingsForm.style.display = '';
+  await fetchSettingsView();
 });
 
 startPolling();

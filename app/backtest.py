@@ -25,6 +25,7 @@ import requests
 
 from app.signal_engine import compute_signal_from_trades, CHAN_LOOKBACK_TRADES
 from app import trading_core
+from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
 
 logger = logging.getLogger("backtest")
@@ -35,11 +36,6 @@ MAX_KLINES_PER_REQUEST = 1500
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
-# 跟paper_trading.py保持一致的預設值(拉寬過的版本，原因見README修正記錄)
-DEFAULT_SL_POINTS = 5.0
-DEFAULT_TRAIL_TRIGGER_POINTS = 6.0
-DEFAULT_TRAIL_DISTANCE_POINTS = 5.0
-DEFAULT_REVERSAL_CONFIRM_COUNT = 2
 
 MAX_BACKTEST_DAYS = 7  # 天數上限，避免單次回測跑太久(纏論分析在大量K棒上會變慢)
 TARGET_STEP_COUNT = 1200  # 重播步數的目標上限，天數越長會自動拉大取樣間隔(stride)來控制在這附近
@@ -114,10 +110,10 @@ def run_backtest(
     interval_seconds=DEFAULT_INTERVAL_SECONDS,
     bucket_size=DEFAULT_BUCKET_SIZE,
     trade_limit=DEFAULT_TRADE_LIMIT,
-    sl_points=DEFAULT_SL_POINTS,
-    trail_trigger_points=DEFAULT_TRAIL_TRIGGER_POINTS,
-    trail_distance_points=DEFAULT_TRAIL_DISTANCE_POINTS,
-    reversal_confirm_count=DEFAULT_REVERSAL_CONFIRM_COUNT,
+    sl_points=None,
+    trail_trigger_points=None,
+    trail_distance_points=None,
+    reversal_confirm_count=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -128,7 +124,22 @@ def run_backtest(
       取代原本每一步都重新掃過整份trades清單的O(n^2)寫法
     - 每一步只保留最近CHAN_LOOKBACK_TRADES筆(這也是compute_signal_from_trades內部
       實際會用到的上限)，避免隨著回測天數增加，切片大小跟著無限成長
+
+    sl_points/trail_trigger_points/trail_distance_points/reversal_confirm_count
+    沒有明確傳入(None)時，會即時從settings.py讀取目前生效的參數(使用者在
+    dashboard調整過的值)，讓「不指定參數的回測」跟「即時模擬單目前實際在用
+    的參數」保持一致，不會兩邊對不上。
     """
+    s = settings_module.get_settings()
+    if sl_points is None:
+        sl_points = s["paper_sl_points"]
+    if trail_trigger_points is None:
+        trail_trigger_points = s["paper_trail_trigger_points"]
+    if trail_distance_points is None:
+        trail_distance_points = s["paper_trail_distance_points"]
+    if reversal_confirm_count is None:
+        reversal_confirm_count = s["paper_reversal_confirm_count"]
+
     klines = fetch_historical_klines(days=days)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}

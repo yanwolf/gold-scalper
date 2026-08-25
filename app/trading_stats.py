@@ -4,16 +4,10 @@
 被 paper_trading.py(即時模擬單) 和 backtest.py(歷史回測) 共用，
 確保兩邊看到的績效指標定義完全一致(勝率怎麼算、獲利因子怎麼算、
 最大回撤怎麼算)，不會有一邊統計口徑跟另一邊對不上的問題。
+
+達標門檻的數值來源是 app/settings.py(可透過dashboard線上調整、有密碼保護)，
+不再是這裡固定讀一次環境變數的常數，改參數不用重新部署就會生效。
 """
-
-import os
-
-# 正式接軌MT5自動下單前的「達標門檻」，可透過環境變數調整。
-# 這些是保守的最低標準，用意是避免樣本數太少、或績效不夠穩定就貿然上線真錢。
-MIN_TRADES_FOR_DECISION = int(os.getenv("READINESS_MIN_TRADES", "30"))
-MIN_WIN_RATE = float(os.getenv("READINESS_MIN_WIN_RATE", "40"))
-MIN_PROFIT_FACTOR = float(os.getenv("READINESS_MIN_PROFIT_FACTOR", "1.3"))
-MAX_ACCEPTABLE_DRAWDOWN_POINTS = float(os.getenv("READINESS_MAX_DRAWDOWN_POINTS", "30"))
 
 
 def compute_stats(trades):
@@ -72,31 +66,37 @@ def assess_readiness(stats):
     """
     對照「達標門檻」評估目前的績效統計，回傳是否達標、以及每一項門檻各自的通過狀況，
     給dashboard和決策參考用。這不是保證獲利的保證，只是避免樣本太少/績效太差就衝去接真錢。
+
+    門檻值即時從 app/settings.py 讀取(而不是固定常數)，這樣使用者在dashboard調整過
+    達標門檻設定後，這裡馬上就會用新的門檻評估，不用重新部署。
     """
+    from app import settings
+    s = settings.get_settings()
+
     checks = [
         {
             "label": "樣本數",
-            "pass": stats["total_trades"] >= MIN_TRADES_FOR_DECISION,
+            "pass": stats["total_trades"] >= s["readiness_min_trades"],
             "actual": stats["total_trades"],
-            "threshold": MIN_TRADES_FOR_DECISION,
+            "threshold": s["readiness_min_trades"],
         },
         {
             "label": "勝率",
-            "pass": stats["win_rate"] >= MIN_WIN_RATE,
+            "pass": stats["win_rate"] >= s["readiness_min_win_rate"],
             "actual": stats["win_rate"],
-            "threshold": MIN_WIN_RATE,
+            "threshold": s["readiness_min_win_rate"],
         },
         {
             "label": "獲利因子",
-            "pass": (stats["profit_factor"] or 0) >= MIN_PROFIT_FACTOR,
+            "pass": (stats["profit_factor"] or 0) >= s["readiness_min_profit_factor"],
             "actual": stats["profit_factor"],
-            "threshold": MIN_PROFIT_FACTOR,
+            "threshold": s["readiness_min_profit_factor"],
         },
         {
             "label": "最大回撤(points)",
-            "pass": stats["max_drawdown_points"] <= MAX_ACCEPTABLE_DRAWDOWN_POINTS,
+            "pass": stats["max_drawdown_points"] <= s["readiness_max_drawdown_points"],
             "actual": stats["max_drawdown_points"],
-            "threshold": MAX_ACCEPTABLE_DRAWDOWN_POINTS,
+            "threshold": s["readiness_max_drawdown_points"],
         },
     ]
 

@@ -24,20 +24,12 @@ from datetime import datetime, timezone
 from app.signal_engine import compute_full_signal
 from app import db
 from app import trading_core
+from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
 
 logger = logging.getLogger("paper_trading")
 
 PAPER_POLL_SECONDS = int(os.getenv("PAPER_POLL_SECONDS", "15"))
-# 停損/移動停損預設值拉寬(原本3點對黃金的日內雜訊來說太緊，正常波動就會誤觸發，
-# 詳見README修正記錄)。這幾個數字之後如果想換成ATR動態版本，只要在這裡替換
-# 成算出來的動態值即可，不用動其他地方的邏輯。這組參數目前1分K/5分K共用同一套，
-# 之後如果想讓不同週期各自有不同風控參數，可以改成依interval_seconds查表。
-PAPER_SL_POINTS = float(os.getenv("PAPER_SL_POINTS", "5.0"))
-PAPER_TRAIL_TRIGGER_POINTS = float(os.getenv("PAPER_TRAIL_TRIGGER_POINTS", "6.0"))
-PAPER_TRAIL_DISTANCE_POINTS = float(os.getenv("PAPER_TRAIL_DISTANCE_POINTS", "5.0"))
-# 訊號反轉需要連續看到幾次才真的出場(避免訊號瞬間閃爍一次就洗出場)
-PAPER_REVERSAL_CONFIRM_COUNT = int(os.getenv("PAPER_REVERSAL_CONFIRM_COUNT", "2"))
 
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
@@ -89,6 +81,12 @@ class PaperTradingEngine:
     def _tick(self):
         self._last_tick_at = datetime.now(timezone.utc)
 
+        # 風控參數即時從settings.py讀取(而不是啟動時就固定的常數)，
+        # 這樣使用者在dashboard調整過設定後，下一次tick馬上就會用新的參數，
+        # 不用重新部署。已開倉的部位維持原本的移動停損進度，只有「新的判斷」
+        # 才會套用最新參數(例如新開倉的初始停損、觸發距離)。
+        s = settings_module.get_settings()
+
         result = compute_full_signal(
             interval_seconds=self.interval_seconds,
             bucket_size=DEFAULT_BUCKET_SIZE,
@@ -103,7 +101,7 @@ class PaperTradingEngine:
 
         if position:
             changed = trading_core.update_trailing_stop(
-                position, current_price, PAPER_TRAIL_TRIGGER_POINTS, PAPER_TRAIL_DISTANCE_POINTS
+                position, current_price, s["paper_trail_trigger_points"], s["paper_trail_distance_points"]
             )
             if changed:
                 db.update_paper_trade_stop(
@@ -112,21 +110,21 @@ class PaperTradingEngine:
 
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
-                reversal_confirm_count=PAPER_REVERSAL_CONFIRM_COUNT,
+                reversal_confirm_count=s["paper_reversal_confirm_count"],
             )
             if exit_reason:
                 self._close_position(position, current_price, exit_reason)
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
-            self._open_position(result, current_price)
+            self._open_position(result, current_price, s["paper_sl_points"])
 
-    def _open_position(self, signal_result, current_price):
+    def _open_position(self, signal_result, current_price, sl_points):
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,
             entry_time=datetime.now(timezone.utc).isoformat(),
-            sl_points=PAPER_SL_POINTS,
+            sl_points=sl_points,
             chan_reason=signal_result["chan"]["reason"],
             profile_reason=signal_result["profile"]["reason"],
         )
@@ -174,15 +172,17 @@ class PaperTradingEngine:
         with self._lock:
             position = self._position
 
+        s = settings_module.get_settings()
+
         return {
             **stats,
             "interval_seconds": self.interval_seconds,
             "label": self.label,
             "open_position": position,
             "recent_trades": trades[:limit],
-            "sl_points": PAPER_SL_POINTS,
-            "trail_trigger_points": PAPER_TRAIL_TRIGGER_POINTS,
-            "trail_distance_points": PAPER_TRAIL_DISTANCE_POINTS,
+            "sl_points": s["paper_sl_points"],
+            "trail_trigger_points": s["paper_trail_trigger_points"],
+            "trail_distance_points": s["paper_trail_distance_points"],
             "readiness": readiness,
         }
 

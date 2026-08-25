@@ -14,8 +14,9 @@ app/analysis.py，在這裡 import 進來、加新的 endpoint 即可，
 
 import asyncio
 import os
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -27,6 +28,7 @@ from app.notifier import notifier
 from app.paper_trading import PAPER_TRADING_ENGINES
 from app.health_monitor import health_monitor
 from app import backtest as backtest_module
+from app import settings as settings_module
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -133,6 +135,38 @@ async def notify_detect_chat_id():
     return notifier.detect_recent_chats()
 
 
+# ---------------------------------------------------------------------------
+# 執行期可調整設定：模擬單風控參數 + 達標門檻，透過dashboard線上調整，
+# 不用進Zeabur後台改環境變數、重新部署。修改需要密碼保護(SETTINGS_PASSWORD)。
+# ---------------------------------------------------------------------------
+
+@app.get("/settings")
+async def get_settings():
+    """
+    回傳目前生效的設定值 + 每個欄位的說明定義(標籤/說明文字/型別/範圍)，
+    dashboard的設定面板直接讀這個來動態產生表單。這支不需要密碼，
+    純讀取不會改動任何東西。
+    """
+    return settings_module.get_settings_with_meta()
+
+
+@app.post("/settings")
+async def update_settings(payload: dict = Body(...)):
+    """
+    更新設定。payload格式: {"password": "...", "values": {"paper_sl_points": 8.0, ...}}。
+    密碼要跟SETTINGS_PASSWORD環境變數一致才能通過，密碼本身沒設定的話一律拒絕
+    (代表使用者還沒去Zeabur做過這唯一一次的初始設定)。
+    """
+    password = payload.get("password", "")
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+
+    values = payload.get("values", {})
+    updated = settings_module.update_settings(values)
+    return {"success": True, "values": updated}
+
+
 @app.get("/paper-trading/summary")
 async def paper_trading_summary(limit: int = 50, interval_seconds: int = 60):
     """
@@ -155,16 +189,19 @@ async def backtest_run(
     interval_seconds: int = 60,
     bucket_size: float = 1.0,
     trade_limit: int = 3000,
-    sl_points: float = 5.0,
-    trail_trigger_points: float = 6.0,
-    trail_distance_points: float = 5.0,
-    reversal_confirm_count: int = 2,
+    sl_points: Optional[float] = None,
+    trail_trigger_points: Optional[float] = None,
+    trail_distance_points: Optional[float] = None,
+    reversal_confirm_count: Optional[int] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
     訊號邏輯和交易規則，快速驗證策略表現，不用乾等即時模擬單累積樣本數。
 
     這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)。
+
+    sl_points等四個風控參數沒有明確指定的話，會自動使用目前dashboard設定面板
+    生效中的參數(跟即時模擬單一致)，不用每次呼叫都重複帶入。
 
     重要：run_backtest()本身是同步、吃CPU的函式，如果直接在這個async函式裡
     呼叫，會整個卡住FastAPI唯一的事件循環，導致回測跑的時候其他所有請求

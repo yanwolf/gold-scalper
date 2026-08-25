@@ -112,6 +112,13 @@ def init_schema():
                     CREATE INDEX IF NOT EXISTS idx_paper_trades_interval
                     ON paper_trades (interval_seconds, status);
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ DEFAULT now()
+                    );
+                """)
             conn.commit()
 
             # 舊版部署可能還有 tp_price 欄位且是 NOT NULL(固定停利機制的殘留)，
@@ -373,3 +380,54 @@ def get_closed_paper_trades(limit=500, interval_seconds=60):
     except Exception as e:
         logger.error(f"讀取模擬單歷史失敗: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# 執行期可調整設定(app_settings) 持久化函式
+# ---------------------------------------------------------------------------
+
+def get_app_settings():
+    """回傳目前資料庫裡存的所有設定，格式 {key: value(字串)}。沒有資料庫時回傳空dict。"""
+    if not _enabled:
+        return {}
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value FROM app_settings;")
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return {r[0]: r[1] for r in rows}
+    except Exception as e:
+        logger.error(f"讀取設定失敗: {e}")
+        return {}
+
+
+def save_app_settings(updates):
+    """
+    寫入/更新設定，updates是 {key: value}。用upsert(ON CONFLICT)，
+    存在就更新、不存在就新增。value一律存成字串，讀取端自己轉型別。
+    """
+    if not _enabled or not updates:
+        return
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                for key, value in updates.items():
+                    cur.execute(
+                        """
+                        INSERT INTO app_settings (key, value, updated_at)
+                        VALUES (%s, %s, now())
+                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+                        """,
+                        (key, str(value)),
+                    )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"寫入設定失敗: {e}")
