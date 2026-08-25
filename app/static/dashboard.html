@@ -715,7 +715,11 @@ function drawPriceLines(profileData, currentPrice){
 async function fetchCandles(profileData, currentPrice){
   const interval = els.chanInterval.value;
   try{
-    const res = await fetch(`/analysis/candles?interval_seconds=${interval}&trade_limit=20000`);
+    // 不手動帶trade_limit，讓後端用預設值(目前是100000，見analysis_candles的
+    // 預設參數)。之前這裡寫死20000，跟後端資料上限調高的時候沒有同步更新，
+    // 導致5分K/15分K只能拼出寥寥幾根K棒，圖表失去參考意義——拿掉寫死的值，
+    // 之後後端預設值再調整，這裡也會自動跟著套用，不用兩邊分別維護。
+    const res = await fetch(`/analysis/candles?interval_seconds=${interval}`);
     if(!res.ok) throw new Error(`K線API回傳錯誤 (${res.status})`);
     const data = await res.json();
     const candles = data.candles || [];
