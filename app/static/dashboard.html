@@ -338,6 +338,18 @@
   .health-alert-banner li{ margin-bottom: 2px; }
 
   footer{ color: var(--muted); font-size: 11px; text-align:center; margin-top: 10px; }
+
+  .tab-bar{
+    display: flex; gap: 6px; margin-bottom: 16px;
+    border-bottom: 1px solid var(--grid); padding-bottom: 0;
+  }
+  .tab-btn{
+    flex: 1; background: transparent; border: none; color: var(--muted);
+    padding: 10px 4px; font-size: 13px; font-weight: 700; cursor: pointer;
+    border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s;
+  }
+  .tab-btn.active{ color: var(--gold); border-bottom-color: var(--gold); }
+  .tab-btn:active{ opacity: 0.7; }
 </style>
 </head>
 <body>
@@ -356,7 +368,20 @@
   </div>
 </header>
 
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="tabMain">主畫面</button>
+  <button class="tab-btn" data-tab="tabTools">回測／掃描</button>
+  <button class="tab-btn" data-tab="tabSettings">設定</button>
+</div>
+
+<div id="tabMain">
+
 <div id="healthAlertBanner"></div>
+
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">K線圖（週期跟下方纏論分析共用）</div>
+  <div id="candleChart" class="candle-chart-container"></div>
+</div>
 
 <div class="signal-panel stage-neutral" id="signalPanel">
   <div class="signal-stage-label">綜合訊號</div>
@@ -365,11 +390,6 @@
     <span class="dir-text" id="signalDir"></span>
   </div>
   <div class="signal-reason-grid" id="signalReasons"></div>
-</div>
-
-<div class="panel">
-  <div class="section-title" style="margin-top:0;">K線圖（週期跟下方纏論分析共用）</div>
-  <div id="candleChart" class="candle-chart-container"></div>
 </div>
 
 <div class="controls">
@@ -427,31 +447,6 @@
 </div>
 
 <div class="panel">
-  <div class="section-title" style="margin-top:0;">Telegram 通知設定</div>
-
-  <div class="notify-status-row">
-    <span class="notify-dot" id="notifyDot"></span>
-    <span id="notifyStatusText">檢查中...</span>
-  </div>
-
-  <div class="controls" style="margin-top:12px;">
-    <button id="notifyTestBtn" class="btn-secondary">傳送測試通知</button>
-    <button id="notifyMuteBtn" class="btn-secondary">暫停通知</button>
-    <button id="notifyDetectBtn" class="btn-secondary">尋找我的 Chat ID</button>
-  </div>
-
-  <div id="notifyResult" class="notify-result"></div>
-  <div id="notifyChatList" class="notify-chat-list"></div>
-
-  <div class="notify-help">
-    還沒設定過？到 Telegram 搜尋 <b>@BotFather</b> 建立bot拿Token，跟bot說一句話後按上面
-    「尋找我的 Chat ID」，把Token和Chat ID填進Zeabur的環境變數
-    <span class="mono">TELEGRAM_BOT_TOKEN</span> / <span class="mono">TELEGRAM_CHAT_ID</span>
-    即可(改完環境變數需要重新部署才會生效)。
-  </div>
-</div>
-
-<div class="panel">
   <div class="section-title" style="margin-top:0;">模擬單績效（尚未接自動下單）</div>
 
   <div class="controls" style="margin-bottom:12px;">
@@ -480,6 +475,9 @@
   <div class="section-title" style="margin-top:16px;">最近成交紀錄</div>
   <div id="paperTradeList" class="bi-list"></div>
 </div>
+</div>
+
+<div id="tabTools" style="display:none;">
 
 <div class="panel">
   <div class="section-title" style="margin-top:0;">歷史回測</div>
@@ -528,6 +526,34 @@
 
   <div id="sweepResult" style="margin-top:14px;"></div>
 </div>
+</div>
+
+<div id="tabSettings" style="display:none;">
+
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">Telegram 通知設定</div>
+
+  <div class="notify-status-row">
+    <span class="notify-dot" id="notifyDot"></span>
+    <span id="notifyStatusText">檢查中...</span>
+  </div>
+
+  <div class="controls" style="margin-top:12px;">
+    <button id="notifyTestBtn" class="btn-secondary">傳送測試通知</button>
+    <button id="notifyMuteBtn" class="btn-secondary">暫停通知</button>
+    <button id="notifyDetectBtn" class="btn-secondary">尋找我的 Chat ID</button>
+  </div>
+
+  <div id="notifyResult" class="notify-result"></div>
+  <div id="notifyChatList" class="notify-chat-list"></div>
+
+  <div class="notify-help">
+    還沒設定過？到 Telegram 搜尋 <b>@BotFather</b> 建立bot拿Token，跟bot說一句話後按上面
+    「尋找我的 Chat ID」，把Token和Chat ID填進Zeabur的環境變數
+    <span class="mono">TELEGRAM_BOT_TOKEN</span> / <span class="mono">TELEGRAM_CHAT_ID</span>
+    即可(改完環境變數需要重新部署才會生效)。
+  </div>
+</div>
 
 <div class="panel">
   <div class="section-title" style="margin-top:0;">策略參數設定</div>
@@ -544,10 +570,28 @@
 
   <div id="settingsResult" class="notify-result"></div>
 </div>
+</div>
 
 <footer id="statusLine">尚未連線</footer>
 
 <script>
+// --- 分頁切換 ---
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const targetId = btn.dataset.tab;
+    ['tabMain', 'tabTools', 'tabSettings'].forEach(id => {
+      document.getElementById(id).style.display = (id === targetId) ? '' : 'none';
+    });
+    // K線圖容器被隱藏過的話寬度會讀到0，切回主畫面時重新校正一次寬度，
+    // 避免圖表跑版(尤其是先切到別的分頁、又切回來的情況)
+    if(targetId === 'tabMain' && typeof priceChart !== 'undefined' && typeof candleChartContainer !== 'undefined'){
+      priceChart.applyOptions({ width: candleChartContainer.clientWidth });
+    }
+  });
+});
+
 const els = {
   bucketSize: document.getElementById('bucketSize'),
   tradeLimit: document.getElementById('tradeLimit'),
