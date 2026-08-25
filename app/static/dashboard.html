@@ -430,6 +430,8 @@
     <div class="stat"><div class="lbl">最大回撤</div><div class="val mono" id="paperMaxDrawdown">--</div></div>
   </div>
 
+  <div id="paperDrawdownPeriod"></div>
+
   <div class="section-title" style="margin-top:16px;">最近成交紀錄</div>
   <div id="paperTradeList" class="bi-list"></div>
 </div>
@@ -1018,7 +1020,25 @@ function renderPaperTrading(data){
   els.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
   els.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
 
+  renderDrawdownPeriod(document.getElementById('paperDrawdownPeriod'), data);
+
   renderTradeList(els.paperTradeList, data.recent_trades);
+}
+
+function renderDrawdownPeriod(el, data){
+  if(!el) return;
+  if(!data.max_drawdown_points || !data.drawdown_peak_time || !data.drawdown_trough_time){
+    el.innerHTML = '';
+    return;
+  }
+  const peakStr = new Date(data.drawdown_peak_time).toLocaleString('zh-TW');
+  const troughStr = new Date(data.drawdown_trough_time).toLocaleString('zh-TW');
+  el.innerHTML = `
+    <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">
+      最大回撤發生區間：帳面高點 <span class="mono">${peakStr}</span> → 谷底 <span class="mono">${troughStr}</span>
+      （這段期間帳面獲利大幅吐回，不代表一直穩定虧損，可對照上方「最近成交紀錄」查看細節）
+    </div>
+  `;
 }
 
 async function fetchPaperTrading(){
@@ -1072,10 +1092,12 @@ els.backtestRunBtn.addEventListener('click', async () => {
         <div class="stat"><div class="lbl">獲利因子</div><div class="val mono">${data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--')}</div></div>
         <div class="stat"><div class="lbl">最大回撤</div><div class="val mono">${data.total_trades ? data.max_drawdown_points.toFixed(2) : '--'}</div></div>
       </div>
+      <div id="backtestDrawdownPeriod"></div>
       <div class="section-title" style="margin-top:16px;">回測交易紀錄</div>
       <div id="backtestTradeList" class="bi-list"></div>
     `;
 
+    renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
     renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades);
   }catch(err){
     els.backtestResult.innerHTML = `<div class="error">回測失敗：${err.message}</div>`;

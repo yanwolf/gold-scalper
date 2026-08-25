@@ -20,6 +20,7 @@ def compute_stats(trades):
             "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate": 0.0,
             "total_pnl_points": 0.0, "avg_win_points": 0.0, "avg_loss_points": 0.0,
             "profit_factor": None, "max_drawdown_points": 0.0,
+            "drawdown_peak_time": None, "drawdown_trough_time": None,
         }
 
     total = len(trades)
@@ -35,19 +36,32 @@ def compute_stats(trades):
     avg_loss = (gross_loss / len(losses)) if losses else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
-    # 最大回撤：把交易依時間排序，算累積損益曲線，抓「從歷史高點回落最多」的那一段
+    # 最大回撤：把交易依時間排序，算累積損益曲線，抓「從歷史高點回落最多」的那一段。
+    # 這個數字代表的是曲線上「峰值到之後最低點」的落差，不是總虧損，兩者是完全不同的
+    # 概念——如果策略曾經帳面大賺一段、後來又把獲利吐回去，最大回撤可以遠大於最終總損益
+    # (例如帳面衝到+130又跌回-30，回撤就有160，但最終總損益可能只是-33)。
+    # 額外記錄峰值/谷底發生在哪一筆、什麼時間，方便診斷這段回撤到底是哪個時期造成的，
+    # 不然只看到一個數字，沒辦法判斷是「一直穩定小賠累積」還是「曾經賺很多後來吐回去」。
     sorted_trades = sorted(
         [t for t in trades if t.get("entry_time") and t.get("pnl_points") is not None],
         key=lambda t: t["entry_time"],
     )
     cumulative = 0.0
     peak = 0.0
+    peak_time = None
     max_drawdown = 0.0
+    drawdown_peak_time = None
+    drawdown_trough_time = None
     for t in sorted_trades:
         cumulative += t["pnl_points"]
-        peak = max(peak, cumulative)
+        if cumulative > peak:
+            peak = cumulative
+            peak_time = t.get("exit_time") or t.get("entry_time")
         drawdown = peak - cumulative
-        max_drawdown = max(max_drawdown, drawdown)
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+            drawdown_peak_time = peak_time
+            drawdown_trough_time = t.get("exit_time") or t.get("entry_time")
 
     return {
         "total_trades": total,
@@ -59,6 +73,8 @@ def compute_stats(trades):
         "avg_loss_points": round(avg_loss, 2),
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else None,
         "max_drawdown_points": round(max_drawdown, 2),
+        "drawdown_peak_time": drawdown_peak_time,     # 回撤起算的高點發生在什麼時候
+        "drawdown_trough_time": drawdown_trough_time,  # 回撤最深的谷底發生在什麼時候
     }
 
 
