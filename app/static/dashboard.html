@@ -286,6 +286,26 @@
     padding: 9px 16px; border-radius: 6px; font-size: 13px; cursor: pointer;
   }
 
+  .sweep-progress{
+    font-size: 12px; color: var(--muted); margin-bottom: 10px;
+  }
+  .sweep-row{
+    display: grid; grid-template-columns: 1fr auto auto auto; gap: 10px;
+    align-items: center; padding: 9px 10px; border-radius: 6px; background: #131a2a;
+    font-size: 11.5px; margin-bottom: 5px;
+  }
+  .sweep-row.best{ border: 1px solid var(--gold); box-shadow: 0 0 8px var(--gold-glow); }
+  .sweep-row.baseline{ border: 1px solid var(--grid); }
+  .sweep-row .sweep-label{ color: var(--text); }
+  .sweep-row .sweep-label .badge{
+    font-size: 9px; font-weight: 700; color: var(--gold); margin-left: 4px;
+  }
+  .sweep-row .sweep-stat{ text-align: right; white-space: nowrap; }
+  .sweep-row .sweep-stat .lbl{ color: var(--muted); font-size: 9px; display:block; }
+  .sweep-row .sweep-stat .val{ font-weight: 700; }
+  .sweep-row .sweep-stat.pos .val{ color: var(--support); }
+  .sweep-row .sweep-stat.neg .val{ color: var(--resistance); }
+
   .health-alert-banner{
     background: var(--resistance-dim); border: 1px solid var(--resistance);
     border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px;
@@ -461,6 +481,30 @@
 </div>
 
 <div class="panel">
+  <div class="section-title" style="margin-top:0;">參數掃描</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
+    一次改一個風控參數(其他維持目前設定)，跑約10組回測，自動比較哪個方向、
+    哪個數值表現比較好，不用手動一個一個試。全部跑完約需1-2分鐘，可以離開
+    這頁再回來看，結果會保留。
+  </div>
+
+  <div class="controls">
+    <select id="sweepInterval">
+      <option value="60" selected>1分K</option>
+      <option value="300">5分K</option>
+    </select>
+    <select id="sweepDays">
+      <option value="1">用 1 天資料</option>
+      <option value="2" selected>用 2 天資料</option>
+      <option value="3">用 3 天資料</option>
+    </select>
+    <button id="sweepStartBtn" class="btn-secondary">開始掃描</button>
+  </div>
+
+  <div id="sweepResult" style="margin-top:14px;"></div>
+</div>
+
+<div class="panel">
   <div class="section-title" style="margin-top:0;">策略參數設定</div>
   <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
     調整模擬單風控參數和達標門檻，不用進Zeabur後台改環境變數。修改需要密碼
@@ -521,6 +565,10 @@ const els = {
   settingsUnlockBtn: document.getElementById('settingsUnlockBtn'),
   settingsForm: document.getElementById('settingsForm'),
   settingsResult: document.getElementById('settingsResult'),
+  sweepInterval: document.getElementById('sweepInterval'),
+  sweepDays: document.getElementById('sweepDays'),
+  sweepStartBtn: document.getElementById('sweepStartBtn'),
+  sweepResult: document.getElementById('sweepResult'),
 };
 
 // --- K線圖初始化 (lightweight-charts) ---
@@ -1200,6 +1248,91 @@ els.settingsUnlockBtn.addEventListener('click', async () => {
   els.settingsLockedView.style.display = 'none';
   els.settingsForm.style.display = '';
   await fetchSettingsView();
+});
+
+// --- 參數掃描 ---
+
+let sweepPollTimer = null;
+
+function renderSweepResults(job){
+  const progressText = job.status === 'done'
+    ? `已完成全部 ${job.total} 組`
+    : `進度：${job.completed} / ${job.total} 組`;
+
+  const results = job.results || [];
+  const validResults = results.filter(r => !r.error && r.total_trades != null);
+  const bestProfitFactor = validResults.length > 0
+    ? Math.max(...validResults.map(r => r.profit_factor || -Infinity))
+    : null;
+
+  const rowsHtml = results.map(r => {
+    if(r.error){
+      return `<div class="sweep-row"><span class="sweep-label">${r.label}</span><span class="sweep-stat" style="grid-column: span 3;">失敗：${r.error}</span></div>`;
+    }
+    const isBaseline = r.label.includes('對照組');
+    const isBest = bestProfitFactor != null && r.profit_factor === bestProfitFactor && !isBaseline;
+    const rowClass = isBest ? 'best' : (isBaseline ? 'baseline' : '');
+    const pnlClass = r.total_pnl_points >= 0 ? 'pos' : 'neg';
+    return `
+      <div class="sweep-row ${rowClass}">
+        <span class="sweep-label">${r.label}${isBest ? '<span class="badge">★最佳</span>' : ''}</span>
+        <span class="sweep-stat"><span class="lbl">勝率</span><span class="val">${r.win_rate}%</span></span>
+        <span class="sweep-stat ${pnlClass}"><span class="lbl">總損益</span><span class="val">${r.total_pnl_points.toFixed(1)}</span></span>
+        <span class="sweep-stat"><span class="lbl">獲利因子</span><span class="val">${r.profit_factor != null ? r.profit_factor.toFixed(2) : '--'}</span></span>
+      </div>
+    `;
+  }).join('');
+
+  els.sweepResult.innerHTML = `
+    <div class="sweep-progress">${progressText}${job.status !== 'done' ? '（背景持續運算中，可以先做其他事，稍後回來看結果會保留）' : ''}</div>
+    ${rowsHtml || '<div class="empty">尚無結果</div>'}
+  `;
+}
+
+async function pollSweep(jobId){
+  try{
+    const res = await fetch(`/backtest/sweep/${jobId}`);
+    if(!res.ok) throw new Error(`查詢失敗 (${res.status})`);
+    const job = await res.json();
+    if(job.error){
+      els.sweepResult.innerHTML = `<div class="error">${job.error}</div>`;
+      clearInterval(sweepPollTimer);
+      return;
+    }
+    renderSweepResults(job);
+    if(job.status === 'done'){
+      clearInterval(sweepPollTimer);
+      els.sweepStartBtn.disabled = false;
+      els.sweepStartBtn.textContent = '開始掃描';
+    }
+  }catch(err){
+    els.sweepResult.innerHTML = `<div class="error">查詢失敗：${err.message}</div>`;
+    clearInterval(sweepPollTimer);
+    els.sweepStartBtn.disabled = false;
+    els.sweepStartBtn.textContent = '開始掃描';
+  }
+}
+
+els.sweepStartBtn.addEventListener('click', async () => {
+  const days = els.sweepDays.value;
+  const intervalSeconds = els.sweepInterval.value;
+  els.sweepStartBtn.disabled = true;
+  els.sweepStartBtn.textContent = '掃描中...';
+  els.sweepResult.innerHTML = '<div class="loading-spinner">正在啟動掃描...</div>';
+
+  try{
+    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}`, { method: 'POST' });
+    if(!res.ok) throw new Error(`啟動失敗 (${res.status})`);
+    const data = await res.json();
+
+    if(sweepPollTimer) clearInterval(sweepPollTimer);
+    sweepPollTimer = setInterval(() => pollSweep(data.job_id), 3000);
+    pollSweep(data.job_id);
+  }catch(err){
+    els.sweepResult.innerHTML = `<div class="error">啟動失敗：${err.message}</div>`;
+    els.sweepStartBtn.disabled = false;
+    els.sweepStartBtn.textContent = '開始掃描';
+  }
 });
 
 startPolling();

@@ -28,6 +28,7 @@ from app.notifier import notifier
 from app.paper_trading import PAPER_TRADING_ENGINES
 from app.health_monitor import health_monitor
 from app import backtest as backtest_module
+from app import sweep as sweep_module
 from app import settings as settings_module
 from app import db
 
@@ -220,6 +221,33 @@ async def backtest_run(
         trail_distance_points=trail_distance_points,
         reversal_confirm_count=reversal_confirm_count,
     )
+
+
+@app.post("/backtest/sweep")
+async def backtest_sweep_start(days: int = 2, interval_seconds: int = 60):
+    """
+    參數掃描：對模擬單風控參數做「一次改一個參數」的敏感度測試，一次跑多組回測，
+    自動比較哪個參數方向、哪個數值表現比較好，不用手動一個一個試。
+
+    立刻回傳job_id，實際運算在背景執行緒進行(不是asyncio.to_thread，是獨立的
+    plain thread，因為要跑好幾組回測、耗時比單次回測長很多，用背景執行緒讓
+    這支API能馬上回應，前端輪詢 GET /backtest/sweep/{job_id} 追蹤進度)。
+
+    天數預設用2天(單組回測較快)，掃描本身會跑約10組回測，全部跑完可能要
+    1-2分鐘，請求發起後用輪詢確認進度，不要每次都拉長天數，跑更多天在
+    掃描情境下時間會乘以組數，容易太久。
+    """
+    job_id = sweep_module.start_sweep(days=days, interval_seconds=interval_seconds)
+    return {"job_id": job_id}
+
+
+@app.get("/backtest/sweep/{job_id}")
+async def backtest_sweep_status(job_id: str):
+    """查詢參數掃描的進度和目前已完成的結果(結果會隨著背景執行緒跑完一組一組累積)。"""
+    job = sweep_module.get_job(job_id)
+    if job is None:
+        return {"error": "找不到這個掃描任務(job_id可能錯誤，或服務重啟過導致任務遺失)"}
+    return job
 
 
 @app.get("/price/latest")
