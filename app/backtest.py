@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from app.signal_engine import compute_signal_from_trades, CHAN_LOOKBACK_TRADES
+from app.signal_engine import compute_signal_from_trades
 from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
@@ -36,6 +36,15 @@ MAX_KLINES_PER_REQUEST = 1500
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
+
+# 回測「逐步重播」用的資料窗口大小，刻意跟即時資料流的CHAN_LOOKBACK_TRADES分開設定，
+# 不要import共用同一個常數。原因：即時資料流的100000是為了「連續運作、真實時間
+# 跨度」而設(見signal_engine.py)，但回測是每一步都要重新算一次纏論，窗口越大、
+# 單步成本越高，30天回測有上千步，等於把這個放大成本乘了上千遍，實測會拖到
+# 30-60秒以上，加上真實部署還要跟Binance來回抓K線，容易在手機瀏覽器/反向代理
+# 逾時前跑不完(修正記錄見README)。20000是先前已經驗證過「7天回測15秒內」的
+# 安全值，回測本身用合成成交重播，不需要跟即時5分K/15分K一樣長的真實時間跨度。
+BACKTEST_CHAN_WINDOW_TRADES = 20000
 
 MAX_BACKTEST_DAYS = 30  # 天數上限，從7天拉長到30天，為之後測試更長週期(例如1小時K)預留空間。
                         # 運算時間本身不會因為天數變長而爆炸(TARGET_STEP_COUNT的取樣間隔機制
@@ -132,8 +141,10 @@ def run_backtest(
     效能設計重點(修正記錄，見README)：
     - 用bisect在已排序的trades時間清單上做二分搜尋定位每一步的「目前為止」邊界，
       取代原本每一步都重新掃過整份trades清單的O(n^2)寫法
-    - 每一步只保留最近CHAN_LOOKBACK_TRADES筆(這也是compute_signal_from_trades內部
-      實際會用到的上限)，避免隨著回測天數增加，切片大小跟著無限成長
+    - 每一步只保留最近BACKTEST_CHAN_WINDOW_TRADES筆，避免隨著回測天數增加，
+      切片大小跟著無限成長。這個窗口大小刻意跟即時資料流的CHAN_LOOKBACK_TRADES
+      分開設定，不要共用同一個常數(曾經共用過，導致即時資料流的窗口調大時
+      意外拖垮回測效能，詳見README修正記錄)
 
     sl_points/trail_trigger_points/trail_distance_points/reversal_confirm_count/
     use_atr/atr_*_multiplier 沒有明確傳入(None)時，會即時從settings.py讀取目前
@@ -192,9 +203,9 @@ def run_backtest(
         if cutoff_index < 20:  # 資料太少，跳過這一步(通常是回測最一開始的幾步)
             continue
 
-        # 只取最近CHAN_LOOKBACK_TRADES筆，跟即時模式的資料窗口大小一致，
+        # 只取最近BACKTEST_CHAN_WINDOW_TRADES筆(跟即時資料流的窗口大小分開設定)，
         # 避免切片大小隨著回測進度不斷成長拖慢速度
-        window_start = max(0, cutoff_index - CHAN_LOOKBACK_TRADES)
+        window_start = max(0, cutoff_index - BACKTEST_CHAN_WINDOW_TRADES)
         trades_so_far = trades[window_start:cutoff_index]
 
         current_price = trades_so_far[-1]["price"]
