@@ -74,7 +74,7 @@ FIELD_META = {
         "help": "從歷史高點回落最多的那一段(points)超過這個值就不算達標，衡量連續虧損的嚴重程度。",
     },
     "paper_use_atr_stops": {
-        "label": "使用ATR動態停損 (0=關閉固定點數 / 1=開啟ATR動態)",
+        "label": "使用ATR動態停損 (0=關閉ATR，用固定點數 / 1=開啟ATR動態)",
         "type": "int", "step": 1, "min": 0, "max": 1,
         "default": int(os.getenv("PAPER_USE_ATR_STOPS", "0")),
         "help": "開啟後，停損/移動停損距離會用ATR(近期實際波動幅度)動態計算，"
