@@ -21,11 +21,24 @@ from app import settings as settings_module
 
 logger = logging.getLogger("sweep")
 
-# 每個參數要測試的候選值清單，掃描時逐一替換這裡的值(其他參數維持baseline不變)
-PARAM_CANDIDATES = {
+# 固定點數模式下才有意義的參數：ATR模式開啟時，run_backtest會直接忽略這些
+# 固定點數值(改用ATR動態計算)，這時候掃這些參數只會拿到一堆跟對照組一模一樣
+# 的無意義結果(這是實際發生過的bug，見README修正記錄)
+FIXED_MODE_PARAM_CANDIDATES = {
     "paper_sl_points": [3.0, 5.0, 8.0, 12.0],
     "paper_trail_trigger_points": [3.0, 6.0, 10.0],
     "paper_trail_distance_points": [3.0, 5.0, 8.0],
+}
+
+# ATR模式開啟時才有意義的參數：固定點數模式下，改這些倍數同樣不會有任何效果
+ATR_MODE_PARAM_CANDIDATES = {
+    "paper_atr_sl_multiplier": [1.0, 1.5, 2.0, 3.0],
+    "paper_atr_trigger_multiplier": [1.0, 1.5, 2.0],
+    "paper_atr_trail_multiplier": [0.8, 1.2, 1.8],
+}
+
+# 不管哪種模式都有實際效果的參數
+ALWAYS_ACTIVE_PARAM_CANDIDATES = {
     "paper_reversal_confirm_count": [1, 2, 3],
 }
 
@@ -34,6 +47,9 @@ PARAM_LABELS = {
     "paper_trail_trigger_points": "移動停損觸發距離",
     "paper_trail_distance_points": "移動停損跟隨距離",
     "paper_reversal_confirm_count": "訊號反轉確認次數",
+    "paper_atr_sl_multiplier": "ATR初始停損倍數",
+    "paper_atr_trigger_multiplier": "ATR移動停損觸發倍數",
+    "paper_atr_trail_multiplier": "ATR移動停損跟隨倍數",
 }
 
 _jobs = {}
@@ -43,13 +59,24 @@ _jobs_lock = threading.Lock()
 def _build_combos():
     """
     baseline(目前生效中的設定)當對照組，其他每組都是「改一個參數」的變化版本。
-    另外加一組「切換ATR動態停損開關」的對照(如果目前是固定點數模式，就多測一組
+
+    重要：只測「在目前模式下真的會影響結果」的參數——如果baseline目前是ATR
+    動態模式，就測ATR的三個倍數，不測固定點數(因為固定點數模式關閉時完全不會
+    被用到，測了也是白測，會出現一堆數值跟對照組一樣的無意義結果)；反過來
+    如果baseline是固定點數模式，就只測固定點數，不測ATR倍數。
+
+    另外固定加一組「切換ATR開關」的對照(如果目前是固定點數模式，就多測一組
     ATR動態模式；反過來也一樣)，方便直接比較兩種停損機制哪個表現比較好。
     """
     baseline = settings_module.get_settings()
     combos = [{"label": "目前設定(對照組)", "params": dict(baseline)}]
 
-    for param_key, candidates in PARAM_CANDIDATES.items():
+    mode_specific_candidates = (
+        ATR_MODE_PARAM_CANDIDATES if baseline["paper_use_atr_stops"] else FIXED_MODE_PARAM_CANDIDATES
+    )
+    all_candidates = {**mode_specific_candidates, **ALWAYS_ACTIVE_PARAM_CANDIDATES}
+
+    for param_key, candidates in all_candidates.items():
         for value in candidates:
             if value == baseline[param_key]:
                 continue  # 跟對照組一樣的值不用重複跑
@@ -62,7 +89,7 @@ def _build_combos():
 
     atr_toggle_params = dict(baseline)
     atr_toggle_params["paper_use_atr_stops"] = 0 if baseline["paper_use_atr_stops"] else 1
-    toggle_label = "ATR動態停損(關閉)" if baseline["paper_use_atr_stops"] else "ATR動態停損(開啟)"
+    toggle_label = "ATR動態停損(關閉，改用固定點數)" if baseline["paper_use_atr_stops"] else "ATR動態停損(開啟)"
     combos.append({"label": toggle_label, "params": atr_toggle_params})
 
     return combos
