@@ -227,31 +227,86 @@ def _build_bi(fenxing, min_gap=1):
 
 def _find_zhongshu(bi_list):
     """
-    中樞判斷：連續三筆(bi[i], bi[i+1], bi[i+2])的價格區間有重疊，
-    重疊區間 = [max(低點), min(高點)]，此區間有效(下界<上界)則構成一個中樞。
-    之後如果後續的筆還在這個區間內延伸，中樞會持續擴張(這裡先抓出基本的三筆中樞，
-    擴張邏輯留待下一版加)。
+    中樞判斷 + 延伸：連續三筆(bi[i], bi[i+1], bi[i+2])的價格區間有重疊，
+    重疊區間 = [max(低點), min(高點)]，此區間有效(下界<上界)則構成一個中樞，
+    核心邊界(ZG/ZD)就固定在這三筆算出來的值，不會再變動。
+
+    之後檢查後續的筆有沒有延伸這個中樞：只要該筆的價格區間還跟[ZD, ZG]有重疊，
+    就算「延伸」，中樞的時間範圍往後拉長、納入更多筆，但ZG/ZD不變；一旦某一筆
+    完全不跟[ZD, ZG]重疊了，代表真正突破，這個中樞到此結束。
+
+    掃描完一個延伸完的中樞後，從突破那一筆重新開始找下一個中樞，避免產生
+    大量重疊、邊界互相矛盾的中樞紀錄(這是舊版「每3筆重新算一次」的問題，
+    同一段真實的中樞會被拆成好幾個ZG/ZD不一致的片段)。
     """
     zhongshu_list = []
-    for i in range(len(bi_list) - 2):
+    i = 0
+    n = len(bi_list)
+
+    while i <= n - 3:
         b1, b2, b3 = bi_list[i], bi_list[i + 1], bi_list[i + 2]
 
         highs = [max(b["start_price"], b["end_price"]) for b in (b1, b2, b3)]
         lows = [min(b["start_price"], b["end_price"]) for b in (b1, b2, b3)]
 
-        zg = min(highs)  # 中樞上界
-        zd = max(lows)   # 中樞下界
+        zg = min(highs)
+        zd = max(lows)
 
-        if zg > zd:
-            zhongshu_list.append({
-                "start_time": b1["start_time"],
-                "end_time": b3["end_time"],
-                "zg": zg,
-                "zd": zd,
-                "bi_indices": [i, i + 1, i + 2],
-            })
+        if zg <= zd:
+            # 這三筆不構成中樞，往後移一筆繼續嘗試(維持原本逐筆掃描的行為)
+            i += 1
+            continue
+
+        # 找到一個有效中樞，接著嘗試延伸：檢查後面的筆是否還跟[zd, zg]重疊
+        end_index = i + 2
+        bi_indices = [i, i + 1, i + 2]
+
+        j = i + 3
+        while j < n:
+            bj = bi_list[j]
+            bj_high = max(bj["start_price"], bj["end_price"])
+            bj_low = min(bj["start_price"], bj["end_price"])
+
+            still_overlaps = bj_high >= zd and bj_low <= zg
+            if not still_overlaps:
+                break  # 真正突破，延伸到此為止
+
+            end_index = j
+            bi_indices.append(j)
+            j += 1
+
+        zhongshu_list.append({
+            "start_time": b1["start_time"],
+            "end_time": bi_list[end_index]["end_time"],
+            "zg": zg,
+            "zd": zd,
+            "bi_indices": bi_indices,
+            "bi_count": len(bi_indices),
+            "is_extended": len(bi_indices) > 3,
+        })
+
+        # 從突破那一筆(j)開始找下一個中樞，不重疊回顧已經納入這個中樞的筆
+        i = j if j > i + 2 else i + 1
 
     return zhongshu_list
+
+
+def _find_trend_zhongshu_pair(zhongshu_list):
+    """
+    在最新的中樞之前，往回找一個「不重疊」的中樞，兩者合起來才構成真正的趨勢
+    (纏論定義：至少兩個中樞、且價格區間不重疊，才算走出一個趨勢，而不只是
+    同一個大區間裡的盤整)。回傳(前一個趨勢中樞, 最新中樞)，找不到就回傳(None, 最新中樞)。
+    """
+    if not zhongshu_list:
+        return None, None
+
+    latest = zhongshu_list[-1]
+    for candidate in reversed(zhongshu_list[:-1]):
+        overlaps = candidate["zg"] >= latest["zd"] and candidate["zd"] <= latest["zg"]
+        if not overlaps:
+            return candidate, latest
+
+    return None, latest
 
 
 def _ema(values, period):
@@ -275,14 +330,21 @@ def _macd_histogram(closes, fast=12, slow=26, signal=9):
     return hist
 
 
-def _detect_beichi(bi_list, merged_candles):
+def _detect_beichi(bi_list, merged_candles, zhongshu_list):
     """
-    背馳判斷(簡化版)：取同方向、且都跟同一個中樞相關的最後兩筆走勢，
-    比較「價格是否創新高/新低」與「MACD柱狀圖面積是否縮小」。
-    價格創新極值但動能(MACD面積)不如前一筆 -> 判定為背馳，是短線可能反轉的訊號。
+    背馳判斷，區分「趨勢背馳」跟「盤整背馳」兩種可信度不同的類型：
+
+    - 趨勢背馳：需要至少兩個「不重疊」的中樞(纏論定義的真正趨勢結構)，
+      比較「連接兩個中樞之間的那一段走勢」跟「離開最新中樞的這一段走勢」，
+      這是代表整個趨勢動能衰竭的訊號，可信度較高。
+    - 盤整背馳：找不到兩個不重疊中樞時，退回比較最近兩筆同方向走勢，
+      這種背馳範圍比較局部(可能只是同一個中樞內部的暫停)，可信度較低。
+
+    兩種類型都用同一套「價格創新極值 + MACD柱狀圖面積縮小」的判斷方式，
+    差別只在於「拿什麼去比較」，這個差異會讓signal.py給不同的訊號強度。
     """
     if len(bi_list) < 4:
-        return {"has_beichi": False, "detail": "筆的數量不足，還無法判斷背馳"}
+        return {"has_beichi": False, "beichi_type": None, "detail": "筆的數量不足，還無法判斷背馳"}
 
     closes = [c["close"] for c in merged_candles]
     hist = _macd_histogram(closes)
@@ -293,34 +355,47 @@ def _detect_beichi(bi_list, merged_candles):
         segment = hist[start:end + 1]
         return sum(abs(h) for h in segment)
 
-    same_direction_bi = [b for b in bi_list if b["direction"] == bi_list[-1]["direction"]]
+    last_bi = bi_list[-1]
+    same_direction_bi = [b for b in bi_list if b["direction"] == last_bi["direction"]]
     if len(same_direction_bi) < 2:
-        return {"has_beichi": False, "detail": "同方向筆數不足，還無法判斷背馳"}
+        return {"has_beichi": False, "beichi_type": None, "detail": "同方向筆數不足，還無法判斷背馳"}
 
-    last_bi = same_direction_bi[-1]
-    prev_bi = same_direction_bi[-2]
+    # 預設用「盤整背馳」的比較方式：最近兩筆同方向走勢
+    compare_bi = same_direction_bi[-2]
+    beichi_type = "盤整背馳" if zhongshu_list else "背馳(無中樞參考)"
+
+    # 嘗試升級成「趨勢背馳」：需要兩個不重疊的中樞，且中間連接的那一筆方向
+    # 要跟目前這筆一致，才代表這真的是同一個趨勢方向上的動能比較
+    prev_zhongshu, latest_zhongshu = _find_trend_zhongshu_pair(zhongshu_list)
+    if prev_zhongshu is not None and latest_zhongshu is not None:
+        connecting_index = latest_zhongshu["bi_indices"][0] - 1
+        if 0 <= connecting_index < len(bi_list):
+            connecting_bi = bi_list[connecting_index]
+            if connecting_bi["direction"] == last_bi["direction"]:
+                compare_bi = connecting_bi
+                beichi_type = "趨勢背馳"
 
     last_area = bi_macd_area(last_bi)
-    prev_area = bi_macd_area(prev_bi)
+    compare_area = bi_macd_area(compare_bi)
 
     if last_bi["direction"] == "up":
-        price_new_extreme = last_bi["end_price"] > prev_bi["end_price"]
+        price_new_extreme = last_bi["end_price"] > compare_bi["end_price"]
     else:
-        price_new_extreme = last_bi["end_price"] < prev_bi["end_price"]
+        price_new_extreme = last_bi["end_price"] < compare_bi["end_price"]
 
-    momentum_weaker = last_area < prev_area
-
+    momentum_weaker = last_area < compare_area
     has_beichi = price_new_extreme and momentum_weaker
 
     return {
         "has_beichi": has_beichi,
+        "beichi_type": beichi_type,
         "direction": last_bi["direction"],
         "last_bi_macd_area": round(last_area, 4),
-        "prev_bi_macd_area": round(prev_area, 4),
+        "compare_bi_macd_area": round(compare_area, 4),
         "price_made_new_extreme": price_new_extreme,
         "detail": (
-            "價格創新極值但動能縮小，屬於背馳訊號" if has_beichi
-            else "尚未同時滿足價格新極值+動能縮小兩個條件"
+            f"【{beichi_type}】價格創新極值但動能縮小，屬於背馳訊號" if has_beichi
+            else f"【{beichi_type}】尚未同時滿足價格新極值+動能縮小兩個條件"
         ),
     }
 
@@ -328,7 +403,7 @@ def _detect_beichi(bi_list, merged_candles):
 def analyze_chan(candles):
     """
     纏論分析主入口：輸入K線清單(build_candles的輸出)，
-    回傳分型/筆/中樞/背馳的完整分析結果。
+    回傳分型/筆/中樞(含延伸)/背馳(區分趨勢/盤整)的完整分析結果。
     """
     if len(candles) < 5:
         return {
@@ -340,7 +415,10 @@ def analyze_chan(candles):
     fenxing = _find_fenxing(merged)
     bi_list = _build_bi(fenxing)
     zhongshu_list = _find_zhongshu(bi_list)
-    beichi = _detect_beichi(bi_list, merged) if bi_list else {"has_beichi": False, "detail": "尚無筆可供判斷"}
+    beichi = (
+        _detect_beichi(bi_list, merged, zhongshu_list) if bi_list
+        else {"has_beichi": False, "beichi_type": None, "detail": "尚無筆可供判斷"}
+    )
 
     return {
         "merged_candle_count": len(merged),

@@ -23,15 +23,21 @@ def _evaluate_chan_bias(chan_data):
     beichi = chan_data.get("beichi") or {}
     if beichi.get("has_beichi"):
         direction = beichi.get("direction")
+        beichi_type = beichi.get("beichi_type")
+        # 趨勢背馳(至少兩個不重疊中樞構成的真正趨勢)給strong權重；
+        # 盤整背馳(範圍局部，可能只是中樞內部暫停)降級成weak，
+        # 這樣「訊號」階段只會在趨勢背馳、或盤整背馳+分價量表也強烈同向時才觸發，
+        # 避免把可信度較低的局部背馳當成跟趨勢背馳同等級的訊號處理
+        strength = "strong" if beichi_type == "趨勢背馳" else "weak"
         if direction == "up":
             return {
-                "bias": "bearish", "strength": "strong",
-                "reason": f"上漲段出現背馳，動能較前一段減弱（{beichi.get('detail', '')}），留意反轉向下",
+                "bias": "bearish", "strength": strength,
+                "reason": f"上漲段出現{beichi_type}，動能較前一段減弱（{beichi.get('detail', '')}），留意反轉向下",
             }
         elif direction == "down":
             return {
-                "bias": "bullish", "strength": "strong",
-                "reason": f"下跌段出現背馳，動能較前一段減弱（{beichi.get('detail', '')}），留意反彈向上",
+                "bias": "bullish", "strength": strength,
+                "reason": f"下跌段出現{beichi_type}，動能較前一段減弱（{beichi.get('detail', '')}），留意反彈向上",
             }
 
     zhongshu = chan_data.get("latest_zhongshu")
