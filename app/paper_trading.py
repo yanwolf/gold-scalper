@@ -208,6 +208,7 @@ class PaperTradingEngine:
             "open_position": position,
             "recent_trades": trades[:limit],
             "active_settings": settings_module.get_settings(),
+            "settings_changed_at": settings_module.get_last_changed_at(),
             "readiness": readiness,
         }
 

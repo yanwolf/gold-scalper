@@ -16,11 +16,13 @@ dashboard的設定面板直接讀這份定義動態產生表單，不用在前�
 import os
 import threading
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger("settings")
 
 _lock = threading.Lock()
 _loaded_from_db = False
+_last_changed_at = None  # 給dashboard標示「哪些交易是新設定生效後產生的」用
 
 # 每個設定項的定義：型別、預設值(來自環境變數，跟舊版行為相容)、
 # 給使用者看的標籤和說明文字、輸入框的建議範圍(給前端input的min/max/step用)
@@ -119,6 +121,7 @@ FIELD_META = {
 }
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}
+_LAST_CHANGED_DB_KEY = "_meta_last_changed_at"  # app_settings表裡的保留key，不是FIELD_META裡的一般設定項
 
 
 def _cast(key, raw_value):
@@ -128,7 +131,7 @@ def _cast(key, raw_value):
 
 def _load_from_db():
     """服務啟動後第一次呼叫get_settings()/update_settings()時，把資料庫裡存的值蓋過環境變數預設值。"""
-    global _loaded_from_db
+    global _loaded_from_db, _last_changed_at
     if _loaded_from_db:
         return
 
@@ -143,6 +146,8 @@ def _load_from_db():
                     _settings[key] = _cast(key, raw_value)
                 except (TypeError, ValueError):
                     logger.warning(f"資料庫裡的設定值 {key}={raw_value} 型別轉換失敗，忽略")
+            if _LAST_CHANGED_DB_KEY in stored:
+                _last_changed_at = stored[_LAST_CHANGED_DB_KEY]
     _loaded_from_db = True
 
 
@@ -155,7 +160,17 @@ def get_settings():
 
 def get_settings_with_meta():
     """給dashboard設定面板用：回傳目前值 + 每個欄位的說明定義，前端可以直接動態產生表單。"""
-    return {"values": get_settings(), "meta": FIELD_META}
+    return {"values": get_settings(), "meta": FIELD_META, "last_changed_at": _last_changed_at}
+
+
+def get_last_changed_at():
+    """
+    給paper_trading.py的get_summary()用：回傳設定上次被實際修改的時間(ISO字串，
+    從未修改過則是None)。用來讓dashboard標示「哪些交易紀錄是新設定生效後產生的」，
+    避免使用者誤以為改參數後畫面沒反應——舊的已平倉交易本來就不會被追溯修改，
+    只有進場時間晚於這個時間點的交易才是新設定底下的結果。
+    """
+    return _last_changed_at
 
 
 def update_settings(updates: dict):
@@ -165,6 +180,8 @@ def update_settings(updates: dict):
     """
     _load_from_db()
     from app import db
+
+    global _last_changed_at
 
     applied = {}
     with _lock:
@@ -183,8 +200,13 @@ def update_settings(updates: dict):
             _settings[key] = casted
             applied[key] = casted
 
+        if applied:
+            _last_changed_at = datetime.now(timezone.utc).isoformat()
+
     if db.is_enabled() and applied:
-        db.save_app_settings(applied)
+        db_applied = dict(applied)
+        db_applied[_LAST_CHANGED_DB_KEY] = _last_changed_at
+        db.save_app_settings(db_applied)
 
     return dict(_settings)
 

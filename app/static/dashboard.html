@@ -251,6 +251,13 @@
   .active-config-card .cfg-value.on{ color: var(--gold); }
   .active-config-card .cfg-value.off{ color: var(--muted); }
 
+  .settings-divider{
+    text-align: center; font-size: 10px; color: var(--gold); padding: 8px 0;
+    border-top: 1px dashed var(--grid); border-bottom: 1px dashed var(--grid);
+    margin: 6px 0;
+  }
+  .paper-trade-row.is-old-settings{ opacity: 0.55; }
+
   .paper-trade-row{
     display:grid; grid-template-columns: 40px 1fr auto; align-items:center; gap: 10px;
     padding: 7px 10px; border-radius: 6px; background: #131a2a; font-size: 11.5px;
@@ -1037,28 +1044,47 @@ function renderReadinessBanner(el, readiness){
   `;
 }
 
-function renderTradeList(el, trades){
+function renderTradeList(el, trades, settingsChangedAt){
   if(!trades || trades.length === 0){
     el.innerHTML = '<div class="empty">尚無已平倉紀錄</div>';
     return;
   }
-  el.innerHTML = trades.map(t => {
+
+  const changedAtMs = settingsChangedAt ? new Date(settingsChangedAt).getTime() : null;
+  let dividerInserted = !changedAtMs; // 沒有變更時間就不用插分隔線
+
+  const rows = trades.map(t => {
     const dirLabel = t.direction === 'bullish' ? '多' : '空';
     const isWin = t.pnl_points > 0;
     const pnlClass = isWin ? 'win' : 'loss';
     const pnlText = `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}`;
     const exitTime = t.exit_time ? new Date(t.exit_time).toLocaleString('zh-TW') : '';
+    const entryMs = t.entry_time ? new Date(t.entry_time).getTime() : null;
+
+    let dividerHtml = '';
+    // trades是新到舊排序，第一次遇到「進場時間早於設定變更時間」的那一筆之前插分隔線，
+    // 分隔線以上都是新設定生效後才進場的交易，以下是舊設定底下的歷史紀錄
+    if(!dividerInserted && entryMs != null && entryMs < changedAtMs){
+      dividerHtml = `<div class="settings-divider">↑ 以上為目前設定生效後的交易　／　以下為舊設定的歷史紀錄 ↓</div>`;
+      dividerInserted = true;
+    }
+
+    const isOld = changedAtMs && entryMs != null && entryMs < changedAtMs;
+
     return `
-      <div class="paper-trade-row">
+      ${dividerHtml}
+      <div class="paper-trade-row ${isOld ? 'is-old-settings' : ''}">
         <span class="dir ${t.direction}">${dirLabel}</span>
         <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）</span>
         <span class="pnl ${pnlClass}">${pnlText}</span>
       </div>
     `;
-  }).join('');
+  });
+
+  el.innerHTML = rows.join('');
 }
 
-function renderActiveConfig(el, activeSettings, label){
+function renderActiveConfig(el, activeSettings, label, settingsChangedAt){
   if(!el || !activeSettings) { if(el) el.innerHTML = ''; return; }
   const s = activeSettings;
 
@@ -1081,18 +1107,23 @@ function renderActiveConfig(el, activeSettings, label){
     ? `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value on">開啟(門檻 ${s.paper_chop_threshold})</span></div>`
     : `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value off">關閉</span></div>`;
 
+  const changedAtHtml = settingsChangedAt
+    ? `<div class="cfg-row"><span class="cfg-label">上次修改</span><span class="cfg-value">${new Date(settingsChangedAt).toLocaleString('zh-TW')}</span></div>`
+    : `<div class="cfg-row"><span class="cfg-label">上次修改</span><span class="cfg-value off">尚未修改過(使用環境變數預設值)</span></div>`;
+
   el.innerHTML = `
     <div class="active-config-card">
       <div class="cfg-title">目前策略設定（${label}）</div>
       ${stopModeHtml}
       <div class="cfg-row"><span class="cfg-label">訊號反轉確認次數</span><span class="cfg-value">${s.paper_reversal_confirm_count}</span></div>
       ${chopHtml}
+      ${changedAtHtml}
     </div>
   `;
 }
 
 function renderPaperTrading(data){
-  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label);
+  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at);
 
   if(data.open_position){
     const p = data.open_position;
@@ -1123,7 +1154,7 @@ function renderPaperTrading(data){
 
   renderDrawdownPeriod(document.getElementById('paperDrawdownPeriod'), data);
 
-  renderTradeList(els.paperTradeList, data.recent_trades);
+  renderTradeList(els.paperTradeList, data.recent_trades, data.settings_changed_at);
 }
 
 function renderDrawdownPeriod(el, data){
@@ -1137,7 +1168,7 @@ function renderDrawdownPeriod(el, data){
   el.innerHTML = `
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">
       最大回撤發生區間：帳面高點 <span class="mono">${peakStr}</span> → 谷底 <span class="mono">${troughStr}</span>
-      （這段期間帳面獲利大幅吐回，不代表一直穩定虧損，可對照上方「最近成交紀錄」查看細節）
+      （這段期間帳面獲利大幅吐回，不代表一直穩定虧損，可對照下方「成交紀錄」查看細節）
     </div>
   `;
 }
