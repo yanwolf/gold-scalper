@@ -31,7 +31,10 @@ PUBLIC_WS_URL = f"wss://fstream.binance.com/public/stream?streams={SYMBOL}@bookT
 MARKET_WS_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@aggTrade"
 
 MAX_TICK_HISTORY = 2000
-MAX_TRADE_HISTORY = 20000  # 逐筆成交量比報價更新頻繁，保留更多筆給分析模組用
+MAX_TRADE_HISTORY = 60000  # 逐筆成交量比報價更新頻繁，保留更多筆給分析模組用
+                           # (從20000提高到60000：5分K/15分K纏論一根K棒平均要吃掉
+                           # 5倍於1分K的成交筆數才能湊滿，同樣的筆數上限對5分K來說
+                           # 一直偏緊，尤其服務重啟、記憶體歸零重新累積時特別明顯)
 DB_FLUSH_INTERVAL_SECONDS = 20  # 多久把新累積的逐筆成交寫進資料庫一次
 
 

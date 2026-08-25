@@ -174,7 +174,7 @@ def insert_trades(trades):
         _last_write_error = str(e)
 
 
-def load_recent_trades(limit=20000):
+def load_recent_trades(limit=60000):
     """
     服務啟動時呼叫：從資料庫撈最近N筆成交，回填進記憶體，
     讓分析模組不用等重新累積就能立刻有資料可用。

@@ -284,7 +284,7 @@ async def recent_ticks_binance(limit: int = 200):
 # ---------------------------------------------------------------------------
 
 @app.get("/analysis/candles")
-async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 20000):
+async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 60000):
     """
     K線聚合。預設5分鐘一根，資料源是 Binance 的逐筆成交(aggTrade)。
     interval_seconds 可調整週期，例如 60 就是1分鐘K線，方便之後往下切。
@@ -299,7 +299,7 @@ async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 20000
 
 
 @app.get("/analysis/volume-profile")
-async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 20000):
+async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 60000):
     """
     分價量表。bucket_size 是每個價格箱的寬度(單位:USD)，例如0.5會分得更細。
     trade_limit 控制回看多少筆逐筆成交，數字越大涵蓋的時間範圍越長。
@@ -316,7 +316,7 @@ async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 2
 
 
 @app.get("/analysis/chan")
-async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 20000):
+async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 60000):
     """
     纏論分析：分型 -> 筆 -> 中樞 -> 背馳判斷。
     預設用5分鐘K線(interval_seconds=300)，之後要往下切1分鐘只要改參數即可，
