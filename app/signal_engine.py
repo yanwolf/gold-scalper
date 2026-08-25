@@ -14,7 +14,10 @@
 """
 
 from app.binance_client import binance_streamer
-from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, compute_atr
+from app.analysis import (
+    build_candles, compute_volume_profile, poc_and_value_area, analyze_chan,
+    compute_atr, compute_choppiness_index,
+)
 from app.signal import generate_signal
 
 CHAN_LOOKBACK_TRADES = 20000  # 纏論固定用較大回看範圍，確保K棒數量足夠，不受trade_limit影響
@@ -37,6 +40,7 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     candles = build_candles(chan_trades, interval_seconds=interval_seconds)
     chan_data = analyze_chan(candles)
     atr = compute_atr(candles)  # 給ATR動態停損模式用，資料不足時是None(呼叫端要處理)
+    choppiness_index = compute_choppiness_index(candles)  # 給震盪濾網用，資料不足時是None
 
     profile_trades = trades[-trade_limit:] if len(trades) > trade_limit else trades
     profile = compute_volume_profile(profile_trades, bucket_size=bucket_size)
@@ -47,6 +51,7 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
 
     result = generate_signal(chan_data, poc_info, current_price)
     result["atr"] = atr
+    result["choppiness_index"] = choppiness_index
     result["chan_detail"] = {
         "interval_seconds": interval_seconds,
         "source_candle_count": len(candles),

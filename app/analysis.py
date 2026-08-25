@@ -105,6 +105,49 @@ def compute_atr(candles, period=14):
     return sum(window) / len(window)
 
 
+def compute_choppiness_index(candles, period=14):
+    """
+    計算Choppiness Index(震盪指標，業界常見的濾網指標)：不判斷方向，只判斷
+    「市場現在有沒有在走出明確方向」。用來當進場濾網——偵測到目前是震盪盤時
+    自動暫停開新倉，不管這個震盪發生在哪個時段，都能即時反應。
+
+    公式：CI = 100 x log10( 過去N根K棒的True Range總和 / (N根K棒的最高點-最低點) ) / log10(N)
+
+    數值介於0~100：
+    - 數值越高(通常>61.8)代表越震盪／盤整：True Range總和相對於整體價格區間
+      很大，代表價格在原地反覆折返，沒有走出淨移動
+    - 數值越低(通常<38.2)代表趨勢越明確：True Range總和跟整體價格區間相近，
+      代表價格是有效率地朝同一個方向移動，沒有太多來回
+
+    candles是build_candles()的輸出，資料不足或分母為0(例如完全沒有波動)時回傳None。
+    """
+    if len(candles) < period + 1:
+        return None
+
+    window = candles[-(period + 1):]
+    true_ranges = []
+    for i in range(1, len(window)):
+        high = window[i]["high"]
+        low = window[i]["low"]
+        prev_close = window[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return None
+
+    tr_sum = sum(true_ranges[-period:])
+    range_window = window[-period:]
+    highest_high = max(c["high"] for c in range_window)
+    lowest_low = min(c["low"] for c in range_window)
+    price_range = highest_high - lowest_low
+
+    if price_range <= 0 or tr_sum <= 0:
+        return None
+
+    return 100 * math.log10(tr_sum / price_range) / math.log10(period)
+
+
 # ---------------------------------------------------------------------------
 # 2. 分價量表 (Volume Profile)
 # ---------------------------------------------------------------------------

@@ -100,6 +100,22 @@ FIELD_META = {
         "help": "移動停損跟隨距離 = ATR x 這個倍數，通常比初始停損倍數略小一點"
                 "(只有上面的ATR開關打開時才生效)。",
     },
+    "paper_use_chop_filter": {
+        "label": "震盪濾網 (0 = 關閉 / 1 = 開啟)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("PAPER_USE_CHOP_FILTER", "0")),
+        "help": "開啟後，偵測到目前是震盪盤(用Choppiness Index判斷)時會暫停開新倉，"
+                "不管震盪發生在哪個時段都能即時反應，不是綁定固定時間。"
+                "已經開倉的部位不受影響，出場規則照常運作。",
+    },
+    "paper_chop_threshold": {
+        "label": "震盪濾網門檻 (Choppiness Index)",
+        "type": "float", "step": 1, "min": 30, "max": 100,
+        "default": float(os.getenv("PAPER_CHOP_THRESHOLD", "61.8")),
+        "help": "Choppiness Index超過這個值就判定為震盪盤、暫停開新倉(只有上面的"
+                "濾網開關打開時才生效)。數值介於0~100，數字越高代表越震盪，"
+                "61.8是業界常見的預設門檻。",
+    },
 }
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}

@@ -118,6 +118,8 @@ def run_backtest(
     atr_sl_multiplier=None,
     atr_trigger_multiplier=None,
     atr_trail_multiplier=None,
+    use_chop_filter=None,
+    chop_threshold=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -156,6 +158,10 @@ def run_backtest(
         atr_trigger_multiplier = s["paper_atr_trigger_multiplier"]
     if atr_trail_multiplier is None:
         atr_trail_multiplier = s["paper_atr_trail_multiplier"]
+    if use_chop_filter is None:
+        use_chop_filter = bool(s["paper_use_chop_filter"])
+    if chop_threshold is None:
+        chop_threshold = s["paper_chop_threshold"]
 
     klines = fetch_historical_klines(days=days)
     if not klines:
@@ -222,15 +228,25 @@ def run_backtest(
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
-            entry_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
-            position = trading_core.open_position(
-                direction=result["direction"],
-                current_price=current_price,
-                entry_time=entry_time_iso,
-                sl_points=step_sl_points,
-                chan_reason=result["chan"]["reason"],
-                profile_reason=result["profile"]["reason"],
+            # 震盪濾網：開啟時，偵測到當下這個時間點是震盪盤就跳過這次進場機會，
+            # 現有部位不受影響(這段邏輯在position為None時才會跑，本來就只影響
+            # 新開倉，不影響出場判斷)。choppiness_index資料不足時不擋單。
+            choppiness_index = result.get("choppiness_index")
+            is_choppy = (
+                use_chop_filter
+                and choppiness_index is not None
+                and choppiness_index >= chop_threshold
             )
+            if not is_choppy:
+                entry_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
+                position = trading_core.open_position(
+                    direction=result["direction"],
+                    current_price=current_price,
+                    entry_time=entry_time_iso,
+                    sl_points=step_sl_points,
+                    chan_reason=result["chan"]["reason"],
+                    profile_reason=result["profile"]["reason"],
+                )
 
     stats = compute_stats(closed_trades)
     readiness = assess_readiness(stats)
@@ -253,4 +269,6 @@ def run_backtest(
         "atr_sl_multiplier": atr_sl_multiplier,
         "atr_trigger_multiplier": atr_trigger_multiplier,
         "atr_trail_multiplier": atr_trail_multiplier,
+        "use_chop_filter": use_chop_filter,
+        "chop_threshold": chop_threshold,
     }

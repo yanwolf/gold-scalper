@@ -130,7 +130,17 @@ class PaperTradingEngine:
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
-            self._open_position(result, current_price, sl_points)
+            # 震盪濾網：開啟時，偵測到目前是震盪盤就暫停開新倉(現有部位不受影響，
+            # 出場規則照常運作)。choppiness_index資料不足時是None，這種情況
+            # 不擋單(寧可正常運作，不要因為資料不足就整個卡住)。
+            choppiness_index = result.get("choppiness_index")
+            is_choppy = (
+                s["paper_use_chop_filter"]
+                and choppiness_index is not None
+                and choppiness_index >= s["paper_chop_threshold"]
+            )
+            if not is_choppy:
+                self._open_position(result, current_price, sl_points)
 
     def _open_position(self, signal_result, current_price, sl_points):
         position = trading_core.open_position(

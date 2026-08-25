@@ -42,6 +42,11 @@ ALWAYS_ACTIVE_PARAM_CANDIDATES = {
     "paper_reversal_confirm_count": [1, 2, 3],
 }
 
+# 震盪濾網開啟時才有意義的參數：濾網關閉時，改門檻同樣不會有任何效果
+CHOP_FILTER_PARAM_CANDIDATES = {
+    "paper_chop_threshold": [40.0, 50.0, 70.0, 80.0],
+}
+
 PARAM_LABELS = {
     "paper_sl_points": "初始停損",
     "paper_trail_trigger_points": "移動停損觸發距離",
@@ -50,6 +55,7 @@ PARAM_LABELS = {
     "paper_atr_sl_multiplier": "ATR初始停損倍數",
     "paper_atr_trigger_multiplier": "ATR移動停損觸發倍數",
     "paper_atr_trail_multiplier": "ATR移動停損跟隨倍數",
+    "paper_chop_threshold": "震盪濾網門檻",
 }
 
 _jobs = {}
@@ -63,10 +69,11 @@ def _build_combos():
     重要：只測「在目前模式下真的會影響結果」的參數——如果baseline目前是ATR
     動態模式，就測ATR的三個倍數，不測固定點數(因為固定點數模式關閉時完全不會
     被用到，測了也是白測，會出現一堆數值跟對照組一樣的無意義結果)；反過來
-    如果baseline是固定點數模式，就只測固定點數，不測ATR倍數。
+    如果baseline是固定點數模式，就只測固定點數，不測ATR倍數。震盪濾網門檻
+    也是同樣邏輯：只有濾網開啟時才測門檻數值，濾網關閉時測門檻沒有意義。
 
-    另外固定加一組「切換ATR開關」的對照(如果目前是固定點數模式，就多測一組
-    ATR動態模式；反過來也一樣)，方便直接比較兩種停損機制哪個表現比較好。
+    另外固定加兩組「切換開關」的對照(ATR動態停損、震盪濾網)，方便直接比較
+    開啟/關閉哪個表現比較好。
     """
     baseline = settings_module.get_settings()
     combos = [{"label": "目前設定(對照組)", "params": dict(baseline)}]
@@ -75,6 +82,8 @@ def _build_combos():
         ATR_MODE_PARAM_CANDIDATES if baseline["paper_use_atr_stops"] else FIXED_MODE_PARAM_CANDIDATES
     )
     all_candidates = {**mode_specific_candidates, **ALWAYS_ACTIVE_PARAM_CANDIDATES}
+    if baseline["paper_use_chop_filter"]:
+        all_candidates = {**all_candidates, **CHOP_FILTER_PARAM_CANDIDATES}
 
     for param_key, candidates in all_candidates.items():
         for value in candidates:
@@ -89,8 +98,13 @@ def _build_combos():
 
     atr_toggle_params = dict(baseline)
     atr_toggle_params["paper_use_atr_stops"] = 0 if baseline["paper_use_atr_stops"] else 1
-    toggle_label = "ATR動態停損(關閉，改用固定點數)" if baseline["paper_use_atr_stops"] else "ATR動態停損(開啟)"
-    combos.append({"label": toggle_label, "params": atr_toggle_params})
+    atr_toggle_label = "ATR動態停損(關閉，改用固定點數)" if baseline["paper_use_atr_stops"] else "ATR動態停損(開啟)"
+    combos.append({"label": atr_toggle_label, "params": atr_toggle_params})
+
+    chop_toggle_params = dict(baseline)
+    chop_toggle_params["paper_use_chop_filter"] = 0 if baseline["paper_use_chop_filter"] else 1
+    chop_toggle_label = "震盪濾網(關閉)" if baseline["paper_use_chop_filter"] else "震盪濾網(開啟)"
+    combos.append({"label": chop_toggle_label, "params": chop_toggle_params})
 
     return combos
 
@@ -133,6 +147,8 @@ def _run_sweep(job_id, combos, days, interval_seconds):
                 atr_sl_multiplier=combo["params"]["paper_atr_sl_multiplier"],
                 atr_trigger_multiplier=combo["params"]["paper_atr_trigger_multiplier"],
                 atr_trail_multiplier=combo["params"]["paper_atr_trail_multiplier"],
+                use_chop_filter=bool(combo["params"]["paper_use_chop_filter"]),
+                chop_threshold=combo["params"]["paper_chop_threshold"],
             )
             summary = {
                 "label": combo["label"],
