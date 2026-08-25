@@ -1135,7 +1135,7 @@ function renderTradeList(el, trades, settingsChangedAt){
   el.innerHTML = rows.join('');
 }
 
-function renderActiveConfig(el, activeSettings, label, settingsChangedAt){
+function renderActiveConfig(el, activeSettings, label, settingsChangedAt, excludedOldCount){
   if(!el || !activeSettings) { if(el) el.innerHTML = ''; return; }
   const s = activeSettings;
 
@@ -1162,6 +1162,10 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt){
     ? `<div class="cfg-row"><span class="cfg-label">上次修改</span><span class="cfg-value">${new Date(settingsChangedAt).toLocaleString('zh-TW')}</span></div>`
     : `<div class="cfg-row"><span class="cfg-label">上次修改</span><span class="cfg-value off">尚未修改過(使用環境變數預設值)</span></div>`;
 
+  const excludedHtml = (excludedOldCount && excludedOldCount > 0)
+    ? `<div class="cfg-row"><span class="cfg-label">績效統計範圍</span><span class="cfg-value" style="color:var(--muted); font-weight:400;">已排除 ${excludedOldCount} 筆舊設定交易</span></div>`
+    : '';
+
   el.innerHTML = `
     <div class="active-config-card">
       <div class="cfg-title">目前策略設定（${label}）</div>
@@ -1169,12 +1173,13 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt){
       <div class="cfg-row"><span class="cfg-label">訊號反轉確認次數</span><span class="cfg-value">${s.paper_reversal_confirm_count}</span></div>
       ${chopHtml}
       ${changedAtHtml}
+      ${excludedHtml}
     </div>
   `;
 }
 
 function renderPaperTrading(data){
-  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at);
+  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades);
 
   if(data.open_position){
     const p = data.open_position;

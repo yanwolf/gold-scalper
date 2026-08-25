@@ -123,6 +123,17 @@ FIELD_META = {
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}
 _LAST_CHANGED_DB_KEY = "_meta_last_changed_at"  # app_settings表裡的保留key，不是FIELD_META裡的一般設定項
 
+# 真正會影響模擬單交易行為的欄位。readiness_*(達標門檻)只影響「怎麼評估績效」，
+# 不影響實際交易邏輯本身——改了門檻不代表舊交易是「別的規則」跑出來的，
+# 所以「設定變更時間」只在這些欄位被改動時才更新，避免使用者只是調整門檻
+# 卻導致歷史交易被誤判成「舊設定」而被排除在績效統計之外。
+TRADING_RELEVANT_KEYS = {
+    "paper_sl_points", "paper_trail_trigger_points", "paper_trail_distance_points",
+    "paper_reversal_confirm_count", "paper_use_atr_stops", "paper_atr_sl_multiplier",
+    "paper_atr_trigger_multiplier", "paper_atr_trail_multiplier",
+    "paper_use_chop_filter", "paper_chop_threshold",
+}
+
 
 def _cast(key, raw_value):
     caster = float if FIELD_META[key]["type"] == "float" else int
@@ -165,10 +176,16 @@ def get_settings_with_meta():
 
 def get_last_changed_at():
     """
-    給paper_trading.py的get_summary()用：回傳設定上次被實際修改的時間(ISO字串，
-    從未修改過則是None)。用來讓dashboard標示「哪些交易紀錄是新設定生效後產生的」，
-    避免使用者誤以為改參數後畫面沒反應——舊的已平倉交易本來就不會被追溯修改，
-    只有進場時間晚於這個時間點的交易才是新設定底下的結果。
+    給paper_trading.py的get_summary()用：回傳「交易相關參數」上次被實際修改的
+    時間(ISO字串，從未修改過則是None)。只有TRADING_RELEVANT_KEYS裡的欄位被
+    改動才會更新這個時間，單純調整達標門檻(readiness_*)不會——因為門檻只影響
+    「怎麼評估績效」，不影響實際交易邏輯，舊交易依然是同一套規則跑出來的，
+    不該被排除在績效統計之外。
+
+    用來讓dashboard標示「哪些交易紀錄是新設定生效後產生的」，並讓績效統計
+    只計算新設定底下的交易，避免使用者誤以為改參數後畫面/數字沒反應——
+    舊的已平倉交易本來就不會被追溯修改，只有進場時間晚於這個時間點的交易
+    才是新設定底下的結果。
     """
     return _last_changed_at
 
@@ -200,12 +217,16 @@ def update_settings(updates: dict):
             _settings[key] = casted
             applied[key] = casted
 
-        if applied:
+        # 只有「真正影響交易行為」的欄位被改動，才更新這個時間戳記——
+        # 單純調整達標門檻(readiness_*)不算，因為那不影響交易邏輯本身，
+        # 舊交易依然有效，不該被排除在績效統計之外
+        if applied and (set(applied.keys()) & TRADING_RELEVANT_KEYS):
             _last_changed_at = datetime.now(timezone.utc).isoformat()
 
     if db.is_enabled() and applied:
         db_applied = dict(applied)
-        db_applied[_LAST_CHANGED_DB_KEY] = _last_changed_at
+        if set(applied.keys()) & TRADING_RELEVANT_KEYS:
+            db_applied[_LAST_CHANGED_DB_KEY] = _last_changed_at
         db.save_app_settings(db_applied)
 
     return dict(_settings)

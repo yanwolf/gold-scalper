@@ -189,13 +189,28 @@ class PaperTradingEngine:
         是固定點數模式還是ATR動態模式、震盪濾網開沒開、反轉確認次數等，
         不會像舊版只回傳固定點數欄位、卻沒說明ATR模式其實已經覆蓋掉這些值
         的情況(修正記錄見README)。
+
+        績效統計(總筆數/勝率/獲利因子/最大回撤/達標門檻)只用「目前設定生效後」
+        的交易來算，不會把舊設定底下的歷史交易混進來稀釋或扭曲數字——這是
+        使用者明確要求的行為：改過參數之後，就該用新參數底下的實際表現來
+        評估，混入舊參數的交易會讓「現在這組設定到底行不行」的判斷失真。
+        設定從來沒被手動改過(settings_changed_at是None)的話，就照常用全部
+        歷史交易計算，沒有這個篩選的必要。
+        `recent_trades`清單本身仍然回傳完整歷史(含分隔線標示新舊分界)，
+        方便對照細節，只有上方的統計數字會排除舊設定的交易。
         """
         if db.is_enabled():
             trades = db.get_closed_paper_trades(limit=max(limit, 500), interval_seconds=self.interval_seconds)
         else:
             trades = list(self._closed_trades_memory)[::-1]
 
-        stats = compute_stats(trades)
+        settings_changed_at = settings_module.get_last_changed_at()
+        if settings_changed_at:
+            stats_trades = [t for t in trades if t.get("entry_time") and t["entry_time"] >= settings_changed_at]
+        else:
+            stats_trades = trades
+
+        stats = compute_stats(stats_trades)
         readiness = assess_readiness(stats)
 
         with self._lock:
@@ -207,8 +222,9 @@ class PaperTradingEngine:
             "label": self.label,
             "open_position": position,
             "recent_trades": trades[:limit],
+            "stats_excluded_old_trades": len(trades) - len(stats_trades),  # 給dashboard顯示排除了幾筆舊紀錄
             "active_settings": settings_module.get_settings(),
-            "settings_changed_at": settings_module.get_last_changed_at(),
+            "settings_changed_at": settings_changed_at,
             "readiness": readiness,
         }
 
