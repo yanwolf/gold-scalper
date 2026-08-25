@@ -96,12 +96,25 @@ class PaperTradingEngine:
         if current_price is None:
             return
 
+        # ATR動態停損模式：開啟時用「ATR x 倍數」取代下面的固定點數，
+        # 讓停損距離跟著市場當下實際波動度調整。ATR資料不足(剛啟動、K棒不夠)
+        # 時會是None，這種情況先退回固定點數，避免整個判斷卡住。
+        atr = result.get("atr")
+        if s["paper_use_atr_stops"] and atr:
+            sl_points = atr * s["paper_atr_sl_multiplier"]
+            trail_trigger_points = atr * s["paper_atr_trigger_multiplier"]
+            trail_distance_points = atr * s["paper_atr_trail_multiplier"]
+        else:
+            sl_points = s["paper_sl_points"]
+            trail_trigger_points = s["paper_trail_trigger_points"]
+            trail_distance_points = s["paper_trail_distance_points"]
+
         with self._lock:
             position = self._position
 
         if position:
             changed = trading_core.update_trailing_stop(
-                position, current_price, s["paper_trail_trigger_points"], s["paper_trail_distance_points"]
+                position, current_price, trail_trigger_points, trail_distance_points
             )
             if changed:
                 db.update_paper_trade_stop(
@@ -117,7 +130,7 @@ class PaperTradingEngine:
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
-            self._open_position(result, current_price, s["paper_sl_points"])
+            self._open_position(result, current_price, sl_points)
 
     def _open_position(self, signal_result, current_price, sl_points):
         position = trading_core.open_position(

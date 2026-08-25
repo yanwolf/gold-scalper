@@ -41,7 +41,11 @@ _jobs_lock = threading.Lock()
 
 
 def _build_combos():
-    """baseline(目前生效中的設定)當對照組，其他每組都是「改一個參數」的變化版本。"""
+    """
+    baseline(目前生效中的設定)當對照組，其他每組都是「改一個參數」的變化版本。
+    另外加一組「切換ATR動態停損開關」的對照(如果目前是固定點數模式，就多測一組
+    ATR動態模式；反過來也一樣)，方便直接比較兩種停損機制哪個表現比較好。
+    """
     baseline = settings_module.get_settings()
     combos = [{"label": "目前設定(對照組)", "params": dict(baseline)}]
 
@@ -55,6 +59,11 @@ def _build_combos():
                 "label": f"{PARAM_LABELS[param_key]} = {value}",
                 "params": params,
             })
+
+    atr_toggle_params = dict(baseline)
+    atr_toggle_params["paper_use_atr_stops"] = 0 if baseline["paper_use_atr_stops"] else 1
+    toggle_label = "ATR動態停損(關閉)" if baseline["paper_use_atr_stops"] else "ATR動態停損(開啟)"
+    combos.append({"label": toggle_label, "params": atr_toggle_params})
 
     return combos
 
@@ -93,6 +102,10 @@ def _run_sweep(job_id, combos, days, interval_seconds):
                 trail_trigger_points=combo["params"]["paper_trail_trigger_points"],
                 trail_distance_points=combo["params"]["paper_trail_distance_points"],
                 reversal_confirm_count=combo["params"]["paper_reversal_confirm_count"],
+                use_atr=bool(combo["params"]["paper_use_atr_stops"]),
+                atr_sl_multiplier=combo["params"]["paper_atr_sl_multiplier"],
+                atr_trigger_multiplier=combo["params"]["paper_atr_trigger_multiplier"],
+                atr_trail_multiplier=combo["params"]["paper_atr_trail_multiplier"],
             )
             summary = {
                 "label": combo["label"],

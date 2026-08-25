@@ -72,6 +72,40 @@ def build_candles(trades, interval_seconds=300):
 
 
 # ---------------------------------------------------------------------------
+# 1b. ATR (Average True Range) — 讓停損距離跟著市場實際波動度動態調整
+# ---------------------------------------------------------------------------
+
+def compute_atr(candles, period=14):
+    """
+    計算ATR：衡量近期價格實際波動幅度的指標，用來讓停損/移動停損距離
+    自動跟著市場波動調整(震盪加大時停損跟著放寬，市場平靜時跟著收緊)，
+    取代原本用固定點數猜一個距離的做法。
+
+    True Range每根K棒取三者最大值：(high-low)、|high-前一根close|、|low-前一根close|，
+    ATR是這個值的N期簡單移動平均(不是EMA，維持一致性且好理解)。
+
+    candles是build_candles()的輸出(未經merge_inclusion處理的原始K線)，
+    回傳ATR數值(跟價格同單位，例如黃金就是美元points)，資料不足時回傳None。
+    """
+    if len(candles) < 2:
+        return None
+
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high = candles[i]["high"]
+        low = candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+
+    if not true_ranges:
+        return None
+
+    window = true_ranges[-period:] if len(true_ranges) >= period else true_ranges
+    return sum(window) / len(window)
+
+
+# ---------------------------------------------------------------------------
 # 2. 分價量表 (Volume Profile)
 # ---------------------------------------------------------------------------
 

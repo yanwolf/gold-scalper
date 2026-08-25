@@ -114,6 +114,10 @@ def run_backtest(
     trail_trigger_points=None,
     trail_distance_points=None,
     reversal_confirm_count=None,
+    use_atr=None,
+    atr_sl_multiplier=None,
+    atr_trigger_multiplier=None,
+    atr_trail_multiplier=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -125,10 +129,15 @@ def run_backtest(
     - 每一步只保留最近CHAN_LOOKBACK_TRADES筆(這也是compute_signal_from_trades內部
       實際會用到的上限)，避免隨著回測天數增加，切片大小跟著無限成長
 
-    sl_points/trail_trigger_points/trail_distance_points/reversal_confirm_count
-    沒有明確傳入(None)時，會即時從settings.py讀取目前生效的參數(使用者在
-    dashboard調整過的值)，讓「不指定參數的回測」跟「即時模擬單目前實際在用
-    的參數」保持一致，不會兩邊對不上。
+    sl_points/trail_trigger_points/trail_distance_points/reversal_confirm_count/
+    use_atr/atr_*_multiplier 沒有明確傳入(None)時，會即時從settings.py讀取目前
+    生效的參數(使用者在dashboard調整過的值)，讓「不指定參數的回測」跟「即時模擬單
+    目前實際在用的參數」保持一致，不會兩邊對不上。
+
+    ATR動態停損模式：use_atr開啟時，每一步都會用「當下這個時間點的ATR x 倍數」
+    重新計算停損/移動停損距離(不是整場回測固定用同一個值)，這樣才能正確模擬
+    「停損距離跟著市場波動即時調整」的效果，跟即時模擬單的行為完全一致。
+    ATR資料不足的步驟(回測最開始那幾步)會自動退回用固定點數。
     """
     s = settings_module.get_settings()
     if sl_points is None:
@@ -139,6 +148,14 @@ def run_backtest(
         trail_distance_points = s["paper_trail_distance_points"]
     if reversal_confirm_count is None:
         reversal_confirm_count = s["paper_reversal_confirm_count"]
+    if use_atr is None:
+        use_atr = bool(s["paper_use_atr_stops"])
+    if atr_sl_multiplier is None:
+        atr_sl_multiplier = s["paper_atr_sl_multiplier"]
+    if atr_trigger_multiplier is None:
+        atr_trigger_multiplier = s["paper_atr_trigger_multiplier"]
+    if atr_trail_multiplier is None:
+        atr_trail_multiplier = s["paper_atr_trail_multiplier"]
 
     klines = fetch_historical_klines(days=days)
     if not klines:
@@ -180,8 +197,20 @@ def run_backtest(
             current_price=current_price,
         )
 
+        # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
+        # 而不是整場回測固定用同一個值，才能正確模擬跟即時模擬單一致的行為
+        atr = result.get("atr")
+        if use_atr and atr:
+            step_sl_points = atr * atr_sl_multiplier
+            step_trail_trigger_points = atr * atr_trigger_multiplier
+            step_trail_distance_points = atr * atr_trail_multiplier
+        else:
+            step_sl_points = sl_points
+            step_trail_trigger_points = trail_trigger_points
+            step_trail_distance_points = trail_distance_points
+
         if position:
-            trading_core.update_trailing_stop(position, current_price, trail_trigger_points, trail_distance_points)
+            trading_core.update_trailing_stop(position, current_price, step_trail_trigger_points, step_trail_distance_points)
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
                 reversal_confirm_count=reversal_confirm_count,
@@ -198,7 +227,7 @@ def run_backtest(
                 direction=result["direction"],
                 current_price=current_price,
                 entry_time=entry_time_iso,
-                sl_points=sl_points,
+                sl_points=step_sl_points,
                 chan_reason=result["chan"]["reason"],
                 profile_reason=result["profile"]["reason"],
             )
@@ -220,4 +249,8 @@ def run_backtest(
         "trail_trigger_points": trail_trigger_points,
         "trail_distance_points": trail_distance_points,
         "reversal_confirm_count": reversal_confirm_count,
+        "use_atr": use_atr,
+        "atr_sl_multiplier": atr_sl_multiplier,
+        "atr_trigger_multiplier": atr_trigger_multiplier,
+        "atr_trail_multiplier": atr_trail_multiplier,
     }

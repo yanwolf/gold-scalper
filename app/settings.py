@@ -73,6 +73,33 @@ FIELD_META = {
         "default": float(os.getenv("READINESS_MAX_DRAWDOWN_POINTS", "30")),
         "help": "從歷史高點回落最多的那一段(points)超過這個值就不算達標，衡量連續虧損的嚴重程度。",
     },
+    "paper_use_atr_stops": {
+        "label": "使用ATR動態停損 (0=關閉固定點數 / 1=開啟ATR動態)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("PAPER_USE_ATR_STOPS", "0")),
+        "help": "開啟後，停損/移動停損距離會用ATR(近期實際波動幅度)動態計算，"
+                "取代上面的固定點數設定，跟著市場波動自動放寬/收緊。可以搭配參數掃描"
+                "比較「固定點數」跟「ATR動態」哪個表現比較好。",
+    },
+    "paper_atr_sl_multiplier": {
+        "label": "ATR初始停損倍數",
+        "type": "float", "step": 0.1, "min": 0.5, "max": 5,
+        "default": float(os.getenv("PAPER_ATR_SL_MULTIPLIER", "1.5")),
+        "help": "初始停損 = ATR x 這個倍數(只有上面的ATR開關打開時才生效)。",
+    },
+    "paper_atr_trigger_multiplier": {
+        "label": "ATR移動停損觸發倍數",
+        "type": "float", "step": 0.1, "min": 0.5, "max": 5,
+        "default": float(os.getenv("PAPER_ATR_TRIGGER_MULTIPLIER", "1.5")),
+        "help": "移動停損觸發距離 = ATR x 這個倍數(只有上面的ATR開關打開時才生效)。",
+    },
+    "paper_atr_trail_multiplier": {
+        "label": "ATR移動停損跟隨倍數",
+        "type": "float", "step": 0.1, "min": 0.5, "max": 5,
+        "default": float(os.getenv("PAPER_ATR_TRAIL_MULTIPLIER", "1.2")),
+        "help": "移動停損跟隨距離 = ATR x 這個倍數，通常比初始停損倍數略小一點"
+                "(只有上面的ATR開關打開時才生效)。",
+    },
 }
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}
