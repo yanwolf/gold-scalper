@@ -254,7 +254,13 @@ def run_backtest(
     return {
         **stats,
         "open_position_at_end": position,  # 回測結束時如果還有未平倉部位，僅供參考，不計入統計
-        "recent_trades": sorted(closed_trades, key=lambda t: t["exit_time"], reverse=True)[:100],
+        # 回傳全部已平倉交易(不像即時模擬單那樣只給最近N筆)，因為回測的總筆數
+        # 本身就有上限(受重播步數的取樣間隔控制，見TARGET_STEP_COUNT)，不會像
+        # 即時模擬單一樣無限累積。之前這裡限制只回傳最近100筆，導致天數長、
+        # 筆數多的回測(例如7天224筆)看不到最大回撤發生的那段期間的交易紀錄
+        # (因為那段時間不在「最近100筆」範圍內)，統計數字跟看得到的紀錄對不上，
+        # 這裡修正成回傳全部，讓使用者能對照到任何時間點的交易明細。
+        "recent_trades": sorted(closed_trades, key=lambda t: t["exit_time"], reverse=True),
         "readiness": readiness,
         "backtest_days": days,
         "kline_count": len(klines),
