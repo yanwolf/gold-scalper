@@ -187,6 +187,7 @@ def _load_from_db():
         return
 
     from app import db
+    migrated_engine_index = None
     if db.is_enabled():
         stored = db.get_app_settings()
         with _lock:
@@ -199,6 +200,31 @@ def _load_from_db():
                     logger.warning(f"資料庫裡的設定值 {key}={raw_value} 型別轉換失敗，忽略")
             if _LAST_CHANGED_DB_KEY in stored:
                 _last_changed_at = stored[_LAST_CHANGED_DB_KEY]
+
+            # 一次性遷移：舊版設定欄位是execution_interval_seconds(0/60/300/900)，
+            # 改版後換成execution_engine_index(0~4)，兩者欄位名稱不同，直接改名
+            # 會讓使用者原本設定好的值悄悄消失、被重置回預設值0(全部純模擬)——
+            # 這是實際發生過的問題，這裡自動把舊值換算成新值，使用者不用手動
+            # 重新設定一次。只有在「舊欄位還留著、新欄位從來沒被存過」時才會
+            # 觸發，避免蓋掉使用者已經在新欄位上做過的選擇。
+            OLD_INTERVAL_TO_NEW_INDEX = {0: 0, 60: 1, 300: 2, 900: 3}
+            if "execution_interval_seconds" in stored and "execution_engine_index" not in stored:
+                try:
+                    old_value = int(float(stored["execution_interval_seconds"]))
+                    if old_value in OLD_INTERVAL_TO_NEW_INDEX:
+                        migrated_engine_index = OLD_INTERVAL_TO_NEW_INDEX[old_value]
+                        _settings["execution_engine_index"] = migrated_engine_index
+                        logger.info(
+                            f"偵測到舊版execution_interval_seconds={old_value}設定，"
+                            f"自動遷移成execution_engine_index={migrated_engine_index}"
+                        )
+                except (TypeError, ValueError):
+                    pass
+
+        # 把遷移後的值實際存回資料庫，這樣只需要遷移這一次，之後重啟服務會
+        # 直接讀到execution_engine_index這個新欄位，不用每次都重新判斷
+        if migrated_engine_index is not None:
+            db.save_app_settings({"execution_engine_index": migrated_engine_index})
     _loaded_from_db = True
 
 
