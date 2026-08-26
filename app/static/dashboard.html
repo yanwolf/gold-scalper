@@ -465,9 +465,10 @@
 
   <div class="controls" style="margin-bottom:12px;">
     <select id="paperInterval">
-      <option value="60">1分K追蹤</option>
-      <option value="300" selected>5分K追蹤</option>
-      <option value="900">15分K追蹤</option>
+      <option value="chan_profile_60">1分K追蹤(纏論)</option>
+      <option value="chan_profile_300" selected>5分K追蹤(纏論)</option>
+      <option value="chan_profile_900">15分K追蹤(纏論)</option>
+      <option value="resonance_fvg_60">1分K追蹤(多條件共振，實驗性)</option>
     </select>
   </div>
 
@@ -1549,8 +1550,8 @@ function renderDrawdownPeriod(el, data){
 
 async function fetchPaperTrading(){
   try{
-    const intervalSeconds = els.paperInterval.value;
-    const res = await fetch(`/paper-trading/summary?limit=30&interval_seconds=${intervalSeconds}`);
+    const engineId = els.paperInterval.value;
+    const res = await fetch(`/paper-trading/summary?limit=30&engine_id=${engineId}`);
     if(!res.ok) throw new Error(`模擬單API回傳錯誤 (${res.status})`);
     const data = await res.json();
     renderPaperTrading(data);

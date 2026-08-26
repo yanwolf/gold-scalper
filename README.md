@@ -1314,3 +1314,68 @@ AND邏輯完全一致(全部4項都要符合，RSI依然是事實上的必要條
 效果，確認「門檻越鬆、訊號量越多、獲利因子越往下掉」的典型取捨模式
 (4/4：26筆/獲利因子1.41；3/4：69筆/0.95；2/4：66筆/0.82)，證實機制運作
 符合設計預期。完整回歸測試確認chan_profile即時/回測路徑完全不受影響。
+
+## 重大架構調整：新增「1分K多條件共振」即時模擬單引擎
+
+**背景**：使用者用真實歷史資料回測`resonance_fvg`策略後，1分K在不同門檻下的
+表現：4/4門檻樣本太少(25筆)但獲利因子不足；3/4門檻樣本數(245筆)、勝率
+(50.2%)、獲利因子(1.38)都達標，但**最大回撤86.19遠超過30的門檻(超標近3倍)**；
+2/4門檻獲利因子也不理想。使用者決定用3/4門檻先接上即時模擬單開始收集資料
+(純模擬，不涉及真錢)，同時明確知道並接受最大回撤偏大這個已知風險特徵。
+
+**架構問題**：新增的「1分K共振」引擎跟既有的「1分K纏論」引擎都是60秒週期，
+但資料庫和引擎查詢邏輯原本完全用`interval_seconds`當唯一識別碼，兩個引擎
+會互相覆蓋彼此的歷史紀錄、也無法讓「真實下單」機制正確只鎖定其中一個。
+這次做了一次貫穿多個檔案的架構調整：
+
+**`db.py`**：`paper_trades`表新增`engine_id`欄位(TEXT)，取代`interval_seconds`
+成為真正的查詢鍵(`interval_seconds`欄位保留，僅供顯示參考「這個引擎用哪個
+K線週期」)。用安全的資料庫migration(`ADD COLUMN IF NOT EXISTS` + `UPDATE ...
+WHERE engine_id IS NULL`)，既有資料自動回填成`chan_profile_<原本的
+interval_seconds>`，不會遺失或錯亂使用者已經累積的歷史紀錄。
+
+**`paper_trading.py`**：`PaperTradingEngine`新增`strategy_type`、
+`resonance_min_conditions`、`execution_index`、`engine_id`參數。新增第四個
+即時引擎：
+
+```python
+paper_trading_1m_resonance = PaperTradingEngine(
+    interval_seconds=60, label="1分K共振", strategy_type="resonance_fvg",
+    resonance_min_conditions=3, execution_index=4,
+)
+```
+
+`PAPER_TRADING_ENGINES`字典改用`engine_id`字串當key(不再是`interval_seconds`
+整數)，目前是`{"chan_profile_60", "chan_profile_300", "chan_profile_900",
+"resonance_fvg_60"}`四個引擎並存。
+
+**`settings.py`**：「真實下單週期」設定改成「真實下單引擎編號」
+(`execution_engine_index`，0~4)，取代原本直接比對`interval_seconds`的做法——
+避免兩個1分K引擎同時符合同一個週期設定、誤判自己都該觸發真實下單這個
+潛在的嚴重bug(已用測試明確驗證過修正前會有的問題確實被擋下)。
+
+**`signal_engine.py`**：`compute_full_signal()`新增`strategy_type`/
+`resonance_min_conditions`參數，但預設值刻意寫死字串"chan_profile"(不是讀
+`STRATEGY_TYPE`環境變數)——維持先前建立的安全保證：任何沒有明確指定
+`strategy_type`的呼叫端永遠安全地拿到`chan_profile`，只有新的共振引擎會
+明確傳入`strategy_type="resonance_fvg"`主動選用實驗性策略。
+
+**`main.py`/`health_monitor.py`/`dashboard.html`**：全部同步改用`engine_id`
+查詢(不再是`interval_seconds`)。Dashboard模擬單面板新增「1分K追蹤(多條件
+共振，實驗性)」選項。
+
+已用完整情境測試驗證：
+- 4個引擎的`engine_id`全部唯一、互不衝突
+- 兩個共用60秒週期的引擎(纏論vs共振)能同時獨立開倉/平倉，記憶體/資料庫
+  狀態完全不互相干擾
+- **`execution_engine_index`機制正確驗證**：即使兩個引擎`interval_seconds`
+  相同，只有設定值指定的那一個引擎會觸發真實下單，另一個維持純模擬——
+  這正是這次架構調整要解決的核心問題
+- 新引擎完整串接Telegram通知、真實下單模組、風控斷路器都正常運作
+- 資料庫停用(沒接DATABASE_URL)時的所有安全回退路徑依然正常
+
+**已知風險特徵，非bug**：`resonance_fvg`策略在真實資料回測中最大回撤明顯
+偏高(86.19 vs 門檻30)，這是策略本身的特性(推測跟RSI逆勢邏輯在強烈單邊
+趨勢中容易連續進場有關)，不是程式錯誤。純模擬階段先觀察即時表現是否重現
+類似的回撤模式，再決定後續要不要調整策略邏輯或門檻，目前**沒有**接上真實
+下單(`execution_engine_index`預設值是0，全部純模擬)。

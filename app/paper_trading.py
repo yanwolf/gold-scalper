@@ -41,9 +41,20 @@ MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼�
 
 
 class PaperTradingEngine:
-    def __init__(self, interval_seconds=60, label=None):
+    def __init__(self, interval_seconds=60, label=None, strategy_type="chan_profile",
+                 resonance_min_conditions=4, execution_index=None, engine_id=None):
         self.interval_seconds = interval_seconds
         self.label = label or f"{interval_seconds}秒K線"
+        self.strategy_type = strategy_type
+        self.resonance_min_conditions = resonance_min_conditions
+        # execution_index是這個引擎在「真實下單」設定裡的固定編號(見settings.py的
+        # execution_engine_index說明)，取代原本直接比對interval_seconds的做法——
+        # 現在同一個K線週期可能有多個策略的引擎平行運作(例如1分K纏論 vs 1分K共振)，
+        # 光用interval_seconds已經無法唯一決定「哪一個」引擎該負責真實下單。
+        self.execution_index = execution_index
+        # engine_id是資料庫查詢用的真正唯一鍵，預設用"策略_週期"組合，
+        # 不指定的話自動產生(例如"chan_profile_60")
+        self.engine_id = engine_id or f"{strategy_type}_{interval_seconds}"
 
         self._lock = threading.Lock()
         self._position = None
@@ -61,7 +72,7 @@ class PaperTradingEngine:
     def start(self):
         if not self._seeded_from_db:
             with self._lock:
-                self._position = db.get_open_paper_trade(interval_seconds=self.interval_seconds)
+                self._position = db.get_open_paper_trade(engine_id=self.engine_id)
             self._seeded_from_db = True
 
         if self._thread and self._thread.is_alive():
@@ -69,7 +80,7 @@ class PaperTradingEngine:
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
-        logger.info(f"模擬單追蹤引擎已啟動({self.label}，移動停損模式)")
+        logger.info(f"模擬單追蹤引擎已啟動({self.label}，{self.strategy_type}策略，移動停損模式)")
 
     def stop(self):
         self._stop_flag.set()
@@ -93,6 +104,8 @@ class PaperTradingEngine:
 
         result = compute_full_signal(
             interval_seconds=self.interval_seconds,
+            strategy_type=self.strategy_type,
+            resonance_min_conditions=self.resonance_min_conditions,
             bucket_size=DEFAULT_BUCKET_SIZE,
             trade_limit=DEFAULT_TRADE_LIMIT,
         )
@@ -156,6 +169,7 @@ class PaperTradingEngine:
             profile_reason=signal_result["profile"]["reason"],
         )
         position["interval_seconds"] = self.interval_seconds
+        position["engine_id"] = self.engine_id
         db_id = db.insert_open_paper_trade(position)
         position["id"] = db_id
 
@@ -167,14 +181,16 @@ class PaperTradingEngine:
             f"(初始SL:{position['sl_price']:.2f})"
         )
 
-        # 只有「指定的那個週期」才會同步送出真實(測試網/正式環境依BINANCE_USE_TESTNET
-        # 決定)下單，其他週期繼續純模擬。設計成只能指定單一週期，避免1分K/5分K/15分K
-        # 三個引擎同時對同一個帳戶下單互相打架(修正記錄見README)。
+        # 只有「指定的那個引擎」才會同步送出真實(測試網/正式環境依BINANCE_USE_TESTNET
+        # 決定)下單，其他引擎繼續純模擬。改用execution_index(每個引擎固定的編號)判斷，
+        # 不再直接比對interval_seconds——因為現在同一個K線週期可能有多個策略的引擎
+        # 平行運作(例如1分K纏論 vs 1分K共振)，光用interval_seconds已經無法唯一決定
+        #「哪一個」引擎該負責真實下單，兩個引擎會同時誤判自己該出手(修正記錄見README)。
         executed = None  # None=沒有嘗試下單(純模擬)，True=下單成功，False=下單失敗
         execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
         skip_reason = None  # 風控斷路器擋下這次下單的原因(修正記錄見README)
         s = settings_module.get_settings()
-        if s["execution_interval_seconds"] == self.interval_seconds:
+        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
             quantity = s["execution_quantity"]
             allowed, block_reason = risk_guard.check(self, quantity)
 
@@ -238,7 +254,7 @@ class PaperTradingEngine:
         executed = None
         execution_error = None
         s = settings_module.get_settings()
-        if s["execution_interval_seconds"] == self.interval_seconds:
+        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
             try:
                 success, result = execution_module.close_position(direction=position["direction"])
                 executed = success
@@ -266,7 +282,8 @@ class PaperTradingEngine:
         """
         績效摘要：總筆數、勝率、總損益、獲利因子、最大回撤、目前開倉狀態、
         最近N筆紀錄、以及對照「達標門檻」的評估結果。只回傳這個引擎自己
-        (自己的interval_seconds)的資料，不會混到其他週期的紀錄。
+        (自己的engine_id)的資料，不會混到其他引擎的紀錄——即使interval_seconds
+        相同(例如1分K纏論跟1分K共振都是60秒週期)，engine_id不同就不會互相混雜。
 
         active_settings回傳目前生效中的「完整」設定快照(不是只挑幾個固定
         點數欄位)，讓dashboard能準確顯示「現在到底在跑什麼策略」——包含
@@ -284,7 +301,7 @@ class PaperTradingEngine:
         方便對照細節，只有上方的統計數字會排除舊設定的交易。
         """
         if db.is_enabled():
-            trades = db.get_closed_paper_trades(limit=max(limit, 500), interval_seconds=self.interval_seconds)
+            trades = db.get_closed_paper_trades(limit=max(limit, 500), engine_id=self.engine_id)
         else:
             trades = list(self._closed_trades_memory)[::-1]
 
@@ -302,12 +319,14 @@ class PaperTradingEngine:
 
         s = settings_module.get_settings()
         circuit_breaker = None
-        if s["execution_interval_seconds"] == self.interval_seconds:
+        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
             circuit_breaker = risk_guard.status(self, s["execution_quantity"])
 
         return {
             **stats,
             "interval_seconds": self.interval_seconds,
+            "engine_id": self.engine_id,
+            "strategy_type": self.strategy_type,
             "label": self.label,
             "open_position": position,
             "recent_trades": trades[:limit],
@@ -315,21 +334,32 @@ class PaperTradingEngine:
             "active_settings": s,
             "settings_changed_at": settings_changed_at,
             "readiness": readiness,
-            "circuit_breaker": circuit_breaker,  # None代表這個週期沒有接真實下單，不適用風控斷路器
+            "circuit_breaker": circuit_breaker,  # None代表這個引擎沒有接真實下單，不適用風控斷路器
         }
 
 
-# 三個平行運作的實例：1分K/5分K/15分K，各自獨立追蹤、可直接對照績效。
-# PAPER_TRADING_ENGINES讓main.py能依interval_seconds查到對應的引擎，
-# health_monitor.py也是直接遍歷這個字典做心跳監控，新增引擎不用改健康監控邏輯。
-paper_trading_1m = PaperTradingEngine(interval_seconds=60, label="1分K")
-paper_trading_5m = PaperTradingEngine(interval_seconds=300, label="5分K")
-paper_trading_15m = PaperTradingEngine(interval_seconds=900, label="15分K")
+# 平行運作的模擬單引擎：1分K/5分K/15分K纏論(既有)，加上1分K多條件共振(新增，
+# 實驗性策略，見README)。PAPER_TRADING_ENGINES改用engine_id字串當key，不再用
+# interval_seconds——因為現在1分K纏論跟1分K共振都是60秒週期，光用interval_seconds
+# 已經無法唯一區分，會互相打架(修正記錄見README)。
+# health_monitor.py是直接遍歷這個字典做心跳監控，新增引擎不用改健康監控邏輯。
+paper_trading_1m = PaperTradingEngine(interval_seconds=60, label="1分K", strategy_type="chan_profile", execution_index=1)
+paper_trading_5m = PaperTradingEngine(interval_seconds=300, label="5分K", strategy_type="chan_profile", execution_index=2)
+paper_trading_15m = PaperTradingEngine(interval_seconds=900, label="15分K", strategy_type="chan_profile", execution_index=3)
+# resonance_min_conditions=3：使用者用真實歷史資料回測後，4/4門檻樣本數太少(25筆)、
+# 2/4門檻獲利因子/回撤都不理想，3/4門檻是三者裡樣本數(245筆)、勝率、獲利因子最平衡
+# 的一組，但務必留意最大回撤86.19遠超過30的門檻，這是已知的風險特徵，不是bug，
+# 純模擬階段先觀察，還沒有要接真實下單(見README)。
+paper_trading_1m_resonance = PaperTradingEngine(
+    interval_seconds=60, label="1分K共振", strategy_type="resonance_fvg",
+    resonance_min_conditions=3, execution_index=4,
+)
 
 PAPER_TRADING_ENGINES = {
-    60: paper_trading_1m,
-    300: paper_trading_5m,
-    900: paper_trading_15m,
+    paper_trading_1m.engine_id: paper_trading_1m,
+    paper_trading_5m.engine_id: paper_trading_5m,
+    paper_trading_15m.engine_id: paper_trading_15m,
+    paper_trading_1m_resonance.engine_id: paper_trading_1m_resonance,
 }
 
 # 保留舊名稱指向1分K引擎，避免其他還沒更新的地方(例如health_monitor.py)

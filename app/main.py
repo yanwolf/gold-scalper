@@ -275,18 +275,21 @@ async def execution_test_close(payload: dict = Body(...)):
 
 
 @app.get("/paper-trading/summary")
-async def paper_trading_summary(limit: int = 50, interval_seconds: int = 300):
+async def paper_trading_summary(limit: int = 50, engine_id: str = "chan_profile_300"):
     """
     模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、最大回撤、
     目前開倉狀態、最近N筆紀錄、以及對照「達標門檻」的評估結果。
     用來在正式接軌Pepperstone MT5自動下單前，評估這套訊號邏輯值不值得真的接execution。
 
-    interval_seconds指定要看哪個K線週期的引擎(目前支援60=1分K、300=5分K，
-    兩個是平行運作、各自獨立的追蹤引擎，方便直接對照績效)。
+    engine_id指定要看哪一個追蹤引擎(不再用interval_seconds查詢，因為現在同一個
+    K線週期可能有多個策略的引擎平行運作，例如1分K纏論"chan_profile_60"跟
+    1分K共振"resonance_fvg_60"都是60秒週期但是不同引擎，光用週期已經無法唯一
+    區分。可用的engine_id可以查PAPER_TRADING_ENGINES.keys()，目前有：
+    chan_profile_60、chan_profile_300、chan_profile_900、resonance_fvg_60)。
     """
-    engine = PAPER_TRADING_ENGINES.get(interval_seconds)
+    engine = PAPER_TRADING_ENGINES.get(engine_id)
     if engine is None:
-        return {"error": f"沒有interval_seconds={interval_seconds}的追蹤引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
+        return {"error": f"沒有engine_id={engine_id}的追蹤引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
     return engine.get_summary(limit=limit)
 
 

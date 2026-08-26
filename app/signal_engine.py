@@ -111,17 +111,19 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     return result
 
 
-def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000):
+def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
+                         strategy_type="chan_profile", resonance_min_conditions=4):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
 
-    刻意寫死strategy_type="chan_profile"，不吃DEFAULT_STRATEGY_TYPE(那個會受
-    STRATEGY_TYPE環境變數影響)——即時模擬單/通知/API永遠只能是chan_profile，
-    resonance_fvg實驗性策略只能透過backtest.py明確指定strategy_type參數測試。
-    這樣就算有人不小心在Zeabur設定了STRATEGY_TYPE=resonance_fvg這個環境變數
-    (原本是設計給backtest.py沒指定時的預設值用)，也不會意外影響到正在運作的
-    即時系統，兩條路徑徹底切開(修正記錄見README)。
+    strategy_type預設值刻意寫死字串"chan_profile"，不是讀DEFAULT_STRATEGY_TYPE
+    (那個會受STRATEGY_TYPE環境變數影響)——這樣任何沒有明確指定strategy_type的
+    呼叫端(通知、API直接呼叫等)永遠安全地拿到chan_profile，不會因為Zeabur不小心
+    設了STRATEGY_TYPE環境變數就被意外帶偏。只有呼叫端「明確傳入」strategy_type=
+    "resonance_fvg"才會真的用到共振策略——目前只有paper_trading.py裡特地建立的
+    1分K共振模擬單引擎會這樣做(修正記錄見README)，這是使用者看過真實回測數據
+    (獲利因子/勝率不錯，但需要留意最大回撤偏大)後決定要開始收集即時資料。
     """
     trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
 
@@ -136,5 +138,6 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000):
         bucket_size=bucket_size,
         trade_limit=trade_limit,
         current_price=current_price,
-        strategy_type="chan_profile",
+        strategy_type=strategy_type,
+        resonance_min_conditions=resonance_min_conditions,
     )

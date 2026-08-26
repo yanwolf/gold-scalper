@@ -104,13 +104,27 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS interval_seconds INTEGER NOT NULL DEFAULT 60;
                 """)
+                # 支援同一個K線週期跑多種策略平行追蹤(例如1分K纏論 vs 1分K多條件共振)：
+                # 光用interval_seconds已經不夠當唯一識別碼(兩個引擎都可能是60秒週期)，
+                # 新增engine_id當真正的查詢鍵。舊資料庫的既有紀錄一律回填成
+                # "chan_profile_<interval_seconds>"，因為resonance_fvg策略在這次
+                # 修改之前從來沒有接過即時模擬單，所有既有資料一定都屬於chan_profile。
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS engine_id TEXT;
+                """)
+                cur.execute("""
+                    UPDATE paper_trades
+                    SET engine_id = 'chan_profile_' || interval_seconds::text
+                    WHERE engine_id IS NULL;
+                """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paper_trades_status
                     ON paper_trades (status);
                 """)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_paper_trades_interval
-                    ON paper_trades (interval_seconds, status);
+                    CREATE INDEX IF NOT EXISTS idx_paper_trades_engine
+                    ON paper_trades (engine_id, status);
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
@@ -218,7 +232,9 @@ def insert_open_paper_trade(position):
     """
     新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
     sl_price, peak_price, trailing_active, chan_reason, profile_reason, interval_seconds
-    (哪個K線週期的追蹤引擎開的倉，用來區分1分K/5分K等平行追蹤的紀錄)。
+    (哪個K線週期，僅供顯示參考)、engine_id(真正的查詢鍵，用來區分同一個K線週期底下
+    不同策略的平行追蹤引擎，例如"chan_profile_60"跟"resonance_fvg_60"都是60秒週期
+    但屬於不同引擎，不能共用同一份歷史紀錄)。
     回傳新增的資料庫id，沒有資料庫時回傳None(呼叫端要能接受id=None，代表這筆單只存在記憶體)。
     """
     if not _enabled:
@@ -232,15 +248,15 @@ def insert_open_paper_trade(position):
                     """
                     INSERT INTO paper_trades
                         (direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
-                         chan_reason, profile_reason, status, interval_seconds)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s)
+                         chan_reason, profile_reason, status, interval_seconds, engine_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s)
                     RETURNING id;
                     """,
                     (
                         position["direction"], position["entry_price"], position["entry_time"],
                         position["sl_price"], position.get("peak_price"), position.get("trailing_active", False),
                         position.get("chan_reason"), position.get("profile_reason"),
-                        position.get("interval_seconds", 60),
+                        position.get("interval_seconds", 60), position.get("engine_id", "chan_profile_60"),
                     ),
                 )
                 new_id = cur.fetchone()[0]
@@ -305,10 +321,12 @@ def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points):
         logger.error(f"平倉模擬單失敗: {e}")
 
 
-def get_open_paper_trade(interval_seconds=60):
+def get_open_paper_trade(engine_id="chan_profile_60"):
     """
-    服務啟動時呼叫：查有沒有還沒平倉的模擬單(每個interval_seconds各自最多一筆)，
-    用來回填記憶體狀態。interval_seconds區分是1分K追蹤引擎還是5分K追蹤引擎在查。
+    服務啟動時呼叫：查有沒有還沒平倉的模擬單(每個engine_id各自最多一筆)，
+    用來回填記憶體狀態。engine_id區分是哪一個追蹤引擎在查(例如1分K纏論
+    "chan_profile_60" 跟 1分K共振 "resonance_fvg_60" 是不同引擎，即使
+    interval_seconds同樣是60也不會查到彼此的資料)。
     """
     if not _enabled:
         return None
@@ -319,12 +337,12 @@ def get_open_paper_trade(interval_seconds=60):
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
-                           chan_reason, profile_reason, interval_seconds
+                           chan_reason, profile_reason, interval_seconds, engine_id
                     FROM paper_trades
-                    WHERE status = 'open' AND interval_seconds = %s
+                    WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
                     LIMIT 1;
-                """, (interval_seconds,))
+                """, (engine_id,))
                 row = cur.fetchone()
         finally:
             _pool.putconn(conn)
@@ -336,14 +354,15 @@ def get_open_paper_trade(interval_seconds=60):
             "entry_time": row[3].isoformat() if row[3] else None,
             "sl_price": row[4], "peak_price": row[5], "trailing_active": row[6],
             "chan_reason": row[7], "profile_reason": row[8], "interval_seconds": row[9],
+            "engine_id": row[10],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")
         return None
 
 
-def get_closed_paper_trades(limit=500, interval_seconds=60):
-    """撈最近N筆已平倉的模擬單(限定某個K線週期)，由新到舊排序，給績效統計用。"""
+def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
+    """撈最近N筆已平倉的模擬單(限定某個引擎)，由新到舊排序，給績效統計用。"""
     if not _enabled:
         return []
 
@@ -356,11 +375,11 @@ def get_closed_paper_trades(limit=500, interval_seconds=60):
                     SELECT direction, entry_price, entry_time, exit_price, exit_time,
                            exit_reason, pnl_points, chan_reason, profile_reason
                     FROM paper_trades
-                    WHERE status = 'closed' AND interval_seconds = %s
+                    WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
                     LIMIT %s;
                     """,
-                    (interval_seconds, limit),
+                    (engine_id, limit),
                 )
                 rows = cur.fetchall()
         finally:

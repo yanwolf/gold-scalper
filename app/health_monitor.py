@@ -52,11 +52,12 @@ class HealthMonitor:
             "trade_data_stall": False,
             "db_write_failure": False,
         }
-        # 模擬單心跳告警是每個週期引擎各自獨立一個key(例如paper_trading_stall_60、
-        # paper_trading_stall_300)，用迴圈動態產生，這樣新增第三個週期引擎時
-        # 不用回頭改這裡
-        for interval_seconds in PAPER_TRADING_ENGINES:
-            self._alert_active[f"paper_trading_stall_{interval_seconds}"] = False
+        # 模擬單心跳告警是每個引擎各自獨立一個key(例如paper_trading_stall_chan_profile_60、
+        # paper_trading_stall_resonance_fvg_60)，用迴圈動態產生，這樣新增引擎時
+        # 不用回頭改這裡。改用engine_id當key(不再是interval_seconds)，因為現在
+        # 同一個K線週期可能有多個策略的引擎平行運作，engine_id才是真正唯一的識別碼
+        for engine_id in PAPER_TRADING_ENGINES:
+            self._alert_active[f"paper_trading_stall_{engine_id}"] = False
 
         self._last_checked_at = None
 
@@ -85,8 +86,8 @@ class HealthMonitor:
 
         self._check_binance_connection(now)
         self._check_trade_data_flow(now)
-        for interval_seconds, engine in PAPER_TRADING_ENGINES.items():
-            self._check_paper_trading_heartbeat(now, interval_seconds, engine)
+        for engine_id, engine in PAPER_TRADING_ENGINES.items():
+            self._check_paper_trading_heartbeat(now, engine_id, engine)
         self._check_db_write_health()
 
     def _set_alert(self, key, is_problem, problem_message, recovered_message):
@@ -164,7 +165,7 @@ class HealthMonitor:
             "Binance逐筆成交資料已恢復正常更新",
         )
 
-    def _check_paper_trading_heartbeat(self, now, interval_seconds, engine):
+    def _check_paper_trading_heartbeat(self, now, engine_id, engine):
         last_tick = engine.last_tick_at
         if last_tick is None:
             # 服務剛啟動、還沒執行過第一次tick，不算異常
@@ -174,7 +175,7 @@ class HealthMonitor:
             is_problem = stalled_seconds >= HEALTH_PAPER_STALL_THRESHOLD_SECONDS
 
         self._set_alert(
-            f"paper_trading_stall_{interval_seconds}",
+            f"paper_trading_stall_{engine_id}",
             is_problem,
             f"模擬單追蹤引擎({engine.label})已經超過{HEALTH_PAPER_STALL_THRESHOLD_SECONDS}秒沒有執行檢查，"
             f"可能背景執行緒已經停止運作",
