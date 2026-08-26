@@ -30,6 +30,7 @@ from app.health_monitor import health_monitor
 from app import backtest as backtest_module
 from app import sweep as sweep_module
 from app import settings as settings_module
+from app import execution as execution_module
 from app import db
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
@@ -166,6 +167,81 @@ async def update_settings(payload: dict = Body(...)):
     values = payload.get("values", {})
     updated = settings_module.update_settings(values)
     return {"success": True, "values": updated}
+
+
+# ---------------------------------------------------------------------------
+# 幣安期貨下單執行(測試網優先)：手動測試用endpoint，還沒自動接上模擬單引擎的
+# 開倉/平倉事件——因為現在1分K/5分K/15分K三個引擎平行運作，如果都自動對同一個
+# 帳戶下單會互相打架，這部分需要另外設計，見README。這裡先讓使用者能手動驗證
+# 認證/簽章/精度換算/下單流程本身能不能正常運作。修改設定用同一組密碼保護，
+# 避免任何拿到網址的人亂觸發下單。
+# ---------------------------------------------------------------------------
+
+@app.get("/execution/status")
+async def execution_status():
+    """回傳執行模組目前狀態：有沒有啟用、現在打的是測試網還正式環境。不需要密碼，純讀取。"""
+    return execution_module.status()
+
+
+@app.get("/execution/account")
+async def execution_account(password: str = ""):
+    """
+    查詢幣安期貨帳戶餘額，用來確認API金鑰有沒有接對、測試網/正式環境有沒有搞錯。
+    需要密碼(跟策略參數設定共用同一組SETTINGS_PASSWORD)，避免任何拿到網址的人
+    都能查看帳戶資訊。
+    """
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+
+    success, data = execution_module.get_account_balance()
+    return {"success": success, "data": data}
+
+
+@app.post("/execution/test-order")
+async def execution_test_order(payload: dict = Body(...)):
+    """
+    手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
+    "risk_usd": 20, "sl_points": 5}。用來驗證整條「換算部位大小 -> 送出市價單」
+    的流程實際能不能跑通，不會自動觸發，一定要手動呼叫這支API才會下單。
+
+    務必先確認 GET /execution/status 顯示 testnet: true，再呼叫這支API，
+    避免不小心對正式環境送出真實訂單。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+
+    if not execution_module.status()["testnet"]:
+        return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
+
+    direction = payload.get("direction")
+    risk_usd = payload.get("risk_usd", 20)
+    sl_points = payload.get("sl_points", 5)
+
+    if direction not in ("bullish", "bearish"):
+        return {"success": False, "error": "direction必須是bullish或bearish"}
+
+    success, result = execution_module.open_position(direction, risk_usd, sl_points)
+    return {"success": success, "result": result}
+
+
+@app.post("/execution/test-close")
+async def execution_test_close(payload: dict = Body(...)):
+    """手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish"}。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+
+    if not execution_module.status()["testnet"]:
+        return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
+
+    direction = payload.get("direction")
+    if direction not in ("bullish", "bearish"):
+        return {"success": False, "error": "direction必須是bullish或bearish"}
+
+    success, result = execution_module.close_position(direction)
+    return {"success": success, "result": result}
 
 
 @app.get("/paper-trading/summary")
