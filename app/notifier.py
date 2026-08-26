@@ -68,7 +68,8 @@ class TelegramNotifier:
         """同上，事件驅動模式下沒有背景執行緒需要停止，保留是為了介面一致。"""
         pass
 
-    def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None, executed=None):
+    def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
+                            executed=None, execution_error=None):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -81,6 +82,9 @@ class TelegramNotifier:
                   下單成功；False代表有嘗試同步下單但失敗了。用來讓使用者從
                   Telegram訊息本身就能分辨「這是純模擬」還是「真的下單了」，
                   不用另外切回dashboard確認。
+        execution_error: executed=False時，附上失敗的詳細原因(例如幣安API回傳的
+                  錯誤代碼/訊息)，直接顯示在通知裡，不用另外查伺服器log才知道
+                  發生什麼事(修正記錄見README)。
         """
         if self._muted:
             return
@@ -93,7 +97,8 @@ class TelegramNotifier:
             env_label = "測試網" if execution_module.use_testnet() else "⚠️正式環境(真錢)"
             execution_note = f"（已同步在幣安{env_label}下單）"
         elif executed is False:
-            execution_note = "（同步下單失敗，僅記錄模擬單，請檢查執行模組狀態）"
+            error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
+            execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"
         else:
             execution_note = "（目前僅模擬單，未接自動下單）"
 

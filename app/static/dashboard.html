@@ -582,6 +582,31 @@
 </div>
 
 <div class="panel">
+  <div class="section-title" style="margin-top:0;">部位風險試算</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
+    輸入候選的下單數量和停損距離，回推「如果觸及停損會虧多少美元、佔目前帳戶
+    餘額多少%」，純參考用，不會下單也不會改任何設定。停損距離可以參考上面
+    模擬單面板顯示的「目前策略設定」裡的ATR相關數值當基準。算完覺得可以接受，
+    再自己把數量填進下面策略參數設定裡的「真實下單口數」。
+  </div>
+
+  <div class="settings-field">
+    <label>候選數量 (XAU張數)</label>
+    <input type="number" id="riskCalcQuantity" value="1.0" step="0.1" min="0.001" />
+  </div>
+  <div class="settings-field">
+    <label>停損距離 (points)</label>
+    <input type="number" id="riskCalcSlPoints" value="5" step="0.5" min="0.5" />
+  </div>
+
+  <div class="controls">
+    <button id="riskCalcBtn" class="btn-secondary">試算</button>
+  </div>
+
+  <div id="riskCalcResult" class="notify-result"></div>
+</div>
+
+<div class="panel">
   <div class="section-title" style="margin-top:0;">幣安下單測試（測試網）</div>
   <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
     手動驗證下單流程能不能跑通，還沒自動接上模擬單引擎(見README說明)。
@@ -596,6 +621,14 @@
   </div>
 
   <div class="settings-field">
+    <label>槓桿倍數</label>
+    <input type="number" id="executionLeverage" value="10" step="1" min="1" />
+  </div>
+  <div class="controls" style="margin-bottom:16px;">
+    <button id="executionLeverageBtn" class="btn-secondary">設定槓桿</button>
+  </div>
+
+  <div class="settings-field">
     <label>方向</label>
     <select id="executionDirection">
       <option value="bullish">看多 (BUY)</option>
@@ -603,12 +636,8 @@
     </select>
   </div>
   <div class="settings-field">
-    <label>風險金額 (USD)</label>
-    <input type="number" id="executionRiskUsd" value="20" step="1" min="1" />
-  </div>
-  <div class="settings-field">
-    <label>停損距離 (points)</label>
-    <input type="number" id="executionSlPoints" value="5" step="0.5" min="0.5" />
+    <label>下單數量 (XAU張數)</label>
+    <input type="number" id="executionQuantity" value="1.0" step="0.1" min="0.001" />
   </div>
 
   <div class="controls">
@@ -705,11 +734,16 @@ const els = {
   executionStatusLine: document.getElementById('executionStatusLine'),
   executionAccountBtn: document.getElementById('executionAccountBtn'),
   executionDirection: document.getElementById('executionDirection'),
-  executionRiskUsd: document.getElementById('executionRiskUsd'),
-  executionSlPoints: document.getElementById('executionSlPoints'),
+  executionQuantity: document.getElementById('executionQuantity'),
+  executionLeverage: document.getElementById('executionLeverage'),
+  executionLeverageBtn: document.getElementById('executionLeverageBtn'),
   executionOpenBtn: document.getElementById('executionOpenBtn'),
   executionCloseBtn: document.getElementById('executionCloseBtn'),
   executionResult: document.getElementById('executionResult'),
+  riskCalcQuantity: document.getElementById('riskCalcQuantity'),
+  riskCalcSlPoints: document.getElementById('riskCalcSlPoints'),
+  riskCalcBtn: document.getElementById('riskCalcBtn'),
+  riskCalcResult: document.getElementById('riskCalcResult'),
   sweepInterval: document.getElementById('sweepInterval'),
   sweepDays: document.getElementById('sweepDays'),
   sweepStartBtn: document.getElementById('sweepStartBtn'),
@@ -1169,8 +1203,7 @@ els.executionOpenBtn.addEventListener('click', async () => {
       body: JSON.stringify({
         password: pwd,
         direction: els.executionDirection.value,
-        risk_usd: parseFloat(els.executionRiskUsd.value),
-        sl_points: parseFloat(els.executionSlPoints.value),
+        quantity: parseFloat(els.executionQuantity.value),
       }),
     });
     const data = await res.json();
@@ -1206,6 +1239,62 @@ els.executionCloseBtn.addEventListener('click', async () => {
     showExecutionResult(`平倉失敗：${err.message}`, true);
   }
   els.executionCloseBtn.disabled = false;
+});
+
+els.executionLeverageBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  els.executionLeverageBtn.disabled = true;
+  showExecutionResult('設定中...', false);
+  try{
+    const res = await fetch('/execution/set-leverage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwd, leverage: parseInt(els.executionLeverage.value) }),
+    });
+    const data = await res.json();
+    if(data.success){
+      showExecutionResult(`槓桿設定成功：\n${JSON.stringify(data.result, null, 2)}`, false);
+    }else{
+      showExecutionResult(`槓桿設定失敗：${JSON.stringify(data.result || data.error)}`, true);
+    }
+  }catch(err){
+    showExecutionResult(`槓桿設定失敗：${err.message}`, true);
+  }
+  els.executionLeverageBtn.disabled = false;
+});
+
+function showRiskCalcResult(msg, isError){
+  els.riskCalcResult.textContent = msg;
+  els.riskCalcResult.className = `notify-result ${isError ? 'error' : 'success'}`;
+}
+
+els.riskCalcBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  els.riskCalcBtn.disabled = true;
+  showRiskCalcResult('試算中...', false);
+  try{
+    const quantity = parseFloat(els.riskCalcQuantity.value);
+    const slPoints = parseFloat(els.riskCalcSlPoints.value);
+    const res = await fetch(`/execution/estimate-risk?quantity=${quantity}&sl_points=${slPoints}&password=${encodeURIComponent(pwd)}`);
+    const data = await res.json();
+    if(data.success){
+      const d = data.data;
+      showRiskCalcResult(
+        `數量 ${d.quantity} 張 × 停損 ${d.sl_points} points\n` +
+        `= 觸及停損時虧損 $${d.dollar_risk}\n` +
+        `目前帳戶餘額：$${d.account_balance}\n` +
+        `佔帳戶餘額：${d.risk_pct != null ? d.risk_pct + '%' : '無法計算(餘額為0)'}`,
+        false
+      );
+    }else{
+      showRiskCalcResult(`試算失敗：${JSON.stringify(data.error)}`, true);
+    }
+  }catch(err){
+    showRiskCalcResult(`試算失敗：${err.message}`, true);
+  }
+  els.riskCalcBtn.disabled = false;
 });
 
 fetchExecutionStatus();

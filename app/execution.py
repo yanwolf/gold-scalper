@@ -123,15 +123,57 @@ def get_symbol_precision(symbol=None):
 
 def calculate_quantity(risk_usd, sl_points, symbol=None):
     """
-    依「這筆單願意承擔多少美元風險」和「停損距離(points)」，換算出應該下單的數量(張數)。
+    (輔助試算用，不再是實際下單的主要依據，見下方open_position()的修正記錄)
+    依「這筆單願意承擔多少美元風險」和「停損距離(points)」，換算出對應的下單數量。
     因為幣安XAUUSDT是1張合約=1金衡盎司=每點1美元價格波動對應1美元損益，
-    所以 數量 = 風險金額 / 停損點數，這是使用者本人在對話裡驗證過的換算邏輯。
+    所以 數量 = 風險金額 / 停損點數。
     """
     if sl_points <= 0:
         return 0.0
     quantity = risk_usd / sl_points
     precision = get_symbol_precision(symbol)
     return round(quantity, precision)
+
+
+def estimate_risk(quantity, sl_points, account_balance=None, symbol=None):
+    """
+    反過來算：使用者自己決定要下多少口數，這裡回推「如果觸及停損，實際會虧多少
+    美元」以及「這筆虧損佔帳戶餘額的百分比」，給使用者參考用，不會自動套用或
+    修改任何設定——真正要下單用哪個數量，由使用者自己決定並填進設定裡。
+
+    改成這個方向的原因(使用者本人在對話裡提出的理由)：ATR動態停損模式下，
+    每一筆的停損距離(sl_points)都不一樣，如果反過來用「固定風險金額 / 停損距離」
+    去derive下單數量，會導致每筆單的實際部位大小跟著波動、難以預期；改成
+    「使用者自己決定固定口數」，部位大小本身變得穩定可預期，風險則誠實地
+    隨著市場波動大小浮動，這樣使用者才有一個穩定的基準去判斷「我能接受多大
+    的部位」。
+
+    account_balance沒有提供的話，會即時查詢目前帳戶的可用餘額。
+    回傳 (success, data_or_error)，成功時data包含 dollar_risk、risk_pct、account_balance。
+    """
+    if quantity <= 0 or sl_points <= 0:
+        return False, "數量和停損距離都必須大於0"
+
+    if account_balance is None:
+        success, balance_data = get_account_balance()
+        if not success:
+            return False, balance_data
+        account_balance = 0.0
+        for asset in balance_data:
+            if asset.get("asset") == "USDT":
+                account_balance = float(asset.get("availableBalance", 0))
+                break
+
+    dollar_risk = quantity * sl_points
+    risk_pct = (dollar_risk / account_balance * 100) if account_balance > 0 else None
+
+    return True, {
+        "quantity": quantity,
+        "sl_points": sl_points,
+        "account_balance": account_balance,
+        "dollar_risk": round(dollar_risk, 2),
+        "risk_pct": round(risk_pct, 2) if risk_pct is not None else None,
+    }
 
 
 def set_leverage(leverage, symbol=None):
@@ -159,6 +201,9 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False):
     if quantity <= 0:
         return False, "下單數量必須大於0"
 
+    precision = get_symbol_precision(symbol)
+    quantity = round(quantity, precision)
+
     params = {
         "symbol": symbol,
         "side": side,
@@ -170,20 +215,25 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False):
     return _signed_request("POST", "/fapi/v1/order", params)
 
 
-def open_position(direction, risk_usd, sl_points, symbol=None):
+def open_position(direction, quantity, symbol=None):
     """
-    依訊號方向開倉。direction是"bullish"/"bearish"，risk_usd是這筆單願意承擔的
-    美元風險，sl_points是停損距離(points)，兩者換算出下單數量。
+    依訊號方向開倉，quantity是直接指定的下單數量(張數)——不再從風險金額反推。
+
+    修正記錄：原本這裡是「給風險金額+停損距離，反推出下單數量」，但ATR動態
+    停損模式下每筆的停損距離都不一樣，用這種方式算出來的部位大小會跟著每筆
+    的停損距離浮動，不容易預期、也不容易對帳。改成直接指定固定數量，部位
+    大小變得穩定可預期，使用者可以搭配estimate_risk()先試算這個數量對應的
+    風險大小，自己決定要用多少，而不是讓系統自動幫忙決定。
+
     回傳(success, order_result_or_error)。
     """
     if not is_enabled():
         return False, "執行模組未啟用(未設定API金鑰)"
 
-    side = "BUY" if direction == "bullish" else "SELL"
-    quantity = calculate_quantity(risk_usd, sl_points, symbol=symbol)
     if quantity <= 0:
-        return False, "換算出來的下單數量是0，可能是風險金額或停損距離設定有問題"
+        return False, "下單數量必須大於0"
 
+    side = "BUY" if direction == "bullish" else "SELL"
     return place_market_order(side, quantity, symbol=symbol)
 
 

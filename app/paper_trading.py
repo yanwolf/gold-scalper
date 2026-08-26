@@ -169,30 +169,34 @@ class PaperTradingEngine:
         # 決定)下單，其他週期繼續純模擬。設計成只能指定單一週期，避免1分K/5分K/15分K
         # 三個引擎同時對同一個帳戶下單互相打架(修正記錄見README)。
         executed = None  # None=沒有嘗試下單(純模擬)，True=下單成功，False=下單失敗
+        execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
         s = settings_module.get_settings()
         if s["execution_interval_seconds"] == self.interval_seconds:
             try:
                 success, result = execution_module.open_position(
                     direction=position["direction"],
-                    risk_usd=s["execution_risk_usd"],
-                    sl_points=sl_points,
+                    quantity=s["execution_quantity"],
                 )
                 executed = success
                 if success:
                     logger.info(f"同步下單成功({self.label}): {result}")
                 else:
+                    execution_error = result
                     logger.error(f"同步下單失敗({self.label}): {result}")
             except Exception as e:
                 executed = False
+                execution_error = str(e)
                 logger.error(f"同步下單發生例外({self.label}): {e}")
 
         # 事件驅動通知：真的開倉了才通知(而不是每次檢測到訊號就通知)，
-        # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)
+        # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)。
+        # execution_error會一起帶進通知內容，讓使用者從Telegram訊息本身就能看到
+        # 下單失敗的具體原因，不用另外查伺服器log。
         try:
             notifier_module.notifier.notify_trade_event(
                 action="open", label=self.label,
                 direction=position["direction"], price=current_price,
-                executed=executed,
+                executed=executed, execution_error=execution_error,
             )
         except Exception as e:
             logger.error(f"開倉通知發送失敗({self.label}): {e}")
@@ -213,6 +217,7 @@ class PaperTradingEngine:
         )
 
         executed = None
+        execution_error = None
         s = settings_module.get_settings()
         if s["execution_interval_seconds"] == self.interval_seconds:
             try:
@@ -221,9 +226,11 @@ class PaperTradingEngine:
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
                 else:
+                    execution_error = result
                     logger.error(f"同步平倉失敗({self.label}): {result}")
             except Exception as e:
                 executed = False
+                execution_error = str(e)
                 logger.error(f"同步平倉發生例外({self.label}): {e}")
 
         try:
@@ -231,7 +238,7 @@ class PaperTradingEngine:
                 action="close", label=self.label,
                 direction=position["direction"], price=exit_price,
                 exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
-                executed=executed,
+                executed=executed, execution_error=execution_error,
             )
         except Exception as e:
             logger.error(f"平倉通知發送失敗({self.label}): {e}")

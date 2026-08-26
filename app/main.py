@@ -198,12 +198,43 @@ async def execution_account(password: str = ""):
     return {"success": success, "data": data}
 
 
+@app.get("/execution/estimate-risk")
+async def execution_estimate_risk(quantity: float, sl_points: float, password: str = ""):
+    """
+    部位風險試算：給定候選下單數量和停損距離，回推「如果觸及停損，實際會虧多少
+    美元、佔目前帳戶餘額多少百分比」，純粹給使用者參考、幫助決定要在
+    execution_quantity設定裡填多少，不會實際下單也不會修改任何設定。
+    需要密碼，跟其他執行相關endpoint一致。
+    """
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+
+    success, data = execution_module.estimate_risk(quantity, sl_points)
+    return {"success": success, "data": data if success else None, "error": None if success else data}
+
+
+@app.post("/execution/set-leverage")
+async def execution_set_leverage(payload: dict = Body(...)):
+    """手動設定槓桿倍數：payload格式 {"password": "...", "leverage": 10}。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+
+    leverage = payload.get("leverage")
+    if not leverage or leverage <= 0:
+        return {"success": False, "error": "leverage必須是正整數"}
+
+    success, result = execution_module.set_leverage(int(leverage))
+    return {"success": success, "result": result}
+
+
 @app.post("/execution/test-order")
 async def execution_test_order(payload: dict = Body(...)):
     """
     手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
-    "risk_usd": 20, "sl_points": 5}。用來驗證整條「換算部位大小 -> 送出市價單」
-    的流程實際能不能跑通，不會自動觸發，一定要手動呼叫這支API才會下單。
+    "quantity": 2.5}。用來驗證整條「送出市價單」的流程實際能不能跑通，不會自動
+    觸發，一定要手動呼叫這支API才會下單。
 
     務必先確認 GET /execution/status 顯示 testnet: true，再呼叫這支API，
     避免不小心對正式環境送出真實訂單。
@@ -216,13 +247,12 @@ async def execution_test_order(payload: dict = Body(...)):
         return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
 
     direction = payload.get("direction")
-    risk_usd = payload.get("risk_usd", 20)
-    sl_points = payload.get("sl_points", 5)
+    quantity = payload.get("quantity", 1.0)
 
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    success, result = execution_module.open_position(direction, risk_usd, sl_points)
+    success, result = execution_module.open_position(direction, quantity)
     return {"success": success, "result": result}
 
 
