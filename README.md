@@ -1405,3 +1405,27 @@ paper_trading_1m_resonance = PaperTradingEngine(
 **經驗教訓**：這是「改設定欄位名稱」這類看似單純的重構，其實隱藏著
 「使用者既有設定值會不會被悄悄遺失」的風險，之後如果還有類似的欄位改名，
 會優先考慮加上這種一次性遷移邏輯，而不是假設「反正有預設值就不會壞」。
+
+## 修正記錄：5分K模擬單績效載入500錯誤(risk_guard.py漏改的呼叫)
+
+**發現的問題**：新增1分K共振引擎的資料庫migration(`db.get_closed_paper_trades()`
+參數從`interval_seconds`改成`engine_id`)之後，`risk_guard.py`裡的
+`get_daily_pnl_usd()`和`get_consecutive_losses()`兩個函式**還在用舊的
+`interval_seconds=`關鍵字參數呼叫**，沒有跟著改成`engine_id=`。這兩個函式
+只有在某個引擎的`execution_index`符合設定的`execution_engine_index`時才會
+被呼叫(用來檢查風控斷路器狀態)——所以只有「目前指定負責真實下單的那個
+引擎」會踩到這個bug，其他引擎完全不受影響，這也是為什麼只有5分K(前一次
+修正才剛把`execution_engine_index`自動遷移回2，對應5分K)出現500錯誤，
+1分K/15分K/1分K共振都正常。
+
+**修正**：把`risk_guard.py`兩處呼叫都改成`engine_id=engine.engine_id`，
+跟`db.py`的新函式簽章一致。已用測試明確重現修正前的錯誤(`TypeError: 
+get_closed_paper_trades() got an unexpected keyword argument
+'interval_seconds'`)，確認根因判斷正確；也驗證修正後4個引擎的
+`get_summary()`都能正常執行，不再拋出例外。
+
+**經驗教訓**：這是同一次架構調整(改`db.py`函式簽章)牽動多個呼叫端，但
+「只有特定條件下才會執行到」的呼叫端(這裡是risk_guard.py，只有真實下單
+引擎才會觸發)容易在改動時被漏掉，因為一般測試路徑不會碰到。之後如果還有
+類似「改動一個底層函式簽章」的重構，會用`grep`全文搜尋所有呼叫端來源，
+確保不會有「藏在條件分支後面」的呼叫端被遺漏。

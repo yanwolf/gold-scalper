@@ -33,7 +33,7 @@ def get_daily_pnl_usd(engine, quantity):
     today = datetime.now(timezone.utc).date()
 
     if db.is_enabled():
-        trades = db.get_closed_paper_trades(limit=500, interval_seconds=engine.interval_seconds)
+        trades = db.get_closed_paper_trades(limit=500, engine_id=engine.engine_id)
     else:
         trades = list(engine._closed_trades_memory)
 
@@ -58,7 +58,7 @@ def get_consecutive_losses(engine):
     盈虧兩平(pnl_points恰好等於0)也算在虧損裡，保守判斷。
     """
     if db.is_enabled():
-        trades = db.get_closed_paper_trades(limit=50, interval_seconds=engine.interval_seconds)
+        trades = db.get_closed_paper_trades(limit=50, engine_id=engine.engine_id)
     else:
         trades = list(engine._closed_trades_memory)[::-1]  # 記憶體版本是舊到新存的，反過來才是新到舊
 
