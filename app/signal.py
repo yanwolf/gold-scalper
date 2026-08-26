@@ -223,6 +223,33 @@ def _has_stabilizing_price_action(latest_candle, prev_candle, direction, wick_ra
     return None
 
 
+def _has_volume_confirmation(candles, direction, lookback=10, shrink_ratio=0.7):
+    """
+    量縮止跌/止漲判斷：比較最新K棒的成交量跟前面近期(lookback根，不含最新那根)
+    的平均成交量，如果明顯縮小(低於平均的shrink_ratio倍)，代表賣壓(多單情境)
+    或買壓(空單情境)可能已經釋放完畢——這是手稿裡「價量的東西」的「量」那半部，
+    原本第一版只做了「價」(K棒影線/收盤位置)，這裡補上「量」。
+
+    這是簡化實作，只採用「量縮止跌」這個方向的價量邏輯(手稿明確描述的版本)，
+    沒有涵蓋「反轉K棒爆量」這種另一種常見但意義不同的價量確認方式(兩者是
+    不同的解讀，量縮代表賣壓衰竭、爆量代表積極承接，這裡先只做前者)。
+    資料不足時回傳None(不擋單，避免資料不足就整個判斷卡住)。
+    """
+    if len(candles) < lookback + 1:
+        return None
+
+    recent = candles[-(lookback + 1):-1]  # 不含最新那根，取前面lookback根當基準
+    avg_volume = sum(c.get("volume", 0) for c in recent) / len(recent)
+    if avg_volume <= 0:
+        return None
+
+    latest_volume = candles[-1].get("volume", 0)
+    if latest_volume <= avg_volume * shrink_ratio:
+        role = "賣壓" if direction == "bullish" else "買盤"
+        return f"成交量較近期平均萎縮({latest_volume:.1f} vs 均量{avg_volume:.1f})，{role}可能已經釋放"
+    return None
+
+
 def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_index, current_price,
                                    chop_threshold=61.8, rsi_oversold=30, rsi_overbought=70):
     """
@@ -232,6 +259,9 @@ def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_ind
     濾網防禦：choppiness_index超過門檻(判定為震盪盤)時直接拒絕，不管其他
     條件再怎麼符合都不給訊號，理由是這套策略假設「在趨勢盤裡找拉回進場點」，
     震盪盤裡EMA/FVG的支撐壓力意義較低。
+
+    MACD目前只當參考資訊放進理由文字裡，不是真正的過濾條件(使用者明確決定
+    先不補這個缺口，只補成交量條件，見README修正記錄)。
     """
     if choppiness_index is not None and choppiness_index >= chop_threshold:
         return {
@@ -260,17 +290,22 @@ def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_ind
         if not price_action_reason:
             continue
 
+        volume_reason = _has_volume_confirmation(candles, direction)
+        if not volume_reason:
+            continue
+
         rsi_reason = f"RSI({rsi:.1f})處於{'超賣' if direction=='bullish' else '超買'}區"
+        macd_note = f"；MACD柱狀圖{macd.get('histogram'):.4f}(參考資訊，非過濾條件)" if macd and macd.get("histogram") is not None else ""
         return {
             "stage": "訊號", "direction": direction,
-            "chan": {"bias": direction, "strength": "strong", "reason": f"{rsi_reason}；MACD柱狀圖{macd.get('histogram'):.4f}" if macd.get("histogram") is not None else rsi_reason},
-            "profile": {"bias": direction, "strength": "strong", "reason": f"{level_reason}；{price_action_reason}"},
+            "chan": {"bias": direction, "strength": "strong", "reason": f"{rsi_reason}{macd_note}"},
+            "profile": {"bias": direction, "strength": "strong", "reason": f"{level_reason}；{price_action_reason}；{volume_reason}"},
             "current_price": current_price,
         }
 
     return {
         "stage": "中性", "direction": None,
-        "chan": {"bias": "neutral", "strength": "none", "reason": "RSI/EMA-FVG/價格行為三項條件未同時符合"},
+        "chan": {"bias": "neutral", "strength": "none", "reason": "RSI/EMA-FVG/價格行為/成交量四項條件未同時符合"},
         "profile": {"bias": "neutral", "strength": "none", "reason": "共振策略要求所有條件都符合才給訊號"},
         "current_price": current_price,
     }
