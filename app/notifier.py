@@ -68,7 +68,7 @@ class TelegramNotifier:
         """同上，事件驅動模式下沒有背景執行緒需要停止，保留是為了介面一致。"""
         pass
 
-    def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None):
+    def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None, executed=None):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -77,6 +77,10 @@ class TelegramNotifier:
         direction: "bullish" 或 "bearish"
         price: 進場價或出場價
         exit_reason/pnl_points: 只有action="close"時才需要提供
+        executed: None代表這個週期沒有設定同步下單(純模擬)；True代表真的送出
+                  下單成功；False代表有嘗試同步下單但失敗了。用來讓使用者從
+                  Telegram訊息本身就能分辨「這是純模擬」還是「真的下單了」，
+                  不用另外切回dashboard確認。
         """
         if self._muted:
             return
@@ -84,13 +88,22 @@ class TelegramNotifier:
         direction_label = DIRECTION_LABELS.get(direction, direction)
         now_str = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
 
+        if executed is True:
+            from app import execution as execution_module
+            env_label = "測試網" if execution_module.use_testnet() else "⚠️正式環境(真錢)"
+            execution_note = f"（已同步在幣安{env_label}下單）"
+        elif executed is False:
+            execution_note = "（同步下單失敗，僅記錄模擬單，請檢查執行模組狀態）"
+        else:
+            execution_note = "（目前僅模擬單，未接自動下單）"
+
         if action == "open":
             text = (
                 f"🟢 黃金模擬單【{label}】進場\n"
                 f"方向：{direction_label}\n"
                 f"時間：{now_str}\n"
                 f"價格：{price:.2f}\n\n"
-                f"（目前僅模擬單，未接自動下單）"
+                f"{execution_note}"
             )
         else:
             pnl_sign = "+" if (pnl_points or 0) >= 0 else ""
@@ -102,7 +115,7 @@ class TelegramNotifier:
                 f"價格：{price:.2f}\n"
                 f"出場原因：{exit_reason}\n"
                 f"損益：{pnl_sign}{pnl_points:.2f} points\n\n"
-                f"（目前僅模擬單，未接自動下單）"
+                f"{execution_note}"
             )
 
         success, _ = self._send_telegram_message(text)

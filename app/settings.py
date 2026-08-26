@@ -118,6 +118,24 @@ FIELD_META = {
                 "濾網開關打開時才生效)。數值介於0~100，數字越高代表越震盪，"
                 "61.8是業界常見的預設門檻。",
     },
+    "execution_interval_seconds": {
+        "label": "真實下單週期 (0=全部純模擬 / 60=1分K / 300=5分K / 900=15分K)",
+        "type": "int", "step": 60, "min": 0, "max": 900,
+        "default": int(os.getenv("EXECUTION_INTERVAL_SECONDS", "0")),
+        "help": "只有『這一個』週期的模擬單引擎，開倉/平倉時才會同步在幣安期貨"
+                "(依BINANCE_USE_TESTNET決定測試網或正式環境)送出對應的市價單，"
+                "其他週期維持純模擬、不會下單。設計成只能指定一個週期，避免多個"
+                "週期同時對同一個帳戶下單互相打架。設0代表全部都是純模擬，"
+                "不會有任何真實下單發生。只能填0/60/300/900這四個值，填其他"
+                "數字等於沒有任何週期會被觸發(安全的失敗模式)。",
+    },
+    "execution_risk_usd": {
+        "label": "每筆真實下單風險金額 (USD)",
+        "type": "float", "step": 5, "min": 1, "max": 5000,
+        "default": float(os.getenv("EXECUTION_RISK_USD", "20")),
+        "help": "只有上面指定的那個真實下單週期才會用到。下單數量 = 這個金額 / "
+                "停損距離(points)，換算邏輯已經在測試面板驗證過。",
+    },
 }
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}

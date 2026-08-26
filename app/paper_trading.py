@@ -26,6 +26,7 @@ from app import db
 from app import trading_core
 from app import settings as settings_module
 from app import notifier as notifier_module
+from app import execution as execution_module
 from app.trading_stats import compute_stats, assess_readiness
 
 logger = logging.getLogger("paper_trading")
@@ -164,12 +165,34 @@ class PaperTradingEngine:
             f"(初始SL:{position['sl_price']:.2f})"
         )
 
+        # 只有「指定的那個週期」才會同步送出真實(測試網/正式環境依BINANCE_USE_TESTNET
+        # 決定)下單，其他週期繼續純模擬。設計成只能指定單一週期，避免1分K/5分K/15分K
+        # 三個引擎同時對同一個帳戶下單互相打架(修正記錄見README)。
+        executed = None  # None=沒有嘗試下單(純模擬)，True=下單成功，False=下單失敗
+        s = settings_module.get_settings()
+        if s["execution_interval_seconds"] == self.interval_seconds:
+            try:
+                success, result = execution_module.open_position(
+                    direction=position["direction"],
+                    risk_usd=s["execution_risk_usd"],
+                    sl_points=sl_points,
+                )
+                executed = success
+                if success:
+                    logger.info(f"同步下單成功({self.label}): {result}")
+                else:
+                    logger.error(f"同步下單失敗({self.label}): {result}")
+            except Exception as e:
+                executed = False
+                logger.error(f"同步下單發生例外({self.label}): {e}")
+
         # 事件驅動通知：真的開倉了才通知(而不是每次檢測到訊號就通知)，
         # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)
         try:
             notifier_module.notifier.notify_trade_event(
                 action="open", label=self.label,
                 direction=position["direction"], price=current_price,
+                executed=executed,
             )
         except Exception as e:
             logger.error(f"開倉通知發送失敗({self.label}): {e}")
@@ -189,11 +212,26 @@ class PaperTradingEngine:
             f"({exit_reason}, 損益:{closed_record['pnl_points']:+.2f})"
         )
 
+        executed = None
+        s = settings_module.get_settings()
+        if s["execution_interval_seconds"] == self.interval_seconds:
+            try:
+                success, result = execution_module.close_position(direction=position["direction"])
+                executed = success
+                if success:
+                    logger.info(f"同步平倉成功({self.label}): {result}")
+                else:
+                    logger.error(f"同步平倉失敗({self.label}): {result}")
+            except Exception as e:
+                executed = False
+                logger.error(f"同步平倉發生例外({self.label}): {e}")
+
         try:
             notifier_module.notifier.notify_trade_event(
                 action="close", label=self.label,
                 direction=position["direction"], price=exit_price,
                 exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
+                executed=executed,
             )
         except Exception as e:
             logger.error(f"平倉通知發送失敗({self.label}): {e}")
