@@ -232,6 +232,15 @@ def update_settings(updates: dict):
             # 夾在設定的合理範圍內，避免使用者手滑打進一個荒謬的數字(例如負的停損距離)
             casted = max(meta["min"], min(meta["max"], casted))
 
+            # 只有「新值真的跟目前的值不一樣」才算真的有異動——dashboard的
+            # 「儲存變更」按鈕會把整個表單所有欄位都一起送出(不是只送使用者
+            # 改的那一個)，如果不做這個檢查，即使只想改execution_interval_seconds
+            # 這種不影響交易邏輯的欄位，也會因為paper_sl_points等交易相關欄位
+            # 剛好也在同一份送出的資料裡，被誤判成「這些欄位也被改動了」，
+            # 錯誤觸發績效統計的新舊設定分界機制(修正記錄見README)
+            if casted == _settings[key]:
+                continue
+
             _settings[key] = casted
             applied[key] = casted
 
