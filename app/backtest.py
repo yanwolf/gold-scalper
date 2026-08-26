@@ -134,6 +134,7 @@ def run_backtest(
     use_chop_filter=None,
     chop_threshold=None,
     strategy_type=None,
+    resonance_min_conditions=4,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -164,6 +165,12 @@ def run_backtest(
     resonance_fvg模式下，震盪濾網已經內建在訊號判斷本身裡(choppiness_index
     超過門檻直接判定中性)，不會再套用外層chan_profile專用的use_chop_filter
     設定，避免兩套濾網互相打架、門檻定義還不一致。
+
+    resonance_min_conditions只有resonance_fvg模式才會用到：四個子條件
+    (RSI/EMA-FVG/價格行為/成交量)裡要符合幾個(含)以上才給訊號，預設4是
+    原本的嚴格AND邏輯，調低可以放寬門檻——用真實資料回測後發現嚴格AND
+    訊號量偏少(30天僅25筆)但獲利因子/勝率數字不錯，這個參數讓使用者可以
+    直接用回測比較不同門檻的訊號量/品質取捨，不用用猜的(修正記錄見README)。
     """
     s = settings_module.get_settings()
     if sl_points is None:
@@ -228,6 +235,7 @@ def run_backtest(
             trade_limit=trade_limit,
             current_price=current_price,
             strategy_type=strategy_type,
+            resonance_min_conditions=resonance_min_conditions,
         )
 
         # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
@@ -315,4 +323,5 @@ def run_backtest(
         "use_chop_filter": use_chop_filter,
         "chop_threshold": chop_threshold,
         "strategy_type": strategy_type,
+        "resonance_min_conditions": resonance_min_conditions,
     }

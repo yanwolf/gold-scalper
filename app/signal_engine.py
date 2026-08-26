@@ -38,7 +38,7 @@ DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_prof
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
-                                current_price=None, strategy_type=None):
+                                current_price=None, strategy_type=None, resonance_min_conditions=4):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -55,6 +55,11 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     傳入"resonance_fvg"才會計算EMA/RSI/MACD/FVG這些額外指標並改用共振策略
     判斷——這些指標平常(chan_profile模式)不會計算，避免每次即時訊號檢查都
     白白多花運算資源在用不到的指標上。
+
+    resonance_min_conditions只有resonance_fvg模式才會用到：四個子條件
+    (RSI/EMA-FVG/價格行為/成交量)裡要符合幾個(含)以上才給訊號，預設4代表
+    要全部符合(原本的嚴格AND邏輯)，調低可以放寬門檻，用回測比較「訊號量
+    vs 品質」的取捨(修正記錄見README)。
     """
     strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
 
@@ -80,6 +85,7 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         result = generate_signal_resonance_fvg(
             candles=candles, emas=emas, rsi=rsi, macd=macd, fvgs=fvgs,
             choppiness_index=choppiness_index, current_price=current_price,
+            min_conditions_met=resonance_min_conditions,
         )
     else:
         result = generate_signal(chan_data, poc_info, current_price)

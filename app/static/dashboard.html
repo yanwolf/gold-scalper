@@ -523,6 +523,17 @@
       <option value="chan_profile" selected>纏論+分價量表(既有)</option>
       <option value="resonance_fvg">多條件共振+FVG(實驗性)</option>
     </select>
+    <select id="backtestResonanceThreshold">
+      <option value="4" selected>4/4項條件(嚴格AND)</option>
+      <option value="3">3/4項條件(放寬)</option>
+      <option value="2">2/4項條件(更寬鬆)</option>
+    </select>
+  </div>
+  <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+    ↑「幾項條件」只有選擇「多條件共振+FVG」時才有作用，套用RSI/EMA-FVG/
+    價格行為/成交量四個子條件裡要符合幾個(含)以上才給訊號。
+  </div>
+  <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
 
@@ -732,6 +743,7 @@ const els = {
   backtestInterval: document.getElementById('backtestInterval'),
   backtestDays: document.getElementById('backtestDays'),
   backtestStrategy: document.getElementById('backtestStrategy'),
+  backtestResonanceThreshold: document.getElementById('backtestResonanceThreshold'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -1557,12 +1569,13 @@ els.backtestRunBtn.addEventListener('click', async () => {
   const days = els.backtestDays.value;
   const intervalSeconds = els.backtestInterval.value;
   const strategyType = els.backtestStrategy.value;
+  const resonanceMinConditions = els.backtestResonanceThreshold.value;
   els.backtestRunBtn.disabled = true;
   els.backtestRunBtn.textContent = '回測中...';
   els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
 
   try{
-    const res = await fetch(`/backtest/run?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}`);
+    const res = await fetch(`/backtest/run?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}`);
     if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
     const data = await res.json();
 

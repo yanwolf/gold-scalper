@@ -251,17 +251,30 @@ def _has_volume_confirmation(candles, direction, lookback=10, shrink_ratio=0.7):
 
 
 def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_index, current_price,
-                                   chop_threshold=61.8, rsi_oversold=30, rsi_overbought=70):
+                                   chop_threshold=61.8, rsi_oversold=30, rsi_overbought=70,
+                                   min_conditions_met=4):
     """
-    多條件共振策略主入口。所有子條件都必須符合才給"訊號"，任一條件不符合
-    則回傳"中性"——這是刻意的嚴格AND邏輯，不是bug。
+    多條件共振策略主入口。四個子條件(RSI極端值、EMA/FVG支撐壓力、價格行為止跌、
+    成交量萎縮)各自獨立檢查，符合min_conditions_met個(含)以上才給"訊號"。
 
-    濾網防禦：choppiness_index超過門檻(判定為震盪盤)時直接拒絕，不管其他
-    條件再怎麼符合都不給訊號，理由是這套策略假設「在趨勢盤裡找拉回進場點」，
-    震盪盤裡EMA/FVG的支撐壓力意義較低。
+    min_conditions_met=4(預設)等於原本的嚴格AND邏輯(全部4項都要符合)，
+    調低到3或2可以放寬門檻——這是使用者用真實歷史資料回測後的決定：嚴格
+    AND邏輯訊號量太少(30天只有25筆)，但獲利因子/勝率的數字看起來不錯，
+    值得試試看放寬門檻、用回測比較「訊號量 vs 品質」的取捨，而不是直接
+    改成OR(任一條件就觸發，會太鬆、容易混入雜訊訊號)。
 
-    MACD目前只當參考資訊放進理由文字裡，不是真正的過濾條件(使用者明確決定
-    先不補這個缺口，只補成交量條件，見README修正記錄)。
+    重要行為差異：min_conditions_met=4時，RSI仍然是事實上的必要條件(4項
+    全部要符合，RSI當然也要符合)，跟改版前行為完全一致；但min_conditions_met
+    調低後，RSI只是4票中的1票，不再是唯一決定「要不要評估這個方向」的
+    硬性前提——例如門檻設3時，即使RSI沒有達到超買超賣，只要EMA/FVG+價格
+    行為+成交量這3項都符合，一樣可以觸發訊號。這是刻意放寬的設計，用
+    min_conditions_met控制放寬的程度。
+
+    濾網防禦(choppiness_index)不算在這四個條件裡，是獨立的硬性前提——判定
+    為震盪盤時直接拒絕，不管其他條件符合幾個都不給訊號。
+
+    MACD目前只當參考資訊放進理由文字裡，不算在四個計分條件裡(使用者明確
+    決定先不補這個缺口，見README修正記錄)。
     """
     if choppiness_index is not None and choppiness_index >= chop_threshold:
         return {
@@ -274,38 +287,47 @@ def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_ind
     latest_candle = candles[-1] if candles else None
     prev_candle = candles[-2] if len(candles) >= 2 else None
 
-    for direction, rsi_gate in (("bullish", rsi is not None and rsi < rsi_oversold),
-                                 ("bearish", rsi is not None and rsi > rsi_overbought)):
-        if not rsi_gate:
-            continue
+    for direction in ("bullish", "bearish"):
+        reasons = []
+
+        if direction == "bullish" and rsi is not None and rsi < rsi_oversold:
+            reasons.append(("rsi", f"RSI({rsi:.1f})處於超賣區"))
+        elif direction == "bearish" and rsi is not None and rsi > rsi_overbought:
+            reasons.append(("rsi", f"RSI({rsi:.1f})處於超買區"))
 
         level_reason = (
             _find_ema_support_or_resistance(current_price, emas, direction)
             or _find_fvg_zone(current_price, fvgs, direction)
         )
-        if not level_reason:
-            continue
+        if level_reason:
+            reasons.append(("level", level_reason))
 
         price_action_reason = _has_stabilizing_price_action(latest_candle, prev_candle, direction)
-        if not price_action_reason:
-            continue
+        if price_action_reason:
+            reasons.append(("price_action", price_action_reason))
 
         volume_reason = _has_volume_confirmation(candles, direction)
-        if not volume_reason:
-            continue
+        if volume_reason:
+            reasons.append(("volume", volume_reason))
 
-        rsi_reason = f"RSI({rsi:.1f})處於{'超賣' if direction=='bullish' else '超買'}區"
-        macd_note = f"；MACD柱狀圖{macd.get('histogram'):.4f}(參考資訊，非過濾條件)" if macd and macd.get("histogram") is not None else ""
-        return {
-            "stage": "訊號", "direction": direction,
-            "chan": {"bias": direction, "strength": "strong", "reason": f"{rsi_reason}{macd_note}"},
-            "profile": {"bias": direction, "strength": "strong", "reason": f"{level_reason}；{price_action_reason}；{volume_reason}"},
-            "current_price": current_price,
-        }
+        if len(reasons) >= min_conditions_met:
+            macd_note = (
+                f"；MACD柱狀圖{macd.get('histogram'):.4f}(參考資訊，非計分條件)"
+                if macd and macd.get("histogram") is not None else ""
+            )
+            rsi_text = next((r for k, r in reasons if k == "rsi"), "RSI未達極端值(此項未計分)")
+            other_reasons = "；".join(r for k, r in reasons if k != "rsi") or "無其他條件符合"
+            return {
+                "stage": "訊號", "direction": direction,
+                "chan": {"bias": direction, "strength": "strong", "reason": f"{rsi_text}{macd_note}"},
+                "profile": {"bias": direction, "strength": "strong", "reason": f"符合{len(reasons)}/4項條件(門檻{min_conditions_met})：{other_reasons}"},
+                "current_price": current_price,
+                "conditions_met": len(reasons),
+            }
 
     return {
         "stage": "中性", "direction": None,
-        "chan": {"bias": "neutral", "strength": "none", "reason": "RSI/EMA-FVG/價格行為/成交量四項條件未同時符合"},
-        "profile": {"bias": "neutral", "strength": "none", "reason": "共振策略要求所有條件都符合才給訊號"},
+        "chan": {"bias": "neutral", "strength": "none", "reason": f"兩個方向都未達到{min_conditions_met}/4項條件門檻"},
+        "profile": {"bias": "neutral", "strength": "none", "reason": "共振策略要求至少符合設定的條件數才給訊號"},
         "current_price": current_price,
     }
