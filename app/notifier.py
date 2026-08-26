@@ -69,7 +69,7 @@ class TelegramNotifier:
         pass
 
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
-                            executed=None, execution_error=None):
+                            executed=None, execution_error=None, skip_reason=None):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -85,6 +85,8 @@ class TelegramNotifier:
         execution_error: executed=False時，附上失敗的詳細原因(例如幣安API回傳的
                   錯誤代碼/訊息)，直接顯示在通知裡，不用另外查伺服器log才知道
                   發生什麼事(修正記錄見README)。
+        skip_reason: 風控斷路器擋下這次真實下單時的原因(每日虧損上限/連續虧損
+                  上限)，這種情況下executed維持None(不算「失敗」，是「刻意不嘗試」)。
         """
         if self._muted:
             return
@@ -99,6 +101,8 @@ class TelegramNotifier:
         elif executed is False:
             error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
             execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"
+        elif skip_reason:
+            execution_note = f"（風控斷路器已暫停真實下單，僅記錄模擬單）\n原因：{skip_reason}"
         else:
             execution_note = "（目前僅模擬單，未接自動下單）"
 
@@ -126,6 +130,23 @@ class TelegramNotifier:
         success, _ = self._send_telegram_message(text)
         if success:
             self._last_notified_at = datetime.now(timezone.utc).isoformat()
+
+    def notify_circuit_breaker(self, label, reason):
+        """
+        風控斷路器「剛觸發」時發送的獨立警示，跟notify_trade_event()是分開的
+        通知路徑——這則是主動、一次性的警示(只在狀態從允許變成擋下的那一刻
+        發送)，不像notify_trade_event那樣依附在每一次交易事件上，避免之後
+        每次被擋都收到重複的訊息轟炸。
+        """
+        if self._muted:
+            return
+        text = (
+            f"🛑 風控斷路器觸發【{label}】\n"
+            f"{reason}\n\n"
+            f"已暫停送出新的真實開倉單(模擬單追蹤不受影響，會繼續正常記錄)。"
+            f"已經開的部位該停損/該出場照樣正常進行，不受這道防線影響。"
+        )
+        self._send_telegram_message(text)
 
     def _send_telegram_message(self, text):
         """回傳 (success: bool, error_message: str|None)，方便API endpoint把結果回報給前端。"""

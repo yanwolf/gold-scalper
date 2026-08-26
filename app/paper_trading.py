@@ -27,6 +27,7 @@ from app import trading_core
 from app import settings as settings_module
 from app import notifier as notifier_module
 from app import execution as execution_module
+from app import risk_guard
 from app.trading_stats import compute_stats, assess_readiness
 
 logger = logging.getLogger("paper_trading")
@@ -51,6 +52,7 @@ class PaperTradingEngine:
         self._stop_flag = threading.Event()
         self._seeded_from_db = False
         self._last_tick_at = None  # 給health_monitor.py檢查引擎是否還活著用
+        self._circuit_breaker_alerted = False  # 避免風控斷路器每次被觸發都重複發送警示
 
     @property
     def last_tick_at(self):
@@ -170,33 +172,50 @@ class PaperTradingEngine:
         # 三個引擎同時對同一個帳戶下單互相打架(修正記錄見README)。
         executed = None  # None=沒有嘗試下單(純模擬)，True=下單成功，False=下單失敗
         execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
+        skip_reason = None  # 風控斷路器擋下這次下單的原因(修正記錄見README)
         s = settings_module.get_settings()
         if s["execution_interval_seconds"] == self.interval_seconds:
-            try:
-                success, result = execution_module.open_position(
-                    direction=position["direction"],
-                    quantity=s["execution_quantity"],
-                )
-                executed = success
-                if success:
-                    logger.info(f"同步下單成功({self.label}): {result}")
-                else:
-                    execution_error = result
-                    logger.error(f"同步下單失敗({self.label}): {result}")
-            except Exception as e:
-                executed = False
-                execution_error = str(e)
-                logger.error(f"同步下單發生例外({self.label}): {e}")
+            quantity = s["execution_quantity"]
+            allowed, block_reason = risk_guard.check(self, quantity)
+
+            if not allowed:
+                skip_reason = block_reason
+                logger.warning(f"風控斷路器阻擋真實下單({self.label}): {block_reason}")
+                # 斷路器「剛觸發」的那一刻才主動發一則獨立警示，避免之後每次
+                # 被擋都重複騷擾——只在狀態從「允許」變成「擋下」時發一次
+                if not self._circuit_breaker_alerted:
+                    self._circuit_breaker_alerted = True
+                    try:
+                        notifier_module.notifier.notify_circuit_breaker(self.label, block_reason)
+                    except Exception as e:
+                        logger.error(f"風控斷路器警示發送失敗({self.label}): {e}")
+            else:
+                self._circuit_breaker_alerted = False  # 恢復正常了，下次再觸發要重新警示
+                try:
+                    success, result = execution_module.open_position(
+                        direction=position["direction"],
+                        quantity=quantity,
+                    )
+                    executed = success
+                    if success:
+                        logger.info(f"同步下單成功({self.label}): {result}")
+                    else:
+                        execution_error = result
+                        logger.error(f"同步下單失敗({self.label}): {result}")
+                except Exception as e:
+                    executed = False
+                    execution_error = str(e)
+                    logger.error(f"同步下單發生例外({self.label}): {e}")
 
         # 事件驅動通知：真的開倉了才通知(而不是每次檢測到訊號就通知)，
         # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)。
-        # execution_error會一起帶進通知內容，讓使用者從Telegram訊息本身就能看到
-        # 下單失敗的具體原因，不用另外查伺服器log。
+        # execution_error/skip_reason會一起帶進通知內容，讓使用者從Telegram訊息
+        # 本身就能看到下單失敗或被風控擋下的具體原因，不用另外查伺服器log。
         try:
             notifier_module.notifier.notify_trade_event(
                 action="open", label=self.label,
                 direction=position["direction"], price=current_price,
-                executed=executed, execution_error=execution_error,
+                executed=executed, execution_error=execution_error, skip_reason=skip_reason,
             )
         except Exception as e:
             logger.error(f"開倉通知發送失敗({self.label}): {e}")
@@ -281,6 +300,11 @@ class PaperTradingEngine:
         with self._lock:
             position = self._position
 
+        s = settings_module.get_settings()
+        circuit_breaker = None
+        if s["execution_interval_seconds"] == self.interval_seconds:
+            circuit_breaker = risk_guard.status(self, s["execution_quantity"])
+
         return {
             **stats,
             "interval_seconds": self.interval_seconds,
@@ -288,9 +312,10 @@ class PaperTradingEngine:
             "open_position": position,
             "recent_trades": trades[:limit],
             "stats_excluded_old_trades": len(trades) - len(stats_trades),  # 給dashboard顯示排除了幾筆舊紀錄
-            "active_settings": settings_module.get_settings(),
+            "active_settings": s,
             "settings_changed_at": settings_changed_at,
             "readiness": readiness,
+            "circuit_breaker": circuit_breaker,  # None代表這個週期沒有接真實下單，不適用風控斷路器
         }
 
 

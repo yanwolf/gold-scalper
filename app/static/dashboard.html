@@ -1401,7 +1401,7 @@ function renderTradeList(el, trades, settingsChangedAt){
   el.innerHTML = rows.join('');
 }
 
-function renderActiveConfig(el, activeSettings, label, settingsChangedAt, excludedOldCount){
+function renderActiveConfig(el, activeSettings, label, settingsChangedAt, excludedOldCount, circuitBreaker){
   if(!el || !activeSettings) { if(el) el.innerHTML = ''; return; }
   const s = activeSettings;
 
@@ -1432,6 +1432,19 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     ? `<div class="cfg-row"><span class="cfg-label">績效統計範圍</span><span class="cfg-value" style="color:var(--muted); font-weight:400;">已排除 ${excludedOldCount} 筆舊設定交易</span></div>`
     : '';
 
+  let circuitBreakerHtml = '';
+  if(circuitBreaker){
+    const pnlClass = circuitBreaker.daily_pnl_usd >= 0 ? 'on' : 'off';
+    const trippedHtml = circuitBreaker.tripped
+      ? `<div class="cfg-row"><span class="cfg-label">🛑 風控斷路器</span><span class="cfg-value" style="color:var(--resistance);">已觸發：${circuitBreaker.reason}</span></div>`
+      : `<div class="cfg-row"><span class="cfg-label">風控斷路器</span><span class="cfg-value on">正常(允許真實下單)</span></div>`;
+    circuitBreakerHtml = `
+      <div class="cfg-row"><span class="cfg-label">今日已實現損益</span><span class="cfg-value">$${circuitBreaker.daily_pnl_usd}</span></div>
+      <div class="cfg-row"><span class="cfg-label">目前連續虧損</span><span class="cfg-value">${circuitBreaker.consecutive_losses} 筆</span></div>
+      ${trippedHtml}
+    `;
+  }
+
   el.innerHTML = `
     <div class="active-config-card">
       <div class="cfg-title">目前策略設定（${label}）</div>
@@ -1440,12 +1453,13 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
       ${chopHtml}
       ${changedAtHtml}
       ${excludedHtml}
+      ${circuitBreakerHtml}
     </div>
   `;
 }
 
 function renderPaperTrading(data){
-  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades);
+  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
 
   if(data.open_position){
     const p = data.open_position;

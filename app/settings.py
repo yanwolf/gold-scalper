@@ -140,6 +140,24 @@ FIELD_META = {
                 "dashboard的「部位風險試算」功能，輸入候選數量看對應的風險金額/"
                 "風險百分比，自己決定要填多少再存進這裡。",
     },
+    "execution_daily_loss_limit_usd": {
+        "label": "每日虧損上限 (USD)",
+        "type": "float", "step": 5, "min": 1, "max": 100000,
+        "default": float(os.getenv("EXECUTION_DAILY_LOSS_LIMIT_USD", "50")),
+        "help": "只有上面指定的真實下單週期才會用到。今天(UTC日)已實現虧損達到"
+                "這個金額時，會暫停送出新的真實開倉單，直到隔天(UTC)重置。"
+                "已經開的部位不受影響，該停損/該出場照樣正常進行——這道防線只擋"
+                "「新增風險」的動作，不擋「降低風險」的動作。模擬單追蹤本身也"
+                "完全不受影響，繼續正常記錄每一筆。",
+    },
+    "execution_max_consecutive_losses": {
+        "label": "連續虧損上限 (筆數)",
+        "type": "int", "step": 1, "min": 1, "max": 50,
+        "default": int(os.getenv("EXECUTION_MAX_CONSECUTIVE_LOSSES", "3")),
+        "help": "只有上面指定的真實下單週期才會用到。連續虧損達到這個筆數時，"
+                "會暫停送出新的真實開倉單，直到出現一筆獲利為止(獲利會重置這個"
+                "計數)。已經開的部位不受影響。",
+    },
 }
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}
