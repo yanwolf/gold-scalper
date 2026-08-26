@@ -77,11 +77,19 @@ def update_trailing_stop(position, current_price, trail_trigger_points, trail_di
     return changed
 
 
-def check_exit(position, current_price, signal_stage, signal_direction, reversal_confirm_count=2):
+def check_exit(position, current_price, signal_stage, signal_direction, reversal_confirm_count=2, current_ema9=None):
     """
-    出場規則：觸及停損(初始或移動後，價格觸發，不需要確認、立刻出場)
-    或 訊號反轉(需要連續reversal_confirm_count次檢查都看到同一個反向訊號才算數，
-    避免訊號瞬間閃爍一次就把倉位洗出場)，先到先出。
+    出場規則：觸及停損(初始或移動後，價格觸發，不需要確認、立刻出場)、
+    9EMA動態防守(見下方說明，立刻出場)、或 訊號反轉(需要連續
+    reversal_confirm_count次檢查都看到同一個反向訊號才算數，避免訊號瞬間
+    閃爍一次就把倉位洗出場)，先到先出。
+
+    9EMA動態防守：current_ema9有提供、且移動停損已經啟動(trailing_active)時，
+    如果價格有效跌破(多單)/突破(空單)9EMA，代表短線動能可能急轉，立刻出場
+    鎖住獲利，不用等移動停損追上。只在trailing_active後才檢查，避免剛進場、
+    還沒累積足夠獲利緩衝時就被9EMA的正常雜訊洗出場。這是resonance_fvg實驗性
+    策略專用的出場加強，current_ema9預設None時完全不影響原本的行為，
+    現有的chan_profile策略(呼叫端不傳這個參數)不受任何影響。
 
     「連續確認」用position裡的pending_reversal_direction/pending_reversal_count
     追蹤跨檢查週期的狀態：
@@ -100,6 +108,12 @@ def check_exit(position, current_price, signal_stage, signal_direction, reversal
     else:
         if current_price >= position["sl_price"]:
             return "觸及移動停損" if position["trailing_active"] else "觸及停損"
+
+    if position["trailing_active"] and current_ema9 is not None:
+        if direction == "bullish" and current_price < current_ema9:
+            return "跌破9EMA動態防守"
+        elif direction == "bearish" and current_price > current_ema9:
+            return "突破9EMA動態防守"
 
     is_opposite_signal = signal_stage == "訊號" and signal_direction and signal_direction != direction
 

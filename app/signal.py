@@ -142,3 +142,135 @@ def generate_signal(chan_data, profile_data, current_price):
         "profile": profile_bias,
         "current_price": current_price,
     }
+
+
+# ---------------------------------------------------------------------------
+# 實驗性策略：多條件共振 + FVG (resonance_fvg)
+#
+# 目前只接回測(backtest.py可以指定strategy_type測試)，不接即時模擬單，
+# 用意是先驗證「這麼多條件疊在一起，訊號量夠不夠、勝率好不好」，再決定
+# 要不要真的接上即時追蹤(見signal_engine.py/README的STRATEGY_TYPE說明)。
+#
+# 設計上刻意要求「全部條件都符合」(AND邏輯)才給訊號，這是使用者參考的
+# 交易筆記(RSI+MACD+多條EMA+FVG共振)明確要求的風格。要注意的取捨：
+# 條件越多，符合的次數會斷崖式下降，訊號量可能很稀疏，這正是要先用
+# 回測驗證「訊號量夠不夠」的原因，不能只看邏輯合理就直接假設會有效。
+#
+# 為了跟trading_core.open_position()等既有介面相容，回傳格式沿用
+# generate_signal()同樣的{stage, direction, chan, profile, current_price}
+# 結構，只是這裡"chan"欄位放的是動能面判斷(RSI+MACD)，"profile"欄位放的是
+# 結構面判斷(EMA/FVG位置+價格行為)，跟纏論/分價量表的原意不同，是刻意
+# 借用相同的欄位名稱維持介面相容，不是真的纏論或分價量表資料。
+# ---------------------------------------------------------------------------
+
+def _find_ema_support_or_resistance(current_price, emas, direction, tolerance_pct=0.15):
+    """
+    檢查價格是不是剛好回踩到長天期EMA(50/100/200)附近。tolerance_pct是容許的
+    價格誤差百分比(預設0.15%，因為要求價格「剛好」壓在EMA上機率極低，需要
+    給一個合理的容忍帶)。direction是"bullish"時找支撐(價格從上方接近)，
+    "bearish"時找壓力(價格從下方接近)。
+    """
+    for period in (50, 100, 200):
+        ema_value = emas.get(period)
+        if ema_value is None:
+            continue
+        distance_pct = abs(current_price - ema_value) / ema_value * 100
+        if distance_pct <= tolerance_pct:
+            role = "支撐" if direction == "bullish" else "壓力"
+            return f"價格回踩{period}EMA({ema_value:.2f})附近，視為{role}"
+    return None
+
+
+def _find_fvg_zone(current_price, fvgs, zone_type):
+    """檢查價格是否落在某個未回補的FVG區間內。zone_type是"bullish"或"bearish"。"""
+    for f in fvgs:
+        if f["type"] != zone_type or f["filled"]:
+            continue
+        if f["bottom"] <= current_price <= f["top"]:
+            role = "支撐" if zone_type == "bullish" else "壓力"
+            return f"價格落入未回補的FVG區間({f['bottom']:.2f}~{f['top']:.2f})，視為{role}"
+    return None
+
+
+def _has_stabilizing_price_action(latest_candle, prev_candle, direction, wick_ratio_threshold=0.4):
+    """
+    簡化版價格行為止跌/止漲判斷：當前K棒留有夠長的方向性影線，或收盤價
+    突破前一根K棒的極值。這是簡化實作，沒有做更嚴謹的K線形態辨識(例如
+    吞噬、槌子線等經典形態)，先用這個粗略但計算簡單的版本驗證概念可不可行。
+    """
+    if not latest_candle:
+        return None
+
+    high, low = latest_candle["high"], latest_candle["low"]
+    open_, close = latest_candle["open"], latest_candle["close"]
+    total_range = high - low
+    if total_range <= 0:
+        return None
+
+    if direction == "bullish":
+        lower_wick = min(open_, close) - low
+        if lower_wick / total_range >= wick_ratio_threshold:
+            return "當前K棒留有長下影線，短線賣壓可能已經釋放"
+        if prev_candle and close > prev_candle["low"]:
+            return "收盤價站上前一根K棒低點，止跌訊號"
+    else:
+        upper_wick = high - max(open_, close)
+        if upper_wick / total_range >= wick_ratio_threshold:
+            return "當前K棒留有長上影線，短線買盤可能已經衰竭"
+        if prev_candle and close < prev_candle["high"]:
+            return "收盤價跌破前一根K棒高點，止漲訊號"
+
+    return None
+
+
+def generate_signal_resonance_fvg(candles, emas, rsi, macd, fvgs, choppiness_index, current_price,
+                                   chop_threshold=61.8, rsi_oversold=30, rsi_overbought=70):
+    """
+    多條件共振策略主入口。所有子條件都必須符合才給"訊號"，任一條件不符合
+    則回傳"中性"——這是刻意的嚴格AND邏輯，不是bug。
+
+    濾網防禦：choppiness_index超過門檻(判定為震盪盤)時直接拒絕，不管其他
+    條件再怎麼符合都不給訊號，理由是這套策略假設「在趨勢盤裡找拉回進場點」，
+    震盪盤裡EMA/FVG的支撐壓力意義較低。
+    """
+    if choppiness_index is not None and choppiness_index >= chop_threshold:
+        return {
+            "stage": "中性", "direction": None,
+            "chan": {"bias": "neutral", "strength": "none", "reason": f"Choppiness Index({choppiness_index:.1f})過高，判定為震盪盤，濾網暫停判斷"},
+            "profile": {"bias": "neutral", "strength": "none", "reason": "震盪盤濾網已阻擋，不評估其他條件"},
+            "current_price": current_price,
+        }
+
+    latest_candle = candles[-1] if candles else None
+    prev_candle = candles[-2] if len(candles) >= 2 else None
+
+    for direction, rsi_gate in (("bullish", rsi is not None and rsi < rsi_oversold),
+                                 ("bearish", rsi is not None and rsi > rsi_overbought)):
+        if not rsi_gate:
+            continue
+
+        level_reason = (
+            _find_ema_support_or_resistance(current_price, emas, direction)
+            or _find_fvg_zone(current_price, fvgs, direction)
+        )
+        if not level_reason:
+            continue
+
+        price_action_reason = _has_stabilizing_price_action(latest_candle, prev_candle, direction)
+        if not price_action_reason:
+            continue
+
+        rsi_reason = f"RSI({rsi:.1f})處於{'超賣' if direction=='bullish' else '超買'}區"
+        return {
+            "stage": "訊號", "direction": direction,
+            "chan": {"bias": direction, "strength": "strong", "reason": f"{rsi_reason}；MACD柱狀圖{macd.get('histogram'):.4f}" if macd.get("histogram") is not None else rsi_reason},
+            "profile": {"bias": direction, "strength": "strong", "reason": f"{level_reason}；{price_action_reason}"},
+            "current_price": current_price,
+        }
+
+    return {
+        "stage": "中性", "direction": None,
+        "chan": {"bias": "neutral", "strength": "none", "reason": "RSI/EMA-FVG/價格行為三項條件未同時符合"},
+        "profile": {"bias": "neutral", "strength": "none", "reason": "共振策略要求所有條件都符合才給訊號"},
+        "current_price": current_price,
+    }

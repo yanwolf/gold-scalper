@@ -1185,3 +1185,80 @@ Telegram通知裡。
 正確打斷連續虧損計數、斷路器觸發時真實下單正確被擋下(模擬單不受影響)、
 獨立警示只在剛觸發時發送一次(持續觸發期間不重複)、斷路器解除後狀態正確
 重置且真實下單恢復正常運作。
+
+## 新增：雙策略架構(resonance_fvg實驗性策略) —— 目前只接回測，不接即時
+
+**背景**：使用者參考一份手寫交易筆記(RSI+MACD+多條EMA+FVG共振)，並用Gemini
+生成了一份實作提示詞，想評估要不要加進系統。經過討論，決定**完整實作雙策略
+架構，但這套新策略先只接回測，不接即時模擬單**——先驗證訊號量夠不夠、
+能不能贏錢，再決定要不要真的接上即時追蹤。
+
+**評估時提出的疑慮(先寫在這裡，供之後判斷回測結果時參考)：**
+1. **MACD在系統裡已經有一份**(藏在纏論背馳判斷裡，用面積比較法)，新增獨立
+   MACD容易造成同一套數學被計算兩次，產生虛假的信心
+2. **RSI的逆勢邏輯跟系統核心(中樞突破/背馳)的順勢邏輯本質衝突**——真正的
+   強勢突破往往正好發生在RSI超買時，用RSI濾掉超買訊號等於濾掉最強的趨勢單
+3. **多條件AND邏輯疊加，訊號量會斷崖式下降**，且系統現有的chan_profile策略
+   都還沒累積到達標門檻(30筆)，先驗證簡單版本能不能賺錢，比疊加更複雜的
+   策略更有優先順序
+
+實測結果(合成隨機資料，3天)：`resonance_fvg`跑出**0筆交易**，`chan_profile`
+跑出38筆——初步驗證了「AND條件太多、訊號稀疏」的疑慮，但這是合成資料，
+沒有真實市場的趨勢/回踩結構，正式結論要看真實歷史資料的回測結果。
+
+### 技術實作
+
+**`app/analysis.py`新增四個公開指標函式**：
+- `compute_ema(candles, periods=[9,21,50,100,200])`——回傳{週期: 最新EMA值}
+- `compute_rsi(candles, period=14)`——Wilder's平滑法，回傳最新RSI(0~100)
+- `compute_macd(candles, fast=12, slow=26, signal=9)`——回傳{macd, signal, histogram}
+- `find_fvg(candles, lookback=50)`——偵測Fair Value Gap，含是否已回補(filled)判斷
+
+四個函式**刻意重用既有的`_ema()`私有函式**(纏論背馳判斷本來就在用)，沒有
+另外寫一份標準SMA種子的EMA實作——避免系統裡同時存在兩種EMA/MACD計算方式，
+在不同地方得出不一致的數字，增加除錯難度。
+
+**`app/signal.py`新增`generate_signal_resonance_fvg()`**：嚴格AND邏輯——
+濾網防禦(Choppiness Index過高直接拒絕) → RSI超買超賣 → EMA/FVG支撐壓力位置
+→ K棒價格行為(長影線或收盤突破前根極值)，全部符合才給「訊號」。回傳格式
+沿用跟`generate_signal()`一樣的`{stage, direction, chan, profile, current_price}`
+結構(維持跟`trading_core.open_position()`等既有介面相容)，只是"chan"欄位
+放動能面判斷(RSI+MACD)、"profile"欄位放結構面判斷(EMA/FVG+價格行為)，
+跟纏論/分價量表的原意不同，是刻意借用相同欄位名稱維持介面相容。
+
+**`app/trading_core.py`的`check_exit()`新增`current_ema9`選用參數**：
+移動停損啟動後，如果多單有效跌破/空單有效突破9EMA，立刻出場(不需要
+`pending_reversal_count`的連續確認，因為這是急停機制)。`current_ema9`預設
+`None`時完全不影響原有行為，經測試驗證向後相容、且不影響既有的連續反轉
+確認機制。
+
+**`app/signal_engine.py`新增`STRATEGY_TYPE`路由**：
+- `compute_signal_from_trades()`新增`strategy_type`參數，不指定時用
+  `DEFAULT_STRATEGY_TYPE`(讀取`STRATEGY_TYPE`環境變數，預設"chan_profile")
+- 只有`strategy_type=="resonance_fvg"`時才會計算EMA/RSI/MACD/FVG這些額外
+  指標，`chan_profile`模式不會多花運算資源在用不到的指標上
+- **重要安全設計**：`compute_full_signal()`(即時模擬單/通知/API三邊都呼叫
+  這個)**刻意寫死`strategy_type="chan_profile"`，不吃`STRATEGY_TYPE`環境
+  變數**——原本第一版有個疏漏，即時路徑會不小心繼承環境變數的預設值，
+  已修正並用測試驗證：即使刻意把`STRATEGY_TYPE`環境變數設成`resonance_fvg`，
+  即時訊號計算依然強制使用`chan_profile`，兩條路徑徹底切開，不會有「不小心
+  在Zeabur改一個環境變數就讓即時系統換了策略」的風險
+
+**`app/backtest.py`新增`strategy_type`參數**，貫穿整個回測重播迴圈：
+- 每一步呼叫`compute_signal_from_trades()`時帶入指定的策略
+- `resonance_fvg`模式下，9EMA動態防守會自動接上`check_exit()`
+- `resonance_fvg`的震盪濾網已經內建在訊號判斷本身裡，不會重複套用
+  `chan_profile`專用的`use_chop_filter`設定，避免兩套濾網門檻不一致互相打架
+
+**Dashboard「歷史回測」面板新增策略選單**(纏論+分價量表 / 多條件共振+FVG)，
+`/backtest/run`API新增`strategy_type`參數。
+
+已用完整情境測試驗證：EMA/RSI/MACD/FVG計算邏輯正確、AND邏輯正確運作(單一
+條件不足以觸發、任一條件缺席都會擋下)、9EMA防守出場正確觸發且向後相容、
+回測能正確依策略切換、**即時路徑不受環境變數影響的隔離保證**、以及完整
+回歸測試確認現有chan_profile策略的即時/回測行為完全沒有被這次改動影響。
+
+**尚未做的事**：`sweep.py`(參數掃描)目前還沒接上`strategy_type`，如果之後
+想對resonance_fvg的RSI門檻/EMA容忍帶等參數做敏感度測試，需要另外擴充。
+RSI「拐頭/底背離」偵測目前簡化成單純的超買超賣門檻，沒有做更嚴謹的背離
+形態辨識。

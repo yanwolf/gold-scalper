@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from app.signal_engine import compute_signal_from_trades
+from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
 from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
@@ -133,6 +133,7 @@ def run_backtest(
     atr_trail_multiplier=None,
     use_chop_filter=None,
     chop_threshold=None,
+    strategy_type=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -155,6 +156,14 @@ def run_backtest(
     重新計算停損/移動停損距離(不是整場回測固定用同一個值)，這樣才能正確模擬
     「停損距離跟著市場波動即時調整」的效果，跟即時模擬單的行為完全一致。
     ATR資料不足的步驟(回測最開始那幾步)會自動退回用固定點數。
+
+    strategy_type不指定時用DEFAULT_STRATEGY_TYPE("chan_profile")，明確傳入
+    "resonance_fvg"可以測試多條件共振+FVG這套實驗性策略——這是目前唯一能
+    測試這套策略的地方，即時模擬單(paper_trading.py)完全不會用到，確保
+    這個還沒驗證過的策略不會意外影響正在運作的即時系統(修正記錄見README)。
+    resonance_fvg模式下，震盪濾網已經內建在訊號判斷本身裡(choppiness_index
+    超過門檻直接判定中性)，不會再套用外層chan_profile專用的use_chop_filter
+    設定，避免兩套濾網互相打架、門檻定義還不一致。
     """
     s = settings_module.get_settings()
     if sl_points is None:
@@ -177,6 +186,8 @@ def run_backtest(
         use_chop_filter = bool(s["paper_use_chop_filter"])
     if chop_threshold is None:
         chop_threshold = s["paper_chop_threshold"]
+    if strategy_type is None:
+        strategy_type = DEFAULT_STRATEGY_TYPE
 
     klines = fetch_historical_klines(days=days)
     if not klines:
@@ -216,6 +227,7 @@ def run_backtest(
             bucket_size=bucket_size,
             trade_limit=trade_limit,
             current_price=current_price,
+            strategy_type=strategy_type,
         )
 
         # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
@@ -230,11 +242,18 @@ def run_backtest(
             step_trail_trigger_points = trail_trigger_points
             step_trail_distance_points = trail_distance_points
 
+        # resonance_fvg策略專用：9EMA動態防守出場，current_ema9=None時
+        # check_exit()完全不會啟用這個判斷，chan_profile模式維持原有行為不變
+        current_ema9 = None
+        if strategy_type == "resonance_fvg" and result.get("emas"):
+            current_ema9 = result["emas"].get(9)
+
         if position:
             trading_core.update_trailing_stop(position, current_price, step_trail_trigger_points, step_trail_distance_points)
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
                 reversal_confirm_count=reversal_confirm_count,
+                current_ema9=current_ema9,
             )
             if exit_reason:
                 exit_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
@@ -246,9 +265,12 @@ def run_backtest(
             # 震盪濾網：開啟時，偵測到當下這個時間點是震盪盤就跳過這次進場機會，
             # 現有部位不受影響(這段邏輯在position為None時才會跑，本來就只影響
             # 新開倉，不影響出場判斷)。choppiness_index資料不足時不擋單。
+            # resonance_fvg策略的震盪濾網已經內建在訊號判斷本身裡，這裡不重複套用
+            # chan_profile專用的use_chop_filter設定，避免兩套濾網門檻不一致互相打架。
             choppiness_index = result.get("choppiness_index")
             is_choppy = (
-                use_chop_filter
+                strategy_type != "resonance_fvg"
+                and use_chop_filter
                 and choppiness_index is not None
                 and choppiness_index >= chop_threshold
             )
@@ -292,4 +314,5 @@ def run_backtest(
         "atr_trail_multiplier": atr_trail_multiplier,
         "use_chop_filter": use_chop_filter,
         "chop_threshold": chop_threshold,
+        "strategy_type": strategy_type,
     }

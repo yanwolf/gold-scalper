@@ -11,21 +11,34 @@
 
 這樣「即時判斷」和「回測重播」永遠共用同一套訊號規則，不會有回測邏輯
 跟正式運作邏輯兜不起來的風險。
+
+STRATEGY_TYPE切換(修正記錄見README)：新增"resonance_fvg"實驗性策略
+(多條件共振+FVG)，跟原本的"chan_profile"策略並存。目前刻意設計成
+「只接回測，不接即時」——compute_full_signal()(即時模擬單/通知/API都是
+呼叫這個)完全不接受strategy_type參數，永遠用預設的"chan_profile"，
+新策略只有透過backtest.py明確指定strategy_type="resonance_fvg"才會生效，
+確保即時運作中的系統完全不受這個實驗性策略影響，直到先用回測驗證過
+訊號量和勝率再決定要不要接上即時。
 """
+
+import os
 
 from app.binance_client import binance_streamer
 from app.analysis import (
     build_candles, compute_volume_profile, poc_and_value_area, analyze_chan,
-    compute_atr, compute_choppiness_index,
+    compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
 )
-from app.signal import generate_signal
+from app.signal import generate_signal, generate_signal_resonance_fvg
 
 CHAN_LOOKBACK_TRADES = 100000  # 纏論固定用較大回看範圍，確保K棒數量足夠，不受trade_limit影響
                               # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
                               # 也沒用，實際能用的資料量是兩者取較小值)
 
+DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" 或 "resonance_fvg"
 
-def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000, current_price=None):
+
+def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
+                                current_price=None, strategy_type=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -37,7 +50,14 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     current_price可以外部指定(例如即時模式想用bid/ask中價而不是最後一筆成交價)，
     不指定的話預設用trades最後一筆的成交價。這個值必須在呼叫generate_signal()
     之前就決定好，否則訊號判斷理由裡引用的價格會跟回傳的current_price對不上。
+
+    strategy_type不指定時用DEFAULT_STRATEGY_TYPE("chan_profile")。只有明確
+    傳入"resonance_fvg"才會計算EMA/RSI/MACD/FVG這些額外指標並改用共振策略
+    判斷——這些指標平常(chan_profile模式)不會計算，避免每次即時訊號檢查都
+    白白多花運算資源在用不到的指標上。
     """
+    strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
+
     chan_trades = trades[-CHAN_LOOKBACK_TRADES:] if len(trades) > CHAN_LOOKBACK_TRADES else trades
     candles = build_candles(chan_trades, interval_seconds=interval_seconds)
     chan_data = analyze_chan(candles)
@@ -51,9 +71,26 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     if current_price is None:
         current_price = trades[-1]["price"] if trades else None
 
-    result = generate_signal(chan_data, poc_info, current_price)
+    emas = rsi = macd = fvgs = None
+    if strategy_type == "resonance_fvg":
+        emas = compute_ema(candles)
+        rsi = compute_rsi(candles)
+        macd = compute_macd(candles)
+        fvgs = find_fvg(candles)
+        result = generate_signal_resonance_fvg(
+            candles=candles, emas=emas, rsi=rsi, macd=macd, fvgs=fvgs,
+            choppiness_index=choppiness_index, current_price=current_price,
+        )
+    else:
+        result = generate_signal(chan_data, poc_info, current_price)
+
+    result["strategy_type"] = strategy_type
     result["atr"] = atr
     result["choppiness_index"] = choppiness_index
+    result["emas"] = emas
+    result["rsi"] = rsi
+    result["macd"] = macd
+    result["fvgs"] = fvgs
     result["chan_detail"] = {
         "interval_seconds": interval_seconds,
         "source_candle_count": len(candles),
@@ -72,6 +109,13 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
+
+    刻意寫死strategy_type="chan_profile"，不吃DEFAULT_STRATEGY_TYPE(那個會受
+    STRATEGY_TYPE環境變數影響)——即時模擬單/通知/API永遠只能是chan_profile，
+    resonance_fvg實驗性策略只能透過backtest.py明確指定strategy_type參數測試。
+    這樣就算有人不小心在Zeabur設定了STRATEGY_TYPE=resonance_fvg這個環境變數
+    (原本是設計給backtest.py沒指定時的預設值用)，也不會意外影響到正在運作的
+    即時系統，兩條路徑徹底切開(修正記錄見README)。
     """
     trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
 
@@ -86,4 +130,5 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000):
         bucket_size=bucket_size,
         trade_limit=trade_limit,
         current_price=current_price,
+        strategy_type="chan_profile",
     )

@@ -300,6 +300,7 @@ async def backtest_run(
     trail_trigger_points: Optional[float] = None,
     trail_distance_points: Optional[float] = None,
     reversal_confirm_count: Optional[int] = None,
+    strategy_type: Optional[str] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -309,6 +310,10 @@ async def backtest_run(
 
     sl_points等四個風控參數沒有明確指定的話，會自動使用目前dashboard設定面板
     生效中的參數(跟即時模擬單一致)，不用每次呼叫都重複帶入。
+
+    strategy_type不指定時預設"chan_profile"(即時模擬單目前使用的策略)，可以
+    指定"resonance_fvg"測試多條件共振+FVG這套實驗性策略——這是目前唯一能
+    測試這套策略的地方，不會影響即時模擬單(修正記錄見README)。
 
     重要：run_backtest()本身是同步、吃CPU的函式，如果直接在這個async函式裡
     呼叫，會整個卡住FastAPI唯一的事件循環，導致回測跑的時候其他所有請求
@@ -326,6 +331,7 @@ async def backtest_run(
         trail_trigger_points=trail_trigger_points,
         trail_distance_points=trail_distance_points,
         reversal_confirm_count=reversal_confirm_count,
+        strategy_type=strategy_type,
     )
 
 

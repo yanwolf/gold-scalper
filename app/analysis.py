@@ -407,6 +407,116 @@ def _macd_histogram(closes, fast=12, slow=26, signal=9):
     return hist
 
 
+# ---------------------------------------------------------------------------
+# 「多條件共振 + FVG」實驗性策略(resonance_fvg)專用指標 —— 目前只接回測，
+# 不影響即時模擬單(見signal_engine.py的STRATEGY_TYPE切換說明)。
+#
+# 重要：這裡刻意重用上面的_ema()，跟纏論背馳判斷用的是同一套EMA計算方式。
+# 原本考慮另外寫一份標準SMA種子的EMA實作，但那樣會讓系統裡同時存在兩種
+# EMA/MACD計算方式，容易在不同地方得出「看起來像但實際上不一致」的數字，
+# 增加除錯難度，所以統一共用同一套。
+# ---------------------------------------------------------------------------
+
+def compute_ema(candles, periods=None):
+    """
+    計算EMA(指數移動平均)，periods預設[9,21,50,100,200]。
+    回傳 {period: 最新EMA值}，資料不足特定週期時該週期的值是None。
+    """
+    if periods is None:
+        periods = [9, 21, 50, 100, 200]
+    closes = [c["close"] for c in candles]
+    result = {}
+    for period in periods:
+        if len(closes) < period:
+            result[period] = None
+            continue
+        result[period] = _ema(closes, period)[-1]
+    return result
+
+
+def compute_rsi(candles, period=14):
+    """
+    計算RSI(相對強弱指標，0~100)，用Wilder's平滑法(業界標準做法)。
+    資料不足時回傳None。
+    """
+    closes = [c["close"] for c in candles]
+    if len(closes) < period + 1:
+        return None
+
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(candles, fast=12, slow=26, signal=9):
+    """
+    計算MACD，回傳最新的{macd(快慢線差/DIF), signal(訊號線/DEA), histogram(柱狀圖)}。
+    共用_macd_histogram()同一套_ema()實作(見上方說明)，資料不足時三個值都是None。
+    """
+    closes = [c["close"] for c in candles]
+    if len(closes) < slow + signal:
+        return {"macd": None, "signal": None, "histogram": None}
+
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    dif = [f - s for f, s in zip(ema_fast, ema_slow)]
+    dea = _ema(dif, signal)
+    histogram = (dif[-1] - dea[-1]) * 2
+    return {"macd": dif[-1], "signal": dea[-1], "histogram": histogram}
+
+
+def find_fvg(candles, lookback=50):
+    """
+    尋找FVG(Fair Value Gap，公平價值缺口)：連續三根K棒，如果第1根的高點
+    低於第3根的低點(看多缺口，當支撐參考)，或第1根的低點高於第3根的高點
+    (看空缺口，當壓力參考)，中間留下一個「價格跳空、還沒被完全回補」的
+    區間。只掃最近lookback根K棒，避免K棒一多、回傳的缺口列表過長。
+
+    每個缺口會標示filled(是否已經被後續價格完全回補穿越過)，未回補的
+    缺口才有支撐/壓力參考價值，已回補的通常視為失效。
+
+    回傳由新到舊排序的缺口列表，每個是
+    {type: "bullish"/"bearish", top, bottom, filled, candle_index}。
+    """
+    if len(candles) < 3:
+        return []
+
+    recent = candles[-lookback:] if len(candles) > lookback else candles
+    fvgs = []
+    for i in range(2, len(recent)):
+        c1, c3 = recent[i - 2], recent[i]
+        if c1["high"] < c3["low"]:
+            fvgs.append({"type": "bullish", "top": c3["low"], "bottom": c1["high"], "candle_index": i})
+        elif c1["low"] > c3["high"]:
+            fvgs.append({"type": "bearish", "top": c1["low"], "bottom": c3["high"], "candle_index": i})
+
+    for f in fvgs:
+        filled = False
+        for later in recent[f["candle_index"] + 1:]:
+            if f["type"] == "bullish" and later["low"] <= f["bottom"]:
+                filled = True
+                break
+            if f["type"] == "bearish" and later["high"] >= f["top"]:
+                filled = True
+                break
+        f["filled"] = filled
+
+    return list(reversed(fvgs))
+
+
 def _detect_beichi(bi_list, merged_candles, zhongshu_list):
     """
     背馳判斷，區分「趨勢背馳」跟「盤整背馳」兩種可信度不同的類型：
