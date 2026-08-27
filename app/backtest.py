@@ -136,6 +136,7 @@ def run_backtest(
     chop_threshold=None,
     strategy_type=None,
     resonance_min_conditions=4,
+    spread_cost_points=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -203,6 +204,8 @@ def run_backtest(
         chop_threshold = s["paper_chop_threshold"]
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
+    if spread_cost_points is None:
+        spread_cost_points = s.get("execution_assumed_spread_points", 0.0)
 
     klines = fetch_historical_klines(symbol=symbol, days=days)
     if not klines:
@@ -304,6 +307,15 @@ def run_backtest(
     stats = compute_stats(closed_trades)
     readiness = assess_readiness(stats)
 
+    # 價差成本調整版統計：拿一樣的交易清單，但每筆先扣掉假設的買賣價差成本，
+    # 讓使用者能同時看到「原始訊號表現」和「扣掉真實交易成本後」兩組數字。
+    # 回測的訊號價本身就沒有真實bid/ask可用(歷史K線只有OHLC，沒有逐筆報價
+    # 深度)，所以回測沒辦法像即時模擬單那樣算出「真正執行滑點」，只能用
+    # 這個假設值概估交易成本對績效的影響，抓大概的量級參考用
+    # (修正記錄見README)。預設值0時，這組數字會跟raw stats完全一樣。
+    stats_spread_adjusted = compute_stats(closed_trades, spread_cost_points=spread_cost_points)
+    readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
+
     return {
         **stats,
         "open_position_at_end": position,  # 回測結束時如果還有未平倉部位，僅供參考，不計入統計
@@ -333,4 +345,7 @@ def run_backtest(
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,
+        "stats_spread_adjusted": stats_spread_adjusted,
+        "readiness_spread_adjusted": readiness_spread_adjusted,
+        "assumed_spread_points": spread_cost_points,
     }

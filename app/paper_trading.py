@@ -236,14 +236,18 @@ class PaperTradingEngine:
 
         if is_execution_engine:
             quantity = s["execution_quantity"]
-            allowed, block_reason = risk_guard.check(self, quantity)
+            allowed, block_reason, block_type = risk_guard.check(self, quantity, sl_points=sl_points)
 
             if not allowed:
                 skip_reason = block_reason
-                logger.warning(f"風控斷路器阻擋真實下單({self.label}): {block_reason}")
-                # 斷路器「剛觸發」的那一刻才主動發一則獨立警示，避免之後每次
-                # 被擋都重複騷擾——只在狀態從「允許」變成「擋下」時發一次
-                if not self._circuit_breaker_alerted:
+                logger.warning(f"真實下單被擋下({self.label}, 原因類型:{block_type}): {block_reason}")
+                # 只有「真正的風控斷路器」(每日/連續虧損)觸發時才發獨立警示，
+                # 且「剛觸發」的那一刻才發、避免之後每次被擋都重複騷擾。
+                # spread_edge(價差安全邊際不足)是市場條件判斷，可能在低波動
+                # 時段頻繁觸發，不該跟風控斷路器共用同一套「只提醒一次」的
+                # 旗標——不然可能會互相干擾，讓真正的虧損警示被誤判成
+                # 「已經提醒過」而被壓下(修正記錄見README)。
+                if block_type in ("daily_loss", "consecutive_loss") and not self._circuit_breaker_alerted:
                     self._circuit_breaker_alerted = True
                     try:
                         notifier_module.notifier.notify_circuit_breaker(self.label, block_reason)
@@ -433,13 +437,23 @@ class PaperTradingEngine:
         else:
             stats_trades = trades
 
+        s = settings_module.get_settings()
+
         stats = compute_stats(stats_trades)
         readiness = assess_readiness(stats)
+
+        # 價差成本調整版統計：拿一樣的交易清單，但每筆先扣掉假設的買賣價差
+        # 成本(execution_assumed_spread_points，預設0代表不調整)，讓使用者
+        # 能同時看到「原始訊號表現」和「扣掉真實交易成本後」兩組數字，才能
+        # 誠實評估策略扣掉價差後還剩不剩得下獲利(修正記錄見README)。
+        # 預設值0時，這組數字會跟raw stats完全一樣，不影響任何既有行為。
+        spread_points = s.get("execution_assumed_spread_points", 0.0)
+        stats_spread_adjusted = compute_stats(stats_trades, spread_cost_points=spread_points)
+        readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
 
         with self._lock:
             position = self._position
 
-        s = settings_module.get_settings()
         circuit_breaker = None
         if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
             circuit_breaker = risk_guard.status(self, s["execution_quantity"])
@@ -457,6 +471,9 @@ class PaperTradingEngine:
             "settings_changed_at": settings_changed_at,
             "readiness": readiness,
             "circuit_breaker": circuit_breaker,  # None代表這個引擎沒有接真實下單，不適用風控斷路器
+            "stats_spread_adjusted": stats_spread_adjusted,
+            "readiness_spread_adjusted": readiness_spread_adjusted,
+            "assumed_spread_points": spread_points,
         }
 
 

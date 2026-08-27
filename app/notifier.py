@@ -111,7 +111,7 @@ class TelegramNotifier:
             error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
             execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"
         elif skip_reason:
-            execution_note = f"（風控斷路器已暫停真實下單，僅記錄模擬單）\n原因：{skip_reason}"
+            execution_note = f"（已暫停真實下單，僅記錄模擬單）\n原因：{skip_reason}"
         else:
             execution_note = "（目前僅模擬單，未接自動下單）"
 

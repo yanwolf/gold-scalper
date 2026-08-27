@@ -10,10 +10,19 @@
 """
 
 
-def compute_stats(trades):
+def compute_stats(trades, spread_cost_points=0.0):
     """
     輸入已平倉的模擬單清單(順序不拘，函式內部會自行按entry_time排序來算最大回撤)，
     回傳完整績效指標。trades裡每筆至少要有 entry_time, pnl_points, direction。
+
+    spread_cost_points：每筆交易假設要扣掉的買賣價差成本(points，預設0代表
+    不調整，維持原本行為)。市價單開倉+平倉各會吃到大約半個價差，兩者加
+    起來大約等於一個完整價差，這個成本不管這筆單本身賺賠都一定會發生——
+    這跟ATR停損距離是兩件完全不同的事：停損是「價格真的走錯方向時的防線」，
+    價差成本是「不管對錯、每筆單都躲不掉的固定交易成本」，不該混在一起，
+    也不該讓停損變寬去「補償」它(那只會改變風險，不會抵銷成本)。這裡讓
+    呼叫端可以另外用這個參數重新算一次「扣掉真實交易成本後」的統計數字，
+    才能誠實評估策略扣掉價差後還剩不剩得下獲利(修正記錄見README)。
     """
     if not trades:
         return {
@@ -22,6 +31,17 @@ def compute_stats(trades):
             "profit_factor": None, "max_drawdown_points": 0.0,
             "drawdown_peak_time": None, "drawdown_trough_time": None,
         }
+
+    if spread_cost_points:
+        adjusted = []
+        for t in trades:
+            if t.get("pnl_points") is None:
+                adjusted.append(t)
+                continue
+            t2 = dict(t)
+            t2["pnl_points"] = t["pnl_points"] - spread_cost_points
+            adjusted.append(t2)
+        trades = adjusted
 
     total = len(trades)
     wins = [t for t in trades if t.get("pnl_points") and t["pnl_points"] > 0]

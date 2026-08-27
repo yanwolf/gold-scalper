@@ -63,6 +63,17 @@
   .stat .lbl{ font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 3px; }
   .stat .val{ font-size: 16px; font-weight: 700; }
   .stat.poc .val{ color: var(--gold); }
+  .val.positive{ color: var(--support); }
+  .val.negative{ color: var(--resistance); }
+
+  .spread-adjusted-card{
+    border: 1px dashed var(--grid); border-radius: 8px; padding: 12px 14px;
+    margin: 10px 0; background: rgba(255,255,255,0.02);
+  }
+  .spread-adjusted-title{
+    font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 10px;
+  }
+  .spread-adjusted-card .stat-row{ margin-bottom: 0; gap: 18px; }
 
   .chart{ display:flex; flex-direction: column; gap: 3px; }
   .row{
@@ -500,6 +511,8 @@
     <div class="stat"><div class="lbl">最大回撤</div><div class="val mono" id="paperMaxDrawdown">--</div></div>
   </div>
 
+  <div id="paperSpreadAdjusted"></div>
+
   <div id="paperDrawdownPeriod"></div>
 
   <div class="section-title" style="margin-top:16px;">最近成交紀錄</div>
@@ -805,6 +818,7 @@ const els = {
   paperProfitFactor: document.getElementById('paperProfitFactor'),
   paperTradeList: document.getElementById('paperTradeList'),
   paperMaxDrawdown: document.getElementById('paperMaxDrawdown'),
+  paperSpreadAdjusted: document.getElementById('paperSpreadAdjusted'),
   paperReadiness: document.getElementById('paperReadiness'),
   paperInterval: document.getElementById('paperInterval'),
   backtestInterval: document.getElementById('backtestInterval'),
@@ -1671,9 +1685,33 @@ function renderPaperTrading(data){
   els.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
   els.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
 
+  renderSpreadAdjusted(els.paperSpreadAdjusted, data);
+
   renderDrawdownPeriod(document.getElementById('paperDrawdownPeriod'), data);
 
   renderTradeList(els.paperTradeList, data.recent_trades, data.settings_changed_at);
+}
+
+function renderSpreadAdjusted(el, data){
+  if(!el) return;
+  const spread = data.assumed_spread_points;
+  const adj = data.stats_spread_adjusted;
+  if(!spread || !adj || !data.total_trades){
+    el.innerHTML = '';
+    return;
+  }
+  const pfText = adj.profit_factor != null ? adj.profit_factor.toFixed(2) : (adj.total_trades ? '∞' : '--');
+  const pnlClass = adj.total_pnl_points >= 0 ? 'positive' : 'negative';
+  el.innerHTML = `
+    <div class="spread-adjusted-card">
+      <div class="spread-adjusted-title">扣掉假設價差成本(${spread}points)後</div>
+      <div class="stat-row">
+        <div class="stat"><div class="lbl">勝率</div><div class="val mono">${adj.win_rate}%</div></div>
+        <div class="stat"><div class="lbl">總損益(points)</div><div class="val mono ${pnlClass}">${adj.total_pnl_points.toFixed(2)}</div></div>
+        <div class="stat"><div class="lbl">獲利因子</div><div class="val mono">${pfText}</div></div>
+      </div>
+    </div>
+  `;
 }
 
 function renderDrawdownPeriod(el, data){
@@ -1748,10 +1786,13 @@ els.backtestRunBtn.addEventListener('click', async () => {
         <div class="stat"><div class="lbl">獲利因子</div><div class="val mono">${data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--')}</div></div>
         <div class="stat"><div class="lbl">最大回撤</div><div class="val mono">${data.total_trades ? data.max_drawdown_points.toFixed(2) : '--'}</div></div>
       </div>
+      <div id="backtestSpreadAdjusted"></div>
       <div id="backtestDrawdownPeriod"></div>
       <div class="section-title" style="margin-top:16px;">回測交易紀錄</div>
       <div id="backtestTradeList" class="bi-list"></div>
     `;
+
+    renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
 
     // 回測回傳的是扁平欄位(sl_points/use_atr等)，不是像/paper-trading/summary
     // 那樣包在active_settings裡，這裡轉換成同樣格式重用renderActiveConfig()，
@@ -1799,7 +1840,7 @@ const SETTINGS_GROUPS = [
   { title: '停損模式', keys: ['paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold'] },
-  { title: '真實下單', keys: ['execution_engine_index', 'execution_quantity', 'execution_leverage', 'execution_margin_type'] },
+  { title: '真實下單', keys: ['execution_engine_index', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_assumed_spread_points', 'execution_min_edge_ratio'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },
 ];
