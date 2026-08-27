@@ -120,6 +120,7 @@ def klines_to_synthetic_trades(klines):
 
 def run_backtest(
     days=2,
+    symbol="XAUUSDT",
     interval_seconds=DEFAULT_INTERVAL_SECONDS,
     bucket_size=DEFAULT_BUCKET_SIZE,
     trade_limit=DEFAULT_TRADE_LIMIT,
@@ -171,6 +172,13 @@ def run_backtest(
     原本的嚴格AND邏輯，調低可以放寬門檻——用真實資料回測後發現嚴格AND
     訊號量偏少(30天僅25筆)但獲利因子/勝率數字不錯，這個參數讓使用者可以
     直接用回測比較不同門檻的訊號量/品質取捨，不用用猜的(修正記錄見README)。
+
+    symbol讓回測可以指定任何幣安期貨合約(不只是XAUUSDT)，用來驗證這套訊號
+    邏輯換到別的商品上適不適用(例如BTCUSDT)——纏論/分價量表/ATR/Choppiness
+    Index這些都是純數學運算，不預設任何特定商品，理論上換商品不用改程式碼，
+    但實際適不適合要看真實資料的回測結果，不能只憑理論猜測。這個參數只影響
+    回測，不影響即時模擬單(即時系統仍然固定追蹤BINANCE_GOLD_SYMBOL環境變數
+    指定的商品，預設XAUUSDT)。
     """
     s = settings_module.get_settings()
     if sl_points is None:
@@ -196,7 +204,7 @@ def run_backtest(
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
 
-    klines = fetch_historical_klines(days=days)
+    klines = fetch_historical_klines(symbol=symbol, days=days)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}
 
@@ -324,4 +332,5 @@ def run_backtest(
         "chop_threshold": chop_threshold,
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
+        "symbol": symbol,
     }

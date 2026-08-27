@@ -535,6 +535,22 @@
     價格行為/成交量四個子條件裡要符合幾個(含)以上才給訊號。
   </div>
   <div class="controls" style="margin-top:8px;">
+    <select id="backtestSymbol">
+      <option value="XAUUSDT" selected>黃金 XAUUSDT</option>
+      <option value="BTCUSDT">比特幣 BTCUSDT</option>
+    </select>
+    <select id="backtestBucketSize">
+      <option value="1">箱寬 1(適合黃金)</option>
+      <option value="50">箱寬 50(適合BTC)</option>
+      <option value="100">箱寬 100(適合BTC)</option>
+    </select>
+  </div>
+  <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+    ↑ 換商品時記得箱寬也要跟著調整——黃金約4000多美元用箱寬1，BTC通常在
+    幾萬美元，箱寬還是1會切出大量沒意義的小格子。這是驗證這套訊號邏輯
+    換到別的商品適不適用的實驗功能，不影響即時模擬單(即時系統仍固定追蹤黃金)。
+  </div>
+  <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
 
@@ -745,6 +761,8 @@ const els = {
   backtestDays: document.getElementById('backtestDays'),
   backtestStrategy: document.getElementById('backtestStrategy'),
   backtestResonanceThreshold: document.getElementById('backtestResonanceThreshold'),
+  backtestSymbol: document.getElementById('backtestSymbol'),
+  backtestBucketSize: document.getElementById('backtestBucketSize'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -1571,12 +1589,14 @@ els.backtestRunBtn.addEventListener('click', async () => {
   const intervalSeconds = els.backtestInterval.value;
   const strategyType = els.backtestStrategy.value;
   const resonanceMinConditions = els.backtestResonanceThreshold.value;
+  const symbol = els.backtestSymbol.value;
+  const bucketSize = els.backtestBucketSize.value;
   els.backtestRunBtn.disabled = true;
   els.backtestRunBtn.textContent = '回測中...';
   els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
 
   try{
-    const res = await fetch(`/backtest/run?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}`);
+    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}`);
     if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
     const data = await res.json();
 

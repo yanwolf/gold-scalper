@@ -296,6 +296,7 @@ async def paper_trading_summary(limit: int = 50, engine_id: str = "chan_profile_
 @app.get("/backtest/run")
 async def backtest_run(
     days: int = 2,
+    symbol: str = "XAUUSDT",
     interval_seconds: int = 300,
     bucket_size: float = 1.0,
     trade_limit: int = 3000,
@@ -310,6 +311,11 @@ async def backtest_run(
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
     訊號邏輯和交易規則，快速驗證策略表現，不用乾等即時模擬單累積樣本數。
 
+    symbol可以指定任何幣安期貨合約(預設XAUUSDT)，用來驗證這套訊號邏輯換到
+    別的商品(例如BTCUSDT)適不適用。注意：換商品時bucket_size(分價量表箱寬)
+    通常也要跟著調整——1.0是配合黃金約4000多美元的價位調的，BTC價位通常在
+    幾萬美元，箱寬還是1的話會切出大量沒意義的小格子，建議依商品價位等比例
+    放大(例如BTC可以試50~100)。這個參數只影響回測，不影響即時模擬單。
     這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)。
 
     sl_points等四個風控參數沒有明確指定的話，會自動使用目前dashboard設定面板
@@ -333,6 +339,7 @@ async def backtest_run(
     return await asyncio.to_thread(
         backtest_module.run_backtest,
         days=days,
+        symbol=symbol,
         interval_seconds=interval_seconds,
         bucket_size=bucket_size,
         trade_limit=trade_limit,
