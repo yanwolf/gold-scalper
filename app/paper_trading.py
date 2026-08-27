@@ -219,11 +219,21 @@ class PaperTradingEngine:
             else:
                 self._circuit_breaker_alerted = False  # 恢復正常了，下次再觸發要重新警示
                 try:
-                    # 每次真實開倉前先確認/設定槓桿(不再只靠dashboard手動按鈕)，
-                    # 幣安這支API是冪等的(重複設定同樣的值沒有副作用)，每次都呼叫
-                    # 一次確保槓桿一定是我們預期的值，不會依賴「使用者記得手動按過」
-                    # 這種容易被忽略的前提(修正記錄見README)。設定失敗就直接放棄
-                    # 這筆下單，不會用不確定的槓桿去冒險。
+                    # 每次真實開倉前先確認/設定保證金模式(逐倉/全倉)跟槓桿，不再只靠
+                    # dashboard手動按鈕。保證金模式的幣安API不是冪等的(已經是目標模式
+                    # 時會回傳特定錯誤碼-4046)，execution.py的set_margin_type()已經把
+                    # 這個情況處理成「視同成功」，這裡不用額外判斷。任一項設定失敗就
+                    # 直接放棄這筆下單，不會用不確定的保證金模式/槓桿去冒險
+                    # (修正記錄見README)。
+                    margin_type = "ISOLATED" if s["execution_margin_type"] == 0 else "CROSSED"
+                    margin_ok, margin_result = execution_module.set_margin_type(
+                        margin_type,
+                        symbol=self.execution_symbol,
+                        account=self.execution_account,
+                    )
+                    if not margin_ok:
+                        raise RuntimeError(f"保證金模式設定失敗，放棄下單: {margin_result}")
+
                     leverage_ok, leverage_result = execution_module.set_leverage(
                         int(s["execution_leverage"]),
                         symbol=self.execution_symbol,

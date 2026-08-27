@@ -294,6 +294,28 @@ def set_leverage(leverage, symbol=None, account=DEFAULT_ACCOUNT):
     return _signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, account=account)
 
 
+def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    設定保證金模式：margin_type是"ISOLATED"(逐倉)或"CROSSED"(全倉)。逐倉是
+    每筆部位有自己專屬的保證金，就算被強制平倉也只會虧掉分配給那筆單的
+    保證金，不會牽連帳戶其他資金——比較符合這個系統「每筆單的風險都要能
+    事先算清楚、互相不牽連」的設計精神(風控斷路器、固定口數等都是同樣的
+    思路)，所以open_position()預設會用逐倉模式。
+
+    注意：幣安這支API**不是冪等的**——如果目前已經是你要設定的模式，
+    幣安會回傳錯誤(code -4046 "No need to change margin type")，這裡把
+    這個特定錯誤視為「本來就設定好了、等同成功」，不會誤判成真的失敗，
+    避免每次開倉都被這個誤判擋下(修正記錄見README)。
+    """
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    success, result = _signed_request(
+        "POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type}, account=account
+    )
+    if not success and isinstance(result, dict) and result.get("code") == -4046:
+        return True, {"msg": "已經是目標保證金模式，不需要變更"}
+    return success, result
+
+
 def get_account_balance(account=DEFAULT_ACCOUNT):
     """查指定帳戶餘額，主要用來確認API金鑰有沒有接對、測試網/正式環境有沒有搞錯。"""
     return _signed_request("GET", "/fapi/v2/balance", account=account)
