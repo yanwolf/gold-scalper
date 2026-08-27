@@ -1,20 +1,34 @@
 """
-幣安期貨(USDⓈ-M)下單執行模組 —— 測試網優先。
+幣安期貨(USDⓈ-M)下單執行模組 —— 測試網優先，支援多帳戶。
 
-用途：讓黃金模擬單系統能實際在幣安期貨(目前鎖定XAUUSDT)送出市價單，
-驗證「訊號 -> 換算部位大小 -> 下單 -> 查詢部位」這條流程能不能跑通。
-現階段刻意設計成獨立的手動測試模組，不會自動接上paper_trading.py的
-開倉/平倉事件——因為現在同時有1分K/5分K/15分K三個模擬單引擎平行運作，
-如果三個都自動對同一個真實帳戶的同一個部位下單，會互相打架，這需要
-另外設計「哪個引擎負責真實下單」才能安全接上，先確保這個模組本身能
-正常運作、驗證認證/簽章/精度換算都對，再談自動接軌的事。
+用途：讓模擬單系統能實際在幣安期貨送出市價單，驗證「訊號 -> 換算部位大小 ->
+下單 -> 查詢部位」這條流程能不能跑通。
+
+多帳戶設計(修正記錄見README)：使用者未來計畫陸續加入大型加密貨幣(例如BTC)
+交易，如果多個策略/商品共用同一個帳戶同時下單，幣安只認得「淨部位」，會
+發生部位互相抵銷、跟各策略內部記錄的狀態對不上的問題(已在對話中討論過)。
+最乾淨的解法是每個策略/商品用獨立的幣安子帳戶，這裡預先把執行模組改成
+支援「多組具名帳戶」，之後真的要接BTC時，只要在Zeabur多設一組環境變數、
+幫對應的模擬單引擎指定帳戶名稱，不用再改這支檔案的邏輯。
+
+帳戶名稱對應環境變數：account="gold"(預設)對應BINANCE_API_KEY_GOLD/
+BINANCE_API_SECRET_GOLD；account="btc"對應BINANCE_API_KEY_BTC/
+BINANCE_API_SECRET_BTC，以此類推(帳戶名稱轉大寫接在後面)。為了向後相容
+現有已經在用的環境變數命名，"gold"這個預設帳戶額外會退回嘗試沒有帳戶
+後綴的舊版BINANCE_API_KEY/BINANCE_API_SECRET(如果新版命名沒設定的話)，
+現有的黃金真實下單設定不用改任何環境變數就能繼續運作。
+
+測試網/正式環境切換也支援per-帳戶覆蓋：BINANCE_USE_TESTNET_<帳戶>沒設定時，
+退回共用的BINANCE_USE_TESTNET(預設"1"，測試網)。
 
 安全設計：
-- 沒有設定BINANCE_API_KEY/BINANCE_API_SECRET時整個模組靜默停用，
-  不影響其他功能(跟db.py/notifier.py同樣的設計原則)
-- BINANCE_USE_TESTNET預設值是"1"(測試網)，要故意設成"0"才會打正式環境，
-  避免不小心不小心接到真錢帳戶去
+- 沒有設定對應帳戶的API金鑰時，該帳戶的操作會靜默失敗回傳明確錯誤訊息，
+  不影響其他帳戶或其他功能(跟db.py/notifier.py同樣的設計原則)
+- 每個帳戶預設都是測試網，要故意設成"0"才會打正式環境，避免不小心接到
+  真錢帳戶去
 - 所有函式都回傳(success, data_or_error)，不會讓例外往外亂噴
+- 不同帳戶的symbol精度快取分開存，避免不同帳戶剛好symbol重名時互相污染
+  (雖然目前還沒有這種情境，但多帳戶架構下先做對比較安全)
 
 參考資料：官方文件 https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
 (內容更新於2026/8/25)，測試網(Demo Trading) REST base是 https://demo-fapi.binance.com，
@@ -35,127 +49,153 @@ logger = logging.getLogger("execution")
 MAINNET_BASE_URL = "https://fapi.binance.com"
 TESTNET_BASE_URL = "https://demo-fapi.binance.com"
 
+DEFAULT_ACCOUNT = "gold"
 DEFAULT_SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").upper()
 
-_symbol_precision_cache = {}
+_symbol_precision_cache = {}  # {(account, symbol): precision}
 
 
-def use_testnet():
+def _get_credentials(account=DEFAULT_ACCOUNT):
+    """
+    取得指定帳戶的API金鑰/密鑰。優先找具名的BINANCE_API_KEY_<帳戶>，
+    帳戶是預設值"gold"且具名版本沒設定時，退回嘗試舊版沒有帳戶後綴的
+    BINANCE_API_KEY/BINANCE_API_SECRET，確保現有部署不用改環境變數。
+    """
+    suffix = account.upper()
+    api_key = os.getenv(f"BINANCE_API_KEY_{suffix}")
+    api_secret = os.getenv(f"BINANCE_API_SECRET_{suffix}")
+
+    if not api_key and account == DEFAULT_ACCOUNT:
+        api_key = os.getenv("BINANCE_API_KEY")
+    if not api_secret and account == DEFAULT_ACCOUNT:
+        api_secret = os.getenv("BINANCE_API_SECRET")
+
+    return api_key, api_secret
+
+
+def use_testnet(account=DEFAULT_ACCOUNT):
+    """
+    是否使用測試網，支援per-帳戶覆蓋：BINANCE_USE_TESTNET_<帳戶>沒設定時，
+    退回共用的BINANCE_USE_TESTNET(預設"1"，測試網)。
+    """
+    suffix = account.upper()
+    per_account = os.getenv(f"BINANCE_USE_TESTNET_{suffix}")
+    if per_account is not None:
+        return per_account != "0"
     return os.getenv("BINANCE_USE_TESTNET", "1") != "0"
 
 
-def _base_url():
-    return TESTNET_BASE_URL if use_testnet() else MAINNET_BASE_URL
+def _base_url(account=DEFAULT_ACCOUNT):
+    return TESTNET_BASE_URL if use_testnet(account) else MAINNET_BASE_URL
 
 
-def is_enabled():
-    return bool(os.getenv("BINANCE_API_KEY") and os.getenv("BINANCE_API_SECRET"))
+def is_enabled(account=DEFAULT_ACCOUNT):
+    api_key, api_secret = _get_credentials(account)
+    return bool(api_key and api_secret)
 
 
-def status():
-    """給dashboard/API endpoint顯示目前執行模組的狀態用。"""
+def status(account=DEFAULT_ACCOUNT, symbol=None):
+    """給dashboard/API endpoint顯示目前執行模組(指定帳戶)的狀態用。"""
     return {
-        "enabled": is_enabled(),
-        "testnet": use_testnet(),
-        "base_url": _base_url(),
-        "symbol": DEFAULT_SYMBOL,
+        "account": account,
+        "enabled": is_enabled(account),
+        "testnet": use_testnet(account),
+        "base_url": _base_url(account),
+        "symbol": symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None),
     }
 
 
-def _sign(params: dict) -> dict:
+def _sign(params: dict, account=DEFAULT_ACCOUNT) -> dict:
     """依官方文件的HMAC SHA256簽章方式，把params組成query string、算出簽章，回傳含簽章的dict。"""
-    secret = os.getenv("BINANCE_API_SECRET", "")
+    _, api_secret = _get_credentials(account)
     query_string = urlencode(params)
-    signature = hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    signature = hmac.new((api_secret or "").encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
     params = dict(params)
     params["signature"] = signature
     return params
 
 
-def _signed_request(method, path, params=None):
+def _signed_request(method, path, params=None, account=DEFAULT_ACCOUNT):
     """呼叫需要簽章的私有端點(帳戶、下單、部位查詢等)。回傳(success, data_or_error)。"""
-    if not is_enabled():
-        return False, "尚未設定 BINANCE_API_KEY / BINANCE_API_SECRET"
+    api_key, api_secret = _get_credentials(account)
+    if not api_key or not api_secret:
+        return False, f"帳戶「{account}」尚未設定API金鑰(BINANCE_API_KEY_{account.upper()}/BINANCE_API_SECRET_{account.upper()})"
 
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
     params.setdefault("recvWindow", 5000)
-    signed_params = _sign(params)
+    signed_params = _sign(params, account=account)
 
-    url = f"{_base_url()}{path}"
-    headers = {"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY")}
+    url = f"{_base_url(account)}{path}"
+    headers = {"X-MBX-APIKEY": api_key}
 
     try:
         resp = requests.request(method, url, headers=headers, params=signed_params, timeout=10)
         data = resp.json()
         if resp.status_code >= 400:
-            logger.error(f"幣安API錯誤({resp.status_code}): {data}")
+            logger.error(f"幣安API錯誤(帳戶{account}, {resp.status_code}): {data}")
             return False, data
         return True, data
     except Exception as e:
-        logger.error(f"幣安API請求失敗: {e}")
+        logger.error(f"幣安API請求失敗(帳戶{account}): {e}")
         return False, str(e)
 
 
-def get_symbol_precision(symbol=None):
+def get_symbol_precision(symbol=None, account=DEFAULT_ACCOUNT):
     """
     查合約的數量精度(quantityPrecision)，下單數量要依這個精度四捨五入，
-    不然幣安會直接拒絕訂單。結果快取起來，不用每次下單都重查一次。
-    這是公開端點，不需要簽章。
+    不然幣安會直接拒絕訂單。結果依(帳戶, 商品)快取起來，不同帳戶就算剛好
+    查同一個symbol也分開存，避免未來多帳戶情境下互相污染。這是公開端點，
+    不需要簽章，但測試網/正式環境的base_url仍然依帳戶決定。
     """
-    symbol = symbol or DEFAULT_SYMBOL
-    if symbol in _symbol_precision_cache:
-        return _symbol_precision_cache[symbol]
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    if not symbol:
+        return 3
+
+    cache_key = (account, symbol)
+    if cache_key in _symbol_precision_cache:
+        return _symbol_precision_cache[cache_key]
 
     try:
-        resp = requests.get(f"{_base_url()}/fapi/v1/exchangeInfo", timeout=10)
+        resp = requests.get(f"{_base_url(account)}/fapi/v1/exchangeInfo", timeout=10)
         data = resp.json()
         for s in data.get("symbols", []):
             if s["symbol"] == symbol:
                 precision = s.get("quantityPrecision", 3)
-                _symbol_precision_cache[symbol] = precision
+                _symbol_precision_cache[cache_key] = precision
                 return precision
     except Exception as e:
-        logger.error(f"查詢合約精度失敗: {e}")
+        logger.error(f"查詢合約精度失敗(帳戶{account}, {symbol}): {e}")
 
     return 3  # 查不到的話用一個保守預設值(0.001精度，符合先前查到的XAUUSDT最小交易單位)
 
 
-def calculate_quantity(risk_usd, sl_points, symbol=None):
+def calculate_quantity(risk_usd, sl_points, symbol=None, account=DEFAULT_ACCOUNT):
     """
     (輔助試算用，不再是實際下單的主要依據，見下方open_position()的修正記錄)
     依「這筆單願意承擔多少美元風險」和「停損距離(points)」，換算出對應的下單數量。
-    因為幣安XAUUSDT是1張合約=1金衡盎司=每點1美元價格波動對應1美元損益，
-    所以 數量 = 風險金額 / 停損點數。
     """
     if sl_points <= 0:
         return 0.0
     quantity = risk_usd / sl_points
-    precision = get_symbol_precision(symbol)
+    precision = get_symbol_precision(symbol, account=account)
     return round(quantity, precision)
 
 
-def estimate_risk(quantity, sl_points, account_balance=None, symbol=None):
+def estimate_risk(quantity, sl_points, account_balance=None, symbol=None, account=DEFAULT_ACCOUNT):
     """
     反過來算：使用者自己決定要下多少口數，這裡回推「如果觸及停損，實際會虧多少
     美元」以及「這筆虧損佔帳戶餘額的百分比」，給使用者參考用，不會自動套用或
     修改任何設定——真正要下單用哪個數量，由使用者自己決定並填進設定裡。
 
-    改成這個方向的原因(使用者本人在對話裡提出的理由)：ATR動態停損模式下，
-    每一筆的停損距離(sl_points)都不一樣，如果反過來用「固定風險金額 / 停損距離」
-    去derive下單數量，會導致每筆單的實際部位大小跟著波動、難以預期；改成
-    「使用者自己決定固定口數」，部位大小本身變得穩定可預期，風險則誠實地
-    隨著市場波動大小浮動，這樣使用者才有一個穩定的基準去判斷「我能接受多大
-    的部位」。
-
-    account_balance沒有提供的話，會即時查詢目前帳戶的可用餘額。
+    account_balance沒有提供的話，會即時查詢指定帳戶的可用餘額。
     回傳 (success, data_or_error)，成功時data包含 dollar_risk、risk_pct、account_balance。
     """
     if quantity <= 0 or sl_points <= 0:
         return False, "數量和停損距離都必須大於0"
 
     if account_balance is None:
-        success, balance_data = get_account_balance()
+        success, balance_data = get_account_balance(account=account)
         if not success:
             return False, balance_data
         account_balance = 0.0
@@ -176,32 +216,34 @@ def estimate_risk(quantity, sl_points, account_balance=None, symbol=None):
     }
 
 
-def set_leverage(leverage, symbol=None):
-    symbol = symbol or DEFAULT_SYMBOL
-    return _signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+def set_leverage(leverage, symbol=None, account=DEFAULT_ACCOUNT):
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    return _signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, account=account)
 
 
-def get_account_balance():
-    """查帳戶餘額，主要用來確認API金鑰有沒有接對、測試網/正式環境有沒有搞錯。"""
-    return _signed_request("GET", "/fapi/v2/balance")
+def get_account_balance(account=DEFAULT_ACCOUNT):
+    """查指定帳戶餘額，主要用來確認API金鑰有沒有接對、測試網/正式環境有沒有搞錯。"""
+    return _signed_request("GET", "/fapi/v2/balance", account=account)
 
 
-def get_position_info(symbol=None):
-    symbol = symbol or DEFAULT_SYMBOL
-    return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+def get_position_info(symbol=None, account=DEFAULT_ACCOUNT):
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, account=account)
 
 
-def place_market_order(side, quantity, symbol=None, reduce_only=False):
+def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT):
     """
-    送出市價單。side是"BUY"或"SELL"，quantity是張數(已經套用過精度)。
+    送出市價單(指定帳戶)。side是"BUY"或"SELL"，quantity是張數(已經套用過精度)。
     reduce_only=True代表這是平倉單(只能減少部位、不會反向開新倉)，
     下平倉單時一律加這個保護，避免手誤或邏輯錯誤導致意外開出反向部位。
     """
-    symbol = symbol or DEFAULT_SYMBOL
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    if not symbol:
+        return False, f"帳戶「{account}」沒有指定symbol，也沒有預設值可用"
     if quantity <= 0:
         return False, "下單數量必須大於0"
 
-    precision = get_symbol_precision(symbol)
+    precision = get_symbol_precision(symbol, account=account)
     quantity = round(quantity, precision)
 
     params = {
@@ -212,46 +254,43 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False):
     }
     if reduce_only:
         params["reduceOnly"] = "true"
-    return _signed_request("POST", "/fapi/v1/order", params)
+    return _signed_request("POST", "/fapi/v1/order", params, account=account)
 
 
-def open_position(direction, quantity, symbol=None):
+def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT):
     """
-    依訊號方向開倉，quantity是直接指定的下單數量(張數)——不再從風險金額反推。
-
-    修正記錄：原本這裡是「給風險金額+停損距離，反推出下單數量」，但ATR動態
-    停損模式下每筆的停損距離都不一樣，用這種方式算出來的部位大小會跟著每筆
-    的停損距離浮動，不容易預期、也不容易對帳。改成直接指定固定數量，部位
-    大小變得穩定可預期，使用者可以搭配estimate_risk()先試算這個數量對應的
-    風險大小，自己決定要用多少，而不是讓系統自動幫忙決定。
+    依訊號方向在指定帳戶開倉，quantity是直接指定的下單數量(張數)。
+    account預設"gold"，之後新增BTC等其他商品時，讓對應的模擬單引擎傳入
+    account="btc"之類的帳戶名稱，各自用獨立的子帳戶下單，不會共用同一個
+    帳戶的部位、也就不會有淨部位互相抵銷的問題(修正記錄見README)。
 
     回傳(success, order_result_or_error)。
     """
-    if not is_enabled():
-        return False, "執行模組未啟用(未設定API金鑰)"
+    if not is_enabled(account):
+        return False, f"帳戶「{account}」的執行模組未啟用(未設定API金鑰)"
 
     if quantity <= 0:
         return False, "下單數量必須大於0"
 
     side = "BUY" if direction == "bullish" else "SELL"
-    return place_market_order(side, quantity, symbol=symbol)
+    return place_market_order(side, quantity, symbol=symbol, account=account)
 
 
-def close_position(direction, symbol=None):
+def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT):
     """
-    平掉目前的部位。direction是原本開倉時的方向(平倉方向要反過來)，
+    平掉指定帳戶目前的部位。direction是原本開倉時的方向(平倉方向要反過來)，
     實際數量直接查詢目前帳戶部位大小，不用呼叫端自己算，避免因為
     浮點數誤差或多筆疊加導致平倉數量對不上實際部位。
     """
-    if not is_enabled():
-        return False, "執行模組未啟用(未設定API金鑰)"
+    if not is_enabled(account):
+        return False, f"帳戶「{account}」的執行模組未啟用(未設定API金鑰)"
 
-    success, position_data = get_position_info(symbol=symbol)
+    success, position_data = get_position_info(symbol=symbol, account=account)
     if not success:
         return False, position_data
 
     position_amt = 0.0
-    target_symbol = symbol or DEFAULT_SYMBOL
+    target_symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
     for p in position_data:
         if p["symbol"] == target_symbol:
             position_amt = float(p["positionAmt"])
@@ -262,4 +301,4 @@ def close_position(direction, symbol=None):
 
     side = "SELL" if position_amt > 0 else "BUY"
     quantity = abs(position_amt)
-    return place_market_order(side, quantity, symbol=symbol, reduce_only=True)
+    return place_market_order(side, quantity, symbol=symbol, reduce_only=True, account=account)

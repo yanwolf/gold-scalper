@@ -42,7 +42,8 @@ MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼�
 
 class PaperTradingEngine:
     def __init__(self, interval_seconds=60, label=None, strategy_type="chan_profile",
-                 resonance_min_conditions=4, execution_index=None, engine_id=None):
+                 resonance_min_conditions=4, execution_index=None, engine_id=None,
+                 execution_account="gold", execution_symbol=None):
         self.interval_seconds = interval_seconds
         self.label = label or f"{interval_seconds}秒K線"
         self.strategy_type = strategy_type
@@ -52,6 +53,14 @@ class PaperTradingEngine:
         # 現在同一個K線週期可能有多個策略的引擎平行運作(例如1分K纏論 vs 1分K共振)，
         # 光用interval_seconds已經無法唯一決定「哪一個」引擎該負責真實下單。
         self.execution_index = execution_index
+        # execution_account/execution_symbol：這個引擎真實下單時要用哪個幣安帳戶、
+        # 哪個商品(見execution.py的多帳戶設計說明)。預設帳戶"gold"對應現有的黃金
+        # 交易設定，之後新增BTC等其他商品時，讓對應的模擬單引擎指定不同的帳戶
+        # 名稱(例如"btc")，各自用獨立的子帳戶下單，避免共用帳戶造成部位互相
+        # 抵銷(修正記錄見README)。execution_symbol不指定時，execution.py會依
+        # 帳戶名稱決定要用哪個預設商品。
+        self.execution_account = execution_account
+        self.execution_symbol = execution_symbol
         # engine_id是資料庫查詢用的真正唯一鍵，預設用"策略_週期"組合，
         # 不指定的話自動產生(例如"chan_profile_60")
         self.engine_id = engine_id or f"{strategy_type}_{interval_seconds}"
@@ -190,7 +199,9 @@ class PaperTradingEngine:
         execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
         skip_reason = None  # 風控斷路器擋下這次下單的原因(修正記錄見README)
         s = settings_module.get_settings()
-        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
+        is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
+
+        if is_execution_engine:
             quantity = s["execution_quantity"]
             allowed, block_reason = risk_guard.check(self, quantity)
 
@@ -211,6 +222,8 @@ class PaperTradingEngine:
                     success, result = execution_module.open_position(
                         direction=position["direction"],
                         quantity=quantity,
+                        symbol=self.execution_symbol,
+                        account=self.execution_account,
                     )
                     executed = success
                     if success:
@@ -223,18 +236,20 @@ class PaperTradingEngine:
                     execution_error = str(e)
                     logger.error(f"同步下單發生例外({self.label}): {e}")
 
-        # 事件驅動通知：真的開倉了才通知(而不是每次檢測到訊號就通知)，
-        # 保證通知內容永遠精確對應模擬單實際的操作(修正記錄見README)。
-        # execution_error/skip_reason會一起帶進通知內容，讓使用者從Telegram訊息
-        # 本身就能看到下單失敗或被風控擋下的具體原因，不用另外查伺服器log。
-        try:
-            notifier_module.notifier.notify_trade_event(
-                action="open", label=self.label,
-                direction=position["direction"], price=current_price,
-                executed=executed, execution_error=execution_error, skip_reason=skip_reason,
-            )
-        except Exception as e:
-            logger.error(f"開倉通知發送失敗({self.label}): {e}")
+        # 事件驅動通知：只有「這個引擎目前綁定真實下單」才會發送Telegram通知，
+        # 純模擬的引擎完全不通知——原本是每個引擎開倉/平倉都會發，四個引擎
+        # 全部訊息量太大、變成垃圾訊息，使用者只在意「真的下單了沒有」，
+        # 純模擬的部分繼續在dashboard上看就好，不需要即時推播(修正記錄見README)。
+        if is_execution_engine:
+            try:
+                notifier_module.notifier.notify_trade_event(
+                    action="open", label=self.label,
+                    direction=position["direction"], price=current_price,
+                    executed=executed, execution_error=execution_error, skip_reason=skip_reason,
+                    account=self.execution_account,
+                )
+            except Exception as e:
+                logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
     def _close_position(self, position, exit_price, exit_reason):
         exit_time = datetime.now(timezone.utc).isoformat()
@@ -254,9 +269,15 @@ class PaperTradingEngine:
         executed = None
         execution_error = None
         s = settings_module.get_settings()
-        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
+        is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
+
+        if is_execution_engine:
             try:
-                success, result = execution_module.close_position(direction=position["direction"])
+                success, result = execution_module.close_position(
+                    direction=position["direction"],
+                    symbol=self.execution_symbol,
+                    account=self.execution_account,
+                )
                 executed = success
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
@@ -268,15 +289,16 @@ class PaperTradingEngine:
                 execution_error = str(e)
                 logger.error(f"同步平倉發生例外({self.label}): {e}")
 
-        try:
-            notifier_module.notifier.notify_trade_event(
-                action="close", label=self.label,
-                direction=position["direction"], price=exit_price,
-                exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
-                executed=executed, execution_error=execution_error,
-            )
-        except Exception as e:
-            logger.error(f"平倉通知發送失敗({self.label}): {e}")
+            try:
+                notifier_module.notifier.notify_trade_event(
+                    action="close", label=self.label,
+                    direction=position["direction"], price=exit_price,
+                    exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
+                    executed=executed, execution_error=execution_error,
+                    account=self.execution_account,
+                )
+            except Exception as e:
+                logger.error(f"平倉通知發送失敗({self.label}): {e}")
 
     def get_summary(self, limit=50):
         """

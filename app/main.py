@@ -178,15 +178,18 @@ async def update_settings(payload: dict = Body(...)):
 # ---------------------------------------------------------------------------
 
 @app.get("/execution/status")
-async def execution_status():
-    """回傳執行模組目前狀態：有沒有啟用、現在打的是測試網還正式環境。不需要密碼，純讀取。"""
-    return execution_module.status()
+async def execution_status(account: str = "gold"):
+    """回傳指定帳戶(預設gold)目前狀態：有沒有啟用、現在打的是測試網還正式環境。不需要密碼，純讀取。"""
+    return execution_module.status(account=account)
 
 
 @app.get("/execution/account")
-async def execution_account(password: str = ""):
+async def execution_account(password: str = "", account: str = "gold"):
     """
-    查詢幣安期貨帳戶餘額，用來確認API金鑰有沒有接對、測試網/正式環境有沒有搞錯。
+    查詢指定帳戶(預設gold)的幣安期貨帳戶餘額，用來確認API金鑰有沒有接對、
+    測試網/正式環境有沒有搞錯。account參數是為了未來多帳戶(例如BTC用獨立
+    子帳戶)預留的，現在只有gold帳戶已經設定金鑰，其他帳戶名稱查詢會得到
+    「尚未設定API金鑰」的錯誤，這是預期中的行為(修正記錄見README)。
     需要密碼(跟策略參數設定共用同一組SETTINGS_PASSWORD)，避免任何拿到網址的人
     都能查看帳戶資訊。
     """
@@ -194,12 +197,12 @@ async def execution_account(password: str = ""):
     if not ok:
         return {"success": False, "error": error}
 
-    success, data = execution_module.get_account_balance()
+    success, data = execution_module.get_account_balance(account=account)
     return {"success": success, "data": data}
 
 
 @app.get("/execution/estimate-risk")
-async def execution_estimate_risk(quantity: float, sl_points: float, password: str = ""):
+async def execution_estimate_risk(quantity: float, sl_points: float, password: str = "", account: str = "gold"):
     """
     部位風險試算：給定候選下單數量和停損距離，回推「如果觸及停損，實際會虧多少
     美元、佔目前帳戶餘額多少百分比」，純粹給使用者參考、幫助決定要在
@@ -210,13 +213,13 @@ async def execution_estimate_risk(quantity: float, sl_points: float, password: s
     if not ok:
         return {"success": False, "error": error}
 
-    success, data = execution_module.estimate_risk(quantity, sl_points)
+    success, data = execution_module.estimate_risk(quantity, sl_points, account=account)
     return {"success": success, "data": data if success else None, "error": None if success else data}
 
 
 @app.post("/execution/set-leverage")
 async def execution_set_leverage(payload: dict = Body(...)):
-    """手動設定槓桿倍數：payload格式 {"password": "...", "leverage": 10}。"""
+    """手動設定槓桿倍數：payload格式 {"password": "...", "leverage": 10, "account": "gold"}。"""
     ok, error = settings_module.verify_password(payload.get("password", ""))
     if not ok:
         return {"success": False, "error": error}
@@ -225,7 +228,8 @@ async def execution_set_leverage(payload: dict = Body(...)):
     if not leverage or leverage <= 0:
         return {"success": False, "error": "leverage必須是正整數"}
 
-    success, result = execution_module.set_leverage(int(leverage))
+    account = payload.get("account", "gold")
+    success, result = execution_module.set_leverage(int(leverage), account=account)
     return {"success": success, "result": result}
 
 
@@ -233,17 +237,19 @@ async def execution_set_leverage(payload: dict = Body(...)):
 async def execution_test_order(payload: dict = Body(...)):
     """
     手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
-    "quantity": 2.5}。用來驗證整條「送出市價單」的流程實際能不能跑通，不會自動
-    觸發，一定要手動呼叫這支API才會下單。
+    "quantity": 2.5, "account": "gold"}。用來驗證整條「送出市價單」的流程實際能
+    不能跑通，不會自動觸發，一定要手動呼叫這支API才會下單。account不指定的話
+    預設"gold"(向後相容現有測試面板)，之後新增BTC等帳戶可以指定不同的account。
 
-    務必先確認 GET /execution/status 顯示 testnet: true，再呼叫這支API，
-    避免不小心對正式環境送出真實訂單。
+    務必先確認 GET /execution/status?account=... 顯示 testnet: true，再呼叫
+    這支API，避免不小心對正式環境送出真實訂單。
     """
     ok, error = settings_module.verify_password(payload.get("password", ""))
     if not ok:
         return {"success": False, "error": error}
 
-    if not execution_module.status()["testnet"]:
+    account = payload.get("account", "gold")
+    if not execution_module.status(account=account)["testnet"]:
         return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
 
     direction = payload.get("direction")
@@ -252,25 +258,26 @@ async def execution_test_order(payload: dict = Body(...)):
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    success, result = execution_module.open_position(direction, quantity)
+    success, result = execution_module.open_position(direction, quantity, account=account)
     return {"success": success, "result": result}
 
 
 @app.post("/execution/test-close")
 async def execution_test_close(payload: dict = Body(...)):
-    """手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish"}。"""
+    """手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish", "account": "gold"}。"""
     ok, error = settings_module.verify_password(payload.get("password", ""))
     if not ok:
         return {"success": False, "error": error}
 
-    if not execution_module.status()["testnet"]:
+    account = payload.get("account", "gold")
+    if not execution_module.status(account=account)["testnet"]:
         return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
 
     direction = payload.get("direction")
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    success, result = execution_module.close_position(direction)
+    success, result = execution_module.close_position(direction, account=account)
     return {"success": success, "result": result}
 
 

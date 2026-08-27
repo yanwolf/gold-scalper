@@ -315,6 +315,20 @@
     width: 100%; background: var(--panel); border: 1px solid var(--grid); color: var(--text);
     padding: 8px 10px; border-radius: 6px; font-size: 13px;
   }
+
+  .settings-group{
+    border: 1px solid var(--grid); border-radius: 8px; margin-bottom: 12px; overflow: hidden;
+  }
+  .settings-group-header{
+    width: 100%; display: flex; justify-content: space-between; align-items: center;
+    background: #131a2a; border: none; color: var(--gold); font-weight: 700;
+    font-size: 13px; padding: 11px 14px; cursor: pointer; text-align: left;
+  }
+  .settings-group-header:active{ opacity: 0.75; }
+  .settings-group-caret{ color: var(--muted); font-size: 11px; }
+  .settings-group-body{ padding: 14px; }
+  .settings-group-body .settings-field:last-child{ margin-bottom: 0; }
+
   .settings-save-row{
     display: flex; gap: 8px; margin-top: 16px; align-items: center;
   }
@@ -1665,24 +1679,69 @@ function showSettingsResult(msg, isError){
   els.settingsResult.className = `notify-result ${isError ? 'error' : 'success'}`;
 }
 
+// 設定欄位分組——原本16+個欄位全部攤平顯示，太擁擠也不容易找到想改的那一項，
+// 依用途分成5組，每組有標題跟分隔，達標門檻預設收合(設定一次後很少需要再看)。
+// 這個分組只是純前端呈現用，不影響FIELD_META本身的資料結構，之後settings.py
+// 新增欄位時，記得同步把key加進對應的分組陣列裡，不然會被歸到「其他」。
+const SETTINGS_GROUPS = [
+  { title: '停損模式', keys: ['paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
+                              'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
+  { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold'] },
+  { title: '真實下單', keys: ['execution_engine_index', 'execution_quantity'] },
+  { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
+  { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },
+];
+
 function renderSettingsForm(values, meta){
   settingsMeta = meta;
-  const fieldsHtml = Object.entries(meta).map(([key, m]) => `
-    <div class="settings-field">
-      <label for="setting-${key}">${m.label}</label>
-      <div class="field-help">${m.help}</div>
-      <input type="number" id="setting-${key}" data-key="${key}"
-             value="${values[key]}" step="${m.step}" min="${m.min}" max="${m.max}" />
+  const groupedKeys = new Set(SETTINGS_GROUPS.flatMap(g => g.keys));
+  const ungroupedKeys = Object.keys(meta).filter(k => !groupedKeys.has(k));
+  const groups = ungroupedKeys.length > 0
+    ? [...SETTINGS_GROUPS, { title: '其他', keys: ungroupedKeys }]
+    : SETTINGS_GROUPS;
+
+  const fieldHtml = (key) => {
+    const m = meta[key];
+    if(!m) return '';
+    return `
+      <div class="settings-field">
+        <label for="setting-${key}">${m.label}</label>
+        <div class="field-help">${m.help}</div>
+        <input type="number" id="setting-${key}" data-key="${key}"
+               value="${values[key]}" step="${m.step}" min="${m.min}" max="${m.max}" />
+      </div>
+    `;
+  };
+
+  const groupsHtml = groups.map((g, idx) => `
+    <div class="settings-group">
+      <button type="button" class="settings-group-header" data-group-idx="${idx}">
+        <span>${g.title}</span>
+        <span class="settings-group-caret">${g.collapsed ? '▸' : '▾'}</span>
+      </button>
+      <div class="settings-group-body" style="${g.collapsed ? 'display:none;' : ''}">
+        ${g.keys.map(fieldHtml).join('')}
+      </div>
     </div>
   `).join('');
 
   els.settingsForm.innerHTML = `
-    ${fieldsHtml}
+    ${groupsHtml}
     <div class="settings-save-row">
       <button id="settingsSaveBtn" class="btn-primary">儲存變更</button>
       <button id="settingsLockBtn" class="btn-secondary">🔒 鎖定</button>
     </div>
   `;
+
+  document.querySelectorAll('.settings-group-header').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const body = btn.nextElementSibling;
+      const caret = btn.querySelector('.settings-group-caret');
+      const isHidden = body.style.display === 'none';
+      body.style.display = isHidden ? '' : 'none';
+      caret.textContent = isHidden ? '▾' : '▸';
+    });
+  });
 
   document.getElementById('settingsSaveBtn').addEventListener('click', saveSettings);
   document.getElementById('settingsLockBtn').addEventListener('click', () => {

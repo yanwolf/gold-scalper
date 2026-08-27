@@ -69,7 +69,7 @@ class TelegramNotifier:
         pass
 
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
-                            executed=None, execution_error=None, skip_reason=None):
+                            executed=None, execution_error=None, skip_reason=None, account="gold"):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -87,6 +87,9 @@ class TelegramNotifier:
                   發生什麼事(修正記錄見README)。
         skip_reason: 風控斷路器擋下這次真實下單時的原因(每日虧損上限/連續虧損
                   上限)，這種情況下executed維持None(不算「失敗」，是「刻意不嘗試」)。
+        account: 這筆單實際下單用的幣安帳戶名稱(見execution.py的多帳戶設計)，
+                  用來正確顯示「這個帳戶當下是測試網還是正式環境」，不同帳戶的
+                  測試網/正式環境狀態可能不一樣(修正記錄見README)。
         """
         if self._muted:
             return
@@ -96,8 +99,8 @@ class TelegramNotifier:
 
         if executed is True:
             from app import execution as execution_module
-            env_label = "測試網" if execution_module.use_testnet() else "⚠️正式環境(真錢)"
-            execution_note = f"（已同步在幣安{env_label}下單）"
+            env_label = "測試網" if execution_module.use_testnet(account) else "⚠️正式環境(真錢)"
+            execution_note = f"（已同步在幣安{env_label}下單，帳戶：{account}）"
         elif executed is False:
             error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
             execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"

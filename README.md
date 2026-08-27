@@ -1461,3 +1461,66 @@ ATR/Choppiness Index/RSI/EMA/FVG這些都是純數學運算，不預設任何特
 已用合成的BTC等級價位(約6萬美元、波動幅度遠大於黃金)資料驗證`symbol`
 參數正確貫穿整個回測流程，管線本身沒有被硬編碼XAUUSDT绑死。實際BTC是否
 適用，需要使用者部署後用真實BTC歷史資料實測才能有可信的答案。
+
+## 四項改良：通知瘦身、切換到15分K真實下單、Dashboard排版整理、預留多帳戶架構
+
+### 1. Telegram通知改成只有真實下單才通知
+
+**問題**：原本4個模擬單引擎(1分K/5分K/15分K纏論+1分K共振)開倉/平倉都會發送
+Telegram通知，即使大部分是純模擬，訊息量太大變成垃圾訊息。
+
+**修正**：`paper_trading.py`的`_open_position()`/`_close_position()`改成
+只有「這個引擎目前綁定真實下單」(`execution_index`符合`execution_engine_index`
+設定)才會呼叫`notify_trade_event()`，純模擬的引擎完全不發送任何通知——
+純模擬的績效繼續在dashboard上查看即可，不需要即時推播騷擾。已用測試驗證：
+非綁定引擎(1分K/5分K)開倉平倉都不發通知，綁定的引擎(15分K)正常發送。
+
+### 2. 切換真實下單到15分K纏論
+
+這是純設定值變更(`execution_engine_index`從2改成3)，不需要改程式碼，
+使用者自行在dashboard的「設定」分頁完成，風控斷路器(每日/連續虧損上限)
+會自動套用到新綁定的15分K引擎，不用額外設定。
+
+### 3. Dashboard「策略參數設定」面板改成分組收合式呈現
+
+**問題**：設定表單累積到18個欄位，全部攤平顯示，越來越難找到想改的那一項。
+
+**修正**：新增`SETTINGS_GROUPS`前端分組定義，把18個欄位依用途分成5組
+(停損模式、訊號濾網、真實下單、風控斷路器、達標門檻)，各組可收合展開，
+達標門檻預設收合(設定一次後很少需要再看)。已用測試驗證分組定義涵蓋
+全部18個欄位、沒有遺漏，且有「其他」分組當保護網，之後新增欄位忘記
+分類也不會憑空消失。
+
+### 4. execution.py改成支援多帳戶架構(預留給未來BTC等商品)
+
+**背景**：使用者未來計畫陸續加入大型加密貨幣交易，先前討論過如果多個
+策略/商品共用同一個帳戶同時下單，幣安只認得淨部位，會有部位互相抵銷的
+風險，建議用獨立子帳戶隔離。這次預先把執行模組改成支援多組具名帳戶。
+
+**設計**：所有`execution.py`的函式新增`account`參數(預設`"gold"`)。帳戶
+名稱對應環境變數`BINANCE_API_KEY_<帳戶大寫>`/`BINANCE_API_SECRET_<帳戶大寫>`，
+例如`account="btc"`對應`BINANCE_API_KEY_BTC`/`BINANCE_API_SECRET_BTC`。
+為了向後相容，預設帳戶`"gold"`額外會退回嘗試舊版沒有帳戶後綴的
+`BINANCE_API_KEY`/`BINANCE_API_SECRET`，**現有的黃金真實下單設定完全不用
+改任何環境變數**。測試網/正式環境切換也支援per-帳戶覆蓋
+(`BINANCE_USE_TESTNET_<帳戶>`)，之後不同商品可以各自獨立控制。
+
+`PaperTradingEngine`新增`execution_account`/`execution_symbol`屬性(預設
+`"gold"`/`None`)，之後新增BTC模擬單引擎時，指定`execution_account="btc"`
+即可自動用獨立子帳戶下單，不用改`execution.py`或`paper_trading.py`的
+任何邏輯。`notifier.py`的通知內容也會標示實際下單的帳戶名稱，並正確
+反映該帳戶(而非寫死"gold")的測試網/正式環境狀態。`main.py`的手動測試
+endpoint(`/execution/status`、`/execution/account`等)也新增`account`
+參數，預設"gold"完全不影響現有的測試面板行為。
+
+已用完整情境測試驗證：(1)完全不指定account時正確退回舊版環境變數，
+現有黃金設定不用改；(2)新帳戶(測試用"btc")正確讀到自己的具名金鑰、
+不會誤用其他帳戶；(3)未設定金鑰的帳戶下單得到清楚的錯誤訊息；(4)
+per-帳戶的測試網開關獨立運作；(5)完整回歸測試確認4個現有引擎的
+`execution_account`都正確預設為"gold"，多帳戶參數正確從
+`PaperTradingEngine`一路貫穿到`execution`模組跟Telegram通知內容。
+
+**這次只做到「架構預留」，還沒有實際的BTC模擬單引擎或即時資料流**——
+即時系統目前仍然是單一symbol架構(`binance_client.py`固定追蹤一個商品)，
+之後真的要加BTC即時追蹤時，還需要額外的live資料流架構調整(另一個
+`binance_streamer`實例)，這是之後真的要接BTC時才需要處理的下一步。
