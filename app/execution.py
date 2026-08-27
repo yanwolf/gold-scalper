@@ -393,6 +393,11 @@ def get_position_info(symbol=None, account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, account=account)
 
 
+def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
+    """查詢指定訂單的目前狀態，用來在avgPrice還沒被填入時重新確認實際成交價。"""
+    return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)
+
+
 def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT):
     """
     送出市價單(指定帳戶)。side是"BUY"或"SELL"，quantity是張數(已經套用過精度)。
@@ -416,7 +421,22 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     }
     if reduce_only:
         params["reduceOnly"] = "true"
-    return _signed_request("POST", "/fapi/v1/order", params, account=account)
+    success, result = _signed_request("POST", "/fapi/v1/order", params, account=account)
+
+    # 市價單理論上會立刻成交，但幣安(尤其測試網)偶爾撮合結果回填進這次API回應
+    # 的時間點會比訂單狀態實際確認慢半拍，導致這次回應裡的avgPrice還是"0"
+    # (代表當下狀態可能還是"NEW"，不是"FILLED")——如果不處理，執行品質分析
+    # 會誤判成「幣安沒有回傳成交價」而完全無法計算。這裡在偵測到avgPrice缺失
+    # 時，短暫等待後重新查詢一次訂單狀態，拿確認後的實際成交價，只重試一次
+    # (不無限重試，避免真的有問題時卡住整個下單流程太久)(修正記錄見README)。
+    if success and extract_fill_price(result) is None and isinstance(result, dict) and result.get("orderId"):
+        logger.warning(f"訂單{result.get('orderId')}的avgPrice尚未填入(狀態:{result.get('status')})，0.5秒後重新查詢一次")
+        time.sleep(0.5)
+        retry_success, retry_result = get_order_status(symbol, result["orderId"], account=account)
+        if retry_success and extract_fill_price(retry_result) is not None:
+            result = retry_result
+
+    return success, result
 
 
 def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT):

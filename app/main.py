@@ -315,6 +315,7 @@ async def execution_test_order(payload: dict = Body(...)):
     success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account)
 
     execution_quality = None
+    actual_fill_price = None
     if success:
         actual_fill_price = execution_module.extract_fill_price(result)
         if actual_fill_price:
@@ -327,6 +328,13 @@ async def execution_test_order(payload: dict = Body(...)):
             f"實際成交價{actual_fill_price:.2f}，真正執行滑點{execution_quality['slippage_points']:+.2f}points"
             f"，當下價差{execution_quality['spread']:.2f}points"
         )
+    elif success:
+        # 不要靜默略過——明確講出是「成交價拿不到」還是「盤口bid/ask拿不到」
+        # (修正記錄見README)
+        if not actual_fill_price:
+            slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+        elif not (bid and ask):
+            slippage_note = f"(無法計算執行品質：查不到當下bid/ask，成交價是{actual_fill_price:.2f}，book_ticker查詢結果：{book}，book_ok={book_ok})"
 
     try:
         notifier.notify_trade_event(
@@ -365,6 +373,7 @@ async def execution_test_close(payload: dict = Body(...)):
     success, result = execution_module.close_position(direction, symbol=symbol, account=account)
 
     execution_quality = None
+    actual_fill_price = None
     if success:
         actual_fill_price = execution_module.extract_fill_price(result)
         if actual_fill_price:
@@ -377,6 +386,11 @@ async def execution_test_close(payload: dict = Body(...)):
             f"實際成交價{actual_fill_price:.2f}，真正執行滑點{execution_quality['slippage_points']:+.2f}points"
             f"，當下價差{execution_quality['spread']:.2f}points"
         )
+    elif success:
+        if not actual_fill_price:
+            slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+        elif not (bid and ask):
+            slippage_note = f"(無法計算執行品質：查不到當下bid/ask，成交價是{actual_fill_price:.2f})"
 
     try:
         notifier.notify_trade_event(

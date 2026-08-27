@@ -278,7 +278,14 @@ class PaperTradingEngine:
                             )
                             logger.info(f"開倉滑點({self.label}): {slippage_note}")
                         else:
-                            slippage_note = None
+                            # 不要靜默略過——明確講出是「成交價拿不到」還是「盤口
+                            # bid/ask拿不到」，不然使用者只會看到完全沒有滑價資訊，
+                            # 猜不出是哪個環節出問題(修正記錄見README)
+                            if not actual_fill_price:
+                                slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+                            elif not (bid and ask):
+                                slippage_note = f"(無法計算執行品質：決策當下沒有取得bid/ask報價，成交價是{actual_fill_price:.2f})"
+                            logger.warning(f"開倉執行品質無法計算({self.label}): fill={actual_fill_price}, bid={bid}, ask={ask}")
                     else:
                         execution_error = result
                         slippage_note = None
@@ -349,6 +356,12 @@ class PaperTradingEngine:
                             f"，當下價差{quality['spread']:.2f}points"
                         )
                         logger.info(f"平倉滑點({self.label}): {slippage_note}")
+                    else:
+                        if not actual_fill_price:
+                            slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+                        elif not (bid and ask):
+                            slippage_note = f"(無法計算執行品質：決策當下沒有取得bid/ask報價，成交價是{actual_fill_price:.2f})"
+                        logger.warning(f"平倉執行品質無法計算({self.label}): fill={actual_fill_price}, bid={bid}, ask={ask}")
                 else:
                     execution_error = result
                     logger.error(f"同步平倉失敗({self.label}): {result}")
