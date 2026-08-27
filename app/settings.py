@@ -140,6 +140,17 @@ FIELD_META = {
                 "dashboard的「部位風險試算」功能，輸入候選數量看對應的風險金額/"
                 "風險百分比，自己決定要填多少再存進這裡。",
     },
+    "execution_leverage": {
+        "label": "真實下單槓桿倍數",
+        "type": "int", "step": 1, "min": 1, "max": 125,
+        "default": int(os.getenv("EXECUTION_LEVERAGE", "10")),
+        "help": "每次真實開倉前，系統會自動呼叫幣安API確認/設定這個槓桿倍數"
+                "(不再需要手動按「設定槓桿」按鈕才會生效)。如果設定槓桿失敗，"
+                "這筆單會直接放棄下單(視為執行失敗)，不會用不確定的槓桿下單。"
+                "注意：槓桿只影響這筆部位要墊多少保證金，不影響每點的損益"
+                "金額(那是由下單口數決定)，可以用dashboard的「部位試算」工具"
+                "分別看數量和槓桿的效果。",
+    },
     "execution_daily_loss_limit_usd": {
         "label": "每日虧損上限 (USD)",
         "type": "float", "step": 5, "min": 1, "max": 100000,

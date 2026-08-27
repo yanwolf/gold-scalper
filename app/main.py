@@ -217,6 +217,31 @@ async def execution_estimate_risk(quantity: float, sl_points: float, password: s
     return {"success": success, "data": data if success else None, "error": None if success else data}
 
 
+@app.get("/execution/estimate-quantity")
+async def execution_estimate_quantity(
+    target_price_move: float, target_pnl_usd: float = 1.0,
+    symbol: str = "XAUUSDT", password: str = "", account: str = "gold",
+):
+    """
+    部位數量試算(反過來算)：給定「價格每變動多少，希望對應賺賠多少美元」，
+    回推需要的下單數量，並列出不同槓桿倍數下對應的名目部位價值和所需保證金。
+
+    例如黃金想要「跳動1點=賺賠1美元」，帶target_price_move=1、target_pnl_usd=1；
+    BTC想要「跳動100點=賺賠1美元」，帶target_price_move=100、target_pnl_usd=1、
+    symbol=BTCUSDT。注意：槓桿不影響算出來的數量或損益敏感度，只影響保證金，
+    這個endpoint刻意把兩者分開列出來，不會給「所需槓桿」這種不存在的單一答案。
+    需要密碼，跟其他執行相關endpoint一致。
+    """
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+
+    success, data = execution_module.estimate_quantity_for_target(
+        target_price_move, target_pnl_usd, symbol=symbol, account=account,
+    )
+    return {"success": success, "data": data if success else None, "error": None if success else data}
+
+
 @app.post("/execution/set-leverage")
 async def execution_set_leverage(payload: dict = Body(...)):
     """手動設定槓桿倍數：payload格式 {"password": "...", "leverage": 10, "account": "gold"}。"""

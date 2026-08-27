@@ -170,6 +170,79 @@ def get_symbol_precision(symbol=None, account=DEFAULT_ACCOUNT):
     return 3  # 查不到的話用一個保守預設值(0.001精度，符合先前查到的XAUUSDT最小交易單位)
 
 
+def get_mark_price(symbol, account=DEFAULT_ACCOUNT):
+    """
+    查詢目前市價(公開端點，不需要簽章/API金鑰)。用symbol的即時mark price，
+    給部位試算工具算名目部位價值用。
+    """
+    try:
+        resp = requests.get(f"{_base_url(account)}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
+        data = resp.json()
+        if "price" in data:
+            return True, float(data["price"])
+        return False, data
+    except Exception as e:
+        logger.error(f"查詢市價失敗({symbol}): {e}")
+        return False, str(e)
+
+
+def estimate_quantity_for_target(target_price_move, target_pnl_usd=1.0, symbol=None,
+                                  current_price=None, account=DEFAULT_ACCOUNT,
+                                  leverage_options=(5, 10, 20, 25, 50, 75, 100)):
+    """
+    給定「價格每變動多少(target_price_move)，希望對應賺賠多少美元(target_pnl_usd)」，
+    回推需要的下單數量，並列出不同槓桿倍數下對應的名目部位價值和所需保證金。
+
+    重要觀念澄清：**槓桿不影響這個數量或損益敏感度的計算**，數量才是決定
+    「每點賺賠多少錢」的唯一變數，槓桿只影響「這筆部位要墊多少保證金才
+    開得起」。這裡刻意把兩者分開列出來，避免誤解成調槓桿可以改變損益
+    敏感度——這是使用者在對話中討論過的觀念，這個計算器就是用來把數量和
+    槓桿兩件事講清楚，不是給「所需槓桿」一個單一答案(因為不存在這種東西，
+    任何槓桿倍數搭配正確數量都能達到同樣的損益敏感度，差別只在保證金)。
+
+    例如：黃金(1張合約=1金衡盎司)要「跳動1點(=1美元)對應賺賠1美元」，
+    數量算出來是1張；BTC(1張合約=1顆BTC)要「跳動100點(=100美元)對應
+    賺賠1美元」，數量算出來是0.01張。
+
+    current_price沒有提供的話會即時查詢(公開端點，不需要API金鑰)。
+    回傳(success, data_or_error)，成功時data包含quantity、current_price、
+    notional_value、以及margin_by_leverage(每個槓桿倍數對應的保證金)。
+    """
+    if target_price_move <= 0:
+        return False, "價格變動量必須大於0"
+    if target_pnl_usd <= 0:
+        return False, "目標損益金額必須大於0"
+
+    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    if not symbol:
+        return False, f"帳戶「{account}」沒有指定symbol，也沒有預設值可用"
+
+    quantity = target_pnl_usd / target_price_move
+    precision = get_symbol_precision(symbol, account=account)
+    quantity = round(quantity, precision)
+
+    if current_price is None:
+        price_ok, price_result = get_mark_price(symbol, account=account)
+        if not price_ok:
+            return False, price_result
+        current_price = price_result
+
+    notional_value = quantity * current_price
+    margin_by_leverage = {
+        lev: round(notional_value / lev, 2) for lev in leverage_options
+    }
+
+    return True, {
+        "symbol": symbol,
+        "quantity": quantity,
+        "target_price_move": target_price_move,
+        "target_pnl_usd": target_pnl_usd,
+        "current_price": current_price,
+        "notional_value": round(notional_value, 2),
+        "margin_by_leverage": margin_by_leverage,
+    }
+
+
 def calculate_quantity(risk_usd, sl_points, symbol=None, account=DEFAULT_ACCOUNT):
     """
     (輔助試算用，不再是實際下單的主要依據，見下方open_position()的修正記錄)

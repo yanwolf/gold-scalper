@@ -219,6 +219,19 @@ class PaperTradingEngine:
             else:
                 self._circuit_breaker_alerted = False  # 恢復正常了，下次再觸發要重新警示
                 try:
+                    # 每次真實開倉前先確認/設定槓桿(不再只靠dashboard手動按鈕)，
+                    # 幣安這支API是冪等的(重複設定同樣的值沒有副作用)，每次都呼叫
+                    # 一次確保槓桿一定是我們預期的值，不會依賴「使用者記得手動按過」
+                    # 這種容易被忽略的前提(修正記錄見README)。設定失敗就直接放棄
+                    # 這筆下單，不會用不確定的槓桿去冒險。
+                    leverage_ok, leverage_result = execution_module.set_leverage(
+                        int(s["execution_leverage"]),
+                        symbol=self.execution_symbol,
+                        account=self.execution_account,
+                    )
+                    if not leverage_ok:
+                        raise RuntimeError(f"槓桿設定失敗，放棄下單: {leverage_result}")
+
                     success, result = execution_module.open_position(
                         direction=position["direction"],
                         quantity=quantity,
