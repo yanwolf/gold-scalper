@@ -13,6 +13,7 @@ app/analysis.py，在這裡 import 進來、加新的 endpoint 即可，
 """
 
 import asyncio
+import logging
 import os
 from typing import Optional
 
@@ -32,6 +33,8 @@ from app import sweep as sweep_module
 from app import settings as settings_module
 from app import execution as execution_module
 from app import db
+
+logger = logging.getLogger("main")
 
 app = FastAPI(title="Gold Scalping Analyzer", version="0.1.0")
 
@@ -285,6 +288,11 @@ async def execution_test_order(payload: dict = Body(...)):
 
     務必先確認 GET /execution/status?account=... 顯示 testnet: true，再呼叫
     這支API，避免不小心對正式環境送出真實訂單。
+
+    下單前會先查詢當下的真實買一/賣一(book ticker)，下單後拿實際成交價
+    比對，算出「真正執行滑點」跟「當下買賣價差」兩個數字回傳，並發送
+    Telegram通知(標示【手動測試】)——這樣手動測試也能跟即時模擬單一樣，
+    直接驗證真實執行品質，不用另外肉眼比對(修正記錄見README)。
     """
     ok, error = settings_module.verify_password(payload.get("password", ""))
     if not ok:
@@ -296,17 +304,48 @@ async def execution_test_order(payload: dict = Body(...)):
 
     direction = payload.get("direction")
     quantity = payload.get("quantity", 1.0)
+    symbol = payload.get("symbol") or (execution_module.DEFAULT_SYMBOL if account == "gold" else None)
 
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    success, result = execution_module.open_position(direction, quantity, account=account)
-    return {"success": success, "result": result}
+    book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
+    bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
+
+    success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account)
+
+    execution_quality = None
+    if success:
+        actual_fill_price = execution_module.extract_fill_price(result)
+        if actual_fill_price:
+            execution_quality = execution_module.analyze_execution_quality(direction, bid, ask, actual_fill_price, is_close=False)
+
+    slippage_note = None
+    if execution_quality:
+        slippage_note = (
+            f"預期成交價{execution_quality['expected_fill_price']:.2f}(依決策當下ask/bid) vs "
+            f"實際成交價{actual_fill_price:.2f}，真正執行滑點{execution_quality['slippage_points']:+.2f}points"
+            f"，當下價差{execution_quality['spread']:.2f}points"
+        )
+
+    try:
+        notifier.notify_trade_event(
+            action="open", label="手動測試", direction=direction, price=bid or ask or 0,
+            executed=success, execution_error=None if success else result,
+            account=account, slippage_note=slippage_note,
+        )
+    except Exception as e:
+        logger.error(f"手動測試下單通知發送失敗: {e}")
+
+    return {"success": success, "result": result, "execution_quality": execution_quality}
 
 
 @app.post("/execution/test-close")
 async def execution_test_close(payload: dict = Body(...)):
-    """手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish", "account": "gold"}。"""
+    """
+    手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish", "account": "gold"}。
+    跟test-order一樣，會計算執行品質並發送Telegram通知(修正記錄見README)。
+    """
     ok, error = settings_module.verify_password(payload.get("password", ""))
     if not ok:
         return {"success": False, "error": error}
@@ -319,8 +358,37 @@ async def execution_test_close(payload: dict = Body(...)):
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    success, result = execution_module.close_position(direction, account=account)
-    return {"success": success, "result": result}
+    symbol = payload.get("symbol") or (execution_module.DEFAULT_SYMBOL if account == "gold" else None)
+    book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
+    bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
+
+    success, result = execution_module.close_position(direction, symbol=symbol, account=account)
+
+    execution_quality = None
+    if success:
+        actual_fill_price = execution_module.extract_fill_price(result)
+        if actual_fill_price:
+            execution_quality = execution_module.analyze_execution_quality(direction, bid, ask, actual_fill_price, is_close=True)
+
+    slippage_note = None
+    if execution_quality:
+        slippage_note = (
+            f"預期成交價{execution_quality['expected_fill_price']:.2f}(依決策當下ask/bid) vs "
+            f"實際成交價{actual_fill_price:.2f}，真正執行滑點{execution_quality['slippage_points']:+.2f}points"
+            f"，當下價差{execution_quality['spread']:.2f}points"
+        )
+
+    try:
+        notifier.notify_trade_event(
+            action="close", label="手動測試", direction=direction, price=bid or ask or 0,
+            exit_reason="手動測試平倉", pnl_points=0,
+            executed=success, execution_error=None if success else result,
+            account=account, slippage_note=slippage_note,
+        )
+    except Exception as e:
+        logger.error(f"手動測試平倉通知發送失敗: {e}")
+
+    return {"success": success, "result": result, "execution_quality": execution_quality}
 
 
 @app.get("/paper-trading/summary")

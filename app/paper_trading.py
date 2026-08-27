@@ -40,23 +40,6 @@ DEFAULT_TRADE_LIMIT = 3000
 MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼多筆已平倉紀錄
 
 
-def _extract_fill_price(order_result):
-    """
-    從幣安下單API的回傳結果裡取出實際平均成交價(avgPrice)，用來跟訊號當下
-    的價格比較、算出真實滑價(修正記錄見README)。市價單成交時幣安會回傳
-    avgPrice欄位，如果因為任何原因缺失或格式不對(例如"0.00"代表還沒完全
-    成交、或某些回應格式差異)，安全回傳None，呼叫端就不會顯示滑價資訊，
-    不會因為這個附加功能本身出錯而影響下單流程。
-    """
-    if not isinstance(order_result, dict):
-        return None
-    try:
-        avg_price = float(order_result.get("avgPrice", 0))
-        return avg_price if avg_price > 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
 class PaperTradingEngine:
     def __init__(self, interval_seconds=60, label=None, strategy_type="chan_profile",
                  resonance_min_conditions=4, execution_index=None, engine_id=None,
@@ -222,14 +205,9 @@ class PaperTradingEngine:
         # 「買賣價差」誤判成「執行滑點」，兩者性質不同：價差是每筆單都會有
         # 的固定成本(不管執行多快都躲不掉)，真正的滑點才是執行過程中價格
         # 又跑掉的部分。這裡改用decision當下實際的bid/ask當基準，backtest
-        # 模式或即時報價還沒抓到時沒有bid/ask，安全退回用中間價。
+        # 模式或即時報價還沒抓到時沒有bid/ask，execution.analyze_execution_quality()
+        # 會安全回傳None，不會顯示滑價資訊。
         bid, ask = signal_result.get("bid"), signal_result.get("ask")
-        if bid and ask:
-            expected_fill_price = ask if position["direction"] == "bullish" else bid
-            spread = ask - bid
-        else:
-            expected_fill_price = current_price
-            spread = None
 
         s = settings_module.get_settings()
         is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
@@ -288,20 +266,15 @@ class PaperTradingEngine:
                     executed = success
                     if success:
                         logger.info(f"同步下單成功({self.label}): {result}")
-                        actual_fill_price = _extract_fill_price(result)
-                        if actual_fill_price:
-                            # 正值=比預期更不利，負值=比預期更有利，用「決策當下
-                            # 的ask/bid」當基準，不是中間價，這樣算出來的才是真正
-                            # 的執行滑點，不包含買賣價差本身(修正記錄見README)
-                            if position["direction"] == "bullish":
-                                slippage_points = actual_fill_price - expected_fill_price
-                            else:
-                                slippage_points = expected_fill_price - actual_fill_price
-                            spread_note = f"，當下價差{spread:.2f}points" if spread is not None else ""
+                        actual_fill_price = execution_module.extract_fill_price(result)
+                        quality = execution_module.analyze_execution_quality(
+                            position["direction"], bid, ask, actual_fill_price, is_close=False,
+                        ) if actual_fill_price else None
+                        if quality:
                             slippage_note = (
-                                f"預期成交價{expected_fill_price:.2f}(依決策當下ask/bid) vs "
-                                f"實際成交價{actual_fill_price:.2f}，真正執行滑點{slippage_points:+.2f}points"
-                                f"{spread_note}"
+                                f"預期成交價{quality['expected_fill_price']:.2f}(依決策當下ask/bid) vs "
+                                f"實際成交價{actual_fill_price:.2f}，真正執行滑點{quality['slippage_points']:+.2f}points"
+                                f"，當下價差{quality['spread']:.2f}points"
                             )
                             logger.info(f"開倉滑點({self.label}): {slippage_note}")
                         else:
@@ -352,13 +325,6 @@ class PaperTradingEngine:
 
         # 平倉方向要反過來：多單出場是賣出(市價賣單成交在買一bid)，空單出場
         # 是買回(市價買單成交在賣一ask)——跟開倉時的方向剛好相反(修正記錄見README)
-        if bid and ask:
-            expected_fill_price = bid if position["direction"] == "bullish" else ask
-            spread = ask - bid
-        else:
-            expected_fill_price = exit_price
-            spread = None
-
         s = settings_module.get_settings()
         is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
 
@@ -372,17 +338,15 @@ class PaperTradingEngine:
                 executed = success
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
-                    actual_fill_price = _extract_fill_price(result)
-                    if actual_fill_price:
-                        if position["direction"] == "bullish":
-                            slippage_points = expected_fill_price - actual_fill_price
-                        else:
-                            slippage_points = actual_fill_price - expected_fill_price
-                        spread_note = f"，當下價差{spread:.2f}points" if spread is not None else ""
+                    actual_fill_price = execution_module.extract_fill_price(result)
+                    quality = execution_module.analyze_execution_quality(
+                        position["direction"], bid, ask, actual_fill_price, is_close=True,
+                    ) if actual_fill_price else None
+                    if quality:
                         slippage_note = (
-                            f"預期成交價{expected_fill_price:.2f}(依決策當下ask/bid) vs "
-                            f"實際成交價{actual_fill_price:.2f}，真正執行滑點{slippage_points:+.2f}points"
-                            f"{spread_note}"
+                            f"預期成交價{quality['expected_fill_price']:.2f}(依決策當下ask/bid) vs "
+                            f"實際成交價{actual_fill_price:.2f}，真正執行滑點{quality['slippage_points']:+.2f}points"
+                            f"，當下價差{quality['spread']:.2f}points"
                         )
                         logger.info(f"平倉滑點({self.label}): {slippage_note}")
                 else:

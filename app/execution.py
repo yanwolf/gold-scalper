@@ -186,6 +186,73 @@ def get_mark_price(symbol, account=DEFAULT_ACCOUNT):
         return False, str(e)
 
 
+def get_book_ticker(symbol, account=DEFAULT_ACCOUNT):
+    """
+    查詢目前最佳買一/賣一(公開端點，不需要簽章/API金鑰)。用來在下單前
+    後拿到「決策當下」的真實盤口，才能事後算出「真正執行滑點」跟
+    「當下買賣價差」，不是拿中間價或事後的市價去比(修正記錄見README)。
+    回傳(success, {"bid": float, "ask": float})。
+    """
+    try:
+        resp = requests.get(f"{_base_url(account)}/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, timeout=10)
+        data = resp.json()
+        if "bidPrice" in data and "askPrice" in data:
+            return True, {"bid": float(data["bidPrice"]), "ask": float(data["askPrice"])}
+        return False, data
+    except Exception as e:
+        logger.error(f"查詢盤口失敗({symbol}): {e}")
+        return False, str(e)
+
+
+def extract_fill_price(order_result):
+    """
+    從幣安下單API的回傳結果裡取出實際平均成交價(avgPrice)。市價單成交時
+    幣安會回傳avgPrice欄位，如果因為任何原因缺失或格式不對(例如"0.00"
+    代表還沒完全成交)，安全回傳None(修正記錄見README)。
+    """
+    if not isinstance(order_result, dict):
+        return None
+    try:
+        avg_price = float(order_result.get("avgPrice", 0))
+        return avg_price if avg_price > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def analyze_execution_quality(direction, bid, ask, actual_fill_price, is_close=False):
+    """
+    比較「決策當下的真實盤口」跟「實際成交價」，拆解出「真正執行滑點」跟
+    「當下買賣價差」兩個獨立數字——市價買單本來就會成交在賣一(ask)、
+    市價賣單會成交在買一(bid)，這是不管執行多快都躲不掉的固定成本(價差)，
+    跟「執行過程中價格又額外跑掉」的真正滑點是不同的兩件事，混在一起看
+    會誤判執行品質(修正記錄見README，使用者用真實成交案例驗證過這個
+    區分方式)。
+
+    direction: "bullish"或"bearish"，這筆單原本的方向。
+    is_close: False代表這是開倉(多單買入對應ask、空單賣出對應bid)；
+              True代表這是平倉(多單出場賣出對應bid、空單出場買回對應ask)，
+              方向要對調。
+    回傳 {expected_fill_price, spread, slippage_points} 或 bid/ask缺失時回傳None。
+    正值slippage_points代表對使用者不利(不管方向)，方便直接判讀。
+    """
+    if bid is None or ask is None:
+        return None
+
+    is_bullish = direction == "bullish"
+    if is_close:
+        expected_fill_price = bid if is_bullish else ask
+        slippage_points = (expected_fill_price - actual_fill_price) if is_bullish else (actual_fill_price - expected_fill_price)
+    else:
+        expected_fill_price = ask if is_bullish else bid
+        slippage_points = (actual_fill_price - expected_fill_price) if is_bullish else (expected_fill_price - actual_fill_price)
+
+    return {
+        "expected_fill_price": expected_fill_price,
+        "spread": ask - bid,
+        "slippage_points": slippage_points,
+    }
+
+
 def estimate_quantity_for_target(target_price_move, target_pnl_usd=1.0, symbol=None,
                                   current_price=None, account=DEFAULT_ACCOUNT,
                                   leverage_options=(5, 10, 20, 25, 50, 75, 100)):
