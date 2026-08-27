@@ -40,6 +40,23 @@ DEFAULT_TRADE_LIMIT = 3000
 MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼多筆已平倉紀錄
 
 
+def _extract_fill_price(order_result):
+    """
+    從幣安下單API的回傳結果裡取出實際平均成交價(avgPrice)，用來跟訊號當下
+    的價格比較、算出真實滑價(修正記錄見README)。市價單成交時幣安會回傳
+    avgPrice欄位，如果因為任何原因缺失或格式不對(例如"0.00"代表還沒完全
+    成交、或某些回應格式差異)，安全回傳None，呼叫端就不會顯示滑價資訊，
+    不會因為這個附加功能本身出錯而影響下單流程。
+    """
+    if not isinstance(order_result, dict):
+        return None
+    try:
+        avg_price = float(order_result.get("avgPrice", 0))
+        return avg_price if avg_price > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 class PaperTradingEngine:
     def __init__(self, interval_seconds=60, label=None, strategy_type="chan_profile",
                  resonance_min_conditions=4, execution_index=None, engine_id=None,
@@ -152,7 +169,7 @@ class PaperTradingEngine:
                 reversal_confirm_count=s["paper_reversal_confirm_count"],
             )
             if exit_reason:
-                self._close_position(position, current_price, exit_reason)
+                self._close_position(position, current_price, exit_reason, bid=result.get("bid"), ask=result.get("ask"))
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
@@ -198,6 +215,22 @@ class PaperTradingEngine:
         executed = None  # None=沒有嘗試下單(純模擬)，True=下單成功，False=下單失敗
         execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
         skip_reason = None  # 風控斷路器擋下這次下單的原因(修正記錄見README)
+        slippage_note = None  # 買賣價差+真正執行滑點的說明(修正記錄見README)
+
+        # 市價買單實際會成交在賣一(ask)、市價賣單會成交在買一(bid)，不是
+        # 中間價(current_price)——使用者實測發現，直接拿中間價當基準會把
+        # 「買賣價差」誤判成「執行滑點」，兩者性質不同：價差是每筆單都會有
+        # 的固定成本(不管執行多快都躲不掉)，真正的滑點才是執行過程中價格
+        # 又跑掉的部分。這裡改用decision當下實際的bid/ask當基準，backtest
+        # 模式或即時報價還沒抓到時沒有bid/ask，安全退回用中間價。
+        bid, ask = signal_result.get("bid"), signal_result.get("ask")
+        if bid and ask:
+            expected_fill_price = ask if position["direction"] == "bullish" else bid
+            spread = ask - bid
+        else:
+            expected_fill_price = current_price
+            spread = None
+
         s = settings_module.get_settings()
         is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
 
@@ -251,12 +284,32 @@ class PaperTradingEngine:
                     executed = success
                     if success:
                         logger.info(f"同步下單成功({self.label}): {result}")
+                        actual_fill_price = _extract_fill_price(result)
+                        if actual_fill_price:
+                            # 正值=比預期更不利，負值=比預期更有利，用「決策當下
+                            # 的ask/bid」當基準，不是中間價，這樣算出來的才是真正
+                            # 的執行滑點，不包含買賣價差本身(修正記錄見README)
+                            if position["direction"] == "bullish":
+                                slippage_points = actual_fill_price - expected_fill_price
+                            else:
+                                slippage_points = expected_fill_price - actual_fill_price
+                            spread_note = f"，當下價差{spread:.2f}points" if spread is not None else ""
+                            slippage_note = (
+                                f"預期成交價{expected_fill_price:.2f}(依決策當下ask/bid) vs "
+                                f"實際成交價{actual_fill_price:.2f}，真正執行滑點{slippage_points:+.2f}points"
+                                f"{spread_note}"
+                            )
+                            logger.info(f"開倉滑點({self.label}): {slippage_note}")
+                        else:
+                            slippage_note = None
                     else:
                         execution_error = result
+                        slippage_note = None
                         logger.error(f"同步下單失敗({self.label}): {result}")
                 except Exception as e:
                     executed = False
                     execution_error = str(e)
+                    slippage_note = None
                     logger.error(f"同步下單發生例外({self.label}): {e}")
 
         # 事件驅動通知：只有「這個引擎目前綁定真實下單」才會發送Telegram通知，
@@ -269,12 +322,12 @@ class PaperTradingEngine:
                     action="open", label=self.label,
                     direction=position["direction"], price=current_price,
                     executed=executed, execution_error=execution_error, skip_reason=skip_reason,
-                    account=self.execution_account,
+                    account=self.execution_account, slippage_note=slippage_note,
                 )
             except Exception as e:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
-    def _close_position(self, position, exit_price, exit_reason):
+    def _close_position(self, position, exit_price, exit_reason, bid=None, ask=None):
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = trading_core.close_position(position, exit_price, exit_reason, exit_time)
 
@@ -291,6 +344,17 @@ class PaperTradingEngine:
 
         executed = None
         execution_error = None
+        slippage_note = None
+
+        # 平倉方向要反過來：多單出場是賣出(市價賣單成交在買一bid)，空單出場
+        # 是買回(市價買單成交在賣一ask)——跟開倉時的方向剛好相反(修正記錄見README)
+        if bid and ask:
+            expected_fill_price = bid if position["direction"] == "bullish" else ask
+            spread = ask - bid
+        else:
+            expected_fill_price = exit_price
+            spread = None
+
         s = settings_module.get_settings()
         is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
 
@@ -304,6 +368,19 @@ class PaperTradingEngine:
                 executed = success
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
+                    actual_fill_price = _extract_fill_price(result)
+                    if actual_fill_price:
+                        if position["direction"] == "bullish":
+                            slippage_points = expected_fill_price - actual_fill_price
+                        else:
+                            slippage_points = actual_fill_price - expected_fill_price
+                        spread_note = f"，當下價差{spread:.2f}points" if spread is not None else ""
+                        slippage_note = (
+                            f"預期成交價{expected_fill_price:.2f}(依決策當下ask/bid) vs "
+                            f"實際成交價{actual_fill_price:.2f}，真正執行滑點{slippage_points:+.2f}points"
+                            f"{spread_note}"
+                        )
+                        logger.info(f"平倉滑點({self.label}): {slippage_note}")
                 else:
                     execution_error = result
                     logger.error(f"同步平倉失敗({self.label}): {result}")
@@ -318,7 +395,7 @@ class PaperTradingEngine:
                     direction=position["direction"], price=exit_price,
                     exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
                     executed=executed, execution_error=execution_error,
-                    account=self.execution_account,
+                    account=self.execution_account, slippage_note=slippage_note,
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")

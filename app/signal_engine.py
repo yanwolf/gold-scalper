@@ -124,15 +124,26 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     "resonance_fvg"才會真的用到共振策略——目前只有paper_trading.py裡特地建立的
     1分K共振模擬單引擎會這樣做(修正記錄見README)，這是使用者看過真實回測數據
     (獲利因子/勝率不錯，但需要留意最大回撤偏大)後決定要開始收集即時資料。
+
+    result額外附上bid/ask(不只是current_price這個中間價)：使用者實測發現，
+    真實下單成交價(市價買單成交在賣一Ask、市價賣單成交在買一Bid)跟中間價
+    本來就有落差，這是買賣價差(spread)造成的固定成本，不是執行延遲造成的
+    滑點——兩者性質不同，混在一起看會誤判「執行品質」。有了bid/ask，
+    paper_trading.py才能算出真正的「執行滑點」(成交價 vs 決策當下的
+    bid/ask，而不是vs中間價)，把價差成本跟真正的滑點分開呈現
+    (修正記錄見README)。
     """
     trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
 
     current_price = None
+    bid = ask = None
     latest_tick = binance_streamer.get_latest()
     if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
-        current_price = (float(latest_tick["bid"]) + float(latest_tick["ask"])) / 2
+        bid = float(latest_tick["bid"])
+        ask = float(latest_tick["ask"])
+        current_price = (bid + ask) / 2
 
-    return compute_signal_from_trades(
+    result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
         bucket_size=bucket_size,
@@ -141,3 +152,6 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
     )
+    result["bid"] = bid
+    result["ask"] = ask
+    return result
