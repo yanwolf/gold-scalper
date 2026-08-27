@@ -201,6 +201,23 @@ async def execution_account(password: str = "", account: str = "gold"):
     return {"success": success, "data": data}
 
 
+@app.get("/execution/position")
+async def execution_position(password: str = "", account: str = "gold", symbol: Optional[str] = None):
+    """
+    查詢指定帳戶目前的實際持倉，包含幣安直接算好的**強平價格**(liquidationPrice)——
+    這是幣安依照該商品實際的維持保證金分級表算出來的精確數字，比自己土法煉鋼
+    估算可靠，維持保證金比率因商品、部位大小分級而異，不用自己猜。也會一併
+    回傳未實現損益、進場均價、槓桿倍數等，方便隨時掌握真實部位現況，不用等
+    到快被強平才知道。需要密碼，跟其他執行相關endpoint一致。
+    """
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+
+    success, data = execution_module.get_position_info(symbol=symbol, account=account)
+    return {"success": success, "data": data}
+
+
 @app.get("/execution/estimate-risk")
 async def execution_estimate_risk(quantity: float, sl_points: float, password: str = "", account: str = "gold"):
     """

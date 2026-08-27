@@ -701,6 +701,7 @@
 
   <div class="controls" style="margin-bottom:12px;">
     <button id="executionAccountBtn" class="btn-secondary">查詢帳戶餘額</button>
+    <button id="executionPositionBtn" class="btn-secondary">查詢目前部位(含強平價)</button>
   </div>
 
   <div class="settings-field">
@@ -820,6 +821,7 @@ const els = {
   settingsResult: document.getElementById('settingsResult'),
   executionStatusLine: document.getElementById('executionStatusLine'),
   executionAccountBtn: document.getElementById('executionAccountBtn'),
+  executionPositionBtn: document.getElementById('executionPositionBtn'),
   executionDirection: document.getElementById('executionDirection'),
   executionQuantity: document.getElementById('executionQuantity'),
   executionLeverage: document.getElementById('executionLeverage'),
@@ -1281,6 +1283,38 @@ els.executionAccountBtn.addEventListener('click', async () => {
     showExecutionResult(`查詢失敗：${err.message}`, true);
   }
   els.executionAccountBtn.disabled = false;
+});
+
+els.executionPositionBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  els.executionPositionBtn.disabled = true;
+  showExecutionResult('查詢中...', false);
+  try{
+    const res = await fetch(`/execution/position?password=${encodeURIComponent(pwd)}`);
+    const data = await res.json();
+    if(data.success){
+      const positions = (data.data || []).filter(p => parseFloat(p.positionAmt) !== 0);
+      if(positions.length === 0){
+        showExecutionResult('目前沒有未平倉部位', false);
+      }else{
+        const lines = positions.map(p =>
+          `方向：${parseFloat(p.positionAmt) > 0 ? '多單' : '空單'} ${Math.abs(p.positionAmt)}張\n` +
+          `進場均價：${p.entryPrice}\n` +
+          `目前標記價：${p.markPrice}\n` +
+          `未實現損益：${p.unRealizedProfit}\n` +
+          `槓桿：${p.leverage}x\n` +
+          `⚠️ 強平價格：${p.liquidationPrice}(幣安依實際維持保證金分級算出的精確數字)`
+        ).join('\n\n---\n\n');
+        showExecutionResult(lines, false);
+      }
+    }else{
+      showExecutionResult(`查詢失敗：${JSON.stringify(data.error)}`, true);
+    }
+  }catch(err){
+    showExecutionResult(`查詢失敗：${err.message}`, true);
+  }
+  els.executionPositionBtn.disabled = false;
 });
 
 els.executionOpenBtn.addEventListener('click', async () => {
