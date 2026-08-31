@@ -106,25 +106,58 @@ def check_spread_edge(sl_points, spread_points, min_ratio):
     return True, None
 
 
-def check(engine, quantity, sl_points=None):
+def check_current_spread(bid, ask, max_spread_points):
+    """
+    檢查決策當下的真實買賣價差(不是假設值，是即時盤口bid/ask)是不是異常放大。
+
+    跟check_spread_edge()的差異：那個是拿「使用者假設的固定價差值」去跟ATR
+    停損距離比，是一個間接的代理指標(用波動度去猜價差划不划算)；這個是
+    直接查當下的真實盤口，抓「這一刻價差真的變寬了」的異常時刻——例如
+    低流動性時段、大單剛好吃掉盤口深度、重大消息公布前後，這種瞬間價差
+    可能跳高，光看ATR/假設值判斷不出來，只有查當下真實報價才抓得到
+    (修正記錄見README，使用者實際觀察到平時價差穩定在0.01points左右，
+    但某幾筆單出現+6.68points的滑點，想在下單前直接擋掉這種異常時刻)。
+
+    這道檢查用的bid/ask，跟後續算「真正執行滑點」用的是同一份資料(決策
+    當下從即時報價流拿到的)，不需要額外呼叫API，幾乎沒有額外成本。
+
+    回傳(allowed, reason)。max_spread_points<=0時視為關閉這道檢查；沒有
+    bid/ask資料時(例如報價還沒抓到)不會因此擋單，避免資料缺失就卡死交易。
+    """
+    if not max_spread_points or max_spread_points <= 0:
+        return True, None
+    if bid is None or ask is None:
+        return True, None
+
+    spread = ask - bid
+    if spread > max_spread_points:
+        return False, (
+            f"當下買賣價差{spread:.2f}points，超過上限{max_spread_points:.2f}points，"
+            f"可能是流動性瞬間變薄或即將有重大波動，暫停真實下單"
+        )
+    return True, None
+
+
+def check(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
     回傳 (allowed: bool, reason: str|None, reason_type: str|None)。allowed=False
-    代表已達每日虧損上限、連續虧損上限、或(提供sl_points時)價差安全邊際不足，
-    這次不該送出真實下單(模擬單本身照常記錄，不受影響)。
+    代表已達每日虧損上限、連續虧損上限、(提供sl_points時)價差安全邊際不足、
+    或(提供bid/ask時)當下真實價差過大，這次不該送出真實下單(模擬單本身
+    照常記錄，不受影響)。
 
     reason_type區分是哪一種原因擋下的("daily_loss"/"consecutive_loss"/
-    "spread_edge")，讓呼叫端可以分開處理：daily_loss/consecutive_loss是
-    真正的風控斷路器，觸發時值得發一則獨立警示提醒使用者；spread_edge是
-    「這個時段市場波動度不夠、划不來真的下單」的市場條件判斷，可能在低
-    波動時段頻繁觸發，不該跟風控斷路器共用同一套「只提醒一次」的機制，
-    不然可能會互相干擾——如果spread_edge先觸發、佔用了提醒額度，之後
-    真正的虧損斷路器觸發時反而不會收到獨立警示，這是需要避免的情況
-    (修正記錄見README)。
+    "spread_edge"/"current_spread")，讓呼叫端可以分開處理：daily_loss/
+    consecutive_loss是真正的風控斷路器，觸發時值得發一則獨立警示提醒
+    使用者；spread_edge跟current_spread都是「這個時刻划不划算真的下單」的
+    市場條件判斷，可能頻繁觸發，不該跟風控斷路器共用同一套「只提醒一次」
+    的機制，不然可能會互相干擾(修正記錄見README)。
 
     sl_points：這筆單目前算出來的停損距離(points)，用來檢查是否有足夠的
-    安全邊際覆蓋假設的買賣價差成本(execution_min_edge_ratio設定)。不提供
-    的話不會做這項檢查(向後相容既有呼叫方式)。
+    安全邊際覆蓋「假設的」買賣價差成本(execution_min_edge_ratio設定)。
+    bid/ask：決策當下的即時真實盤口，用來檢查「當下實際」價差是否異常
+    放大(execution_max_spread_points設定)，比sl_points那組更直接、即時。
+    兩者都不提供的話都不會做對應的檢查(向後相容既有呼叫方式)。
     """
     s = settings_module.get_settings()
 
@@ -146,6 +179,13 @@ def check(engine, quantity, sl_points=None):
         )
         if not edge_allowed:
             return False, edge_reason, "spread_edge"
+
+    if bid is not None and ask is not None:
+        spread_allowed, spread_reason = check_current_spread(
+            bid, ask, s.get("execution_max_spread_points"),
+        )
+        if not spread_allowed:
+            return False, spread_reason, "current_spread"
 
     return True, None, None
 

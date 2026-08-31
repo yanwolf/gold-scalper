@@ -214,7 +214,7 @@ class PaperTradingEngine:
 
         if is_execution_engine:
             quantity = s["execution_quantity"]
-            allowed, block_reason, block_type = risk_guard.check(self, quantity, sl_points=sl_points)
+            allowed, block_reason, block_type = risk_guard.check(self, quantity, sl_points=sl_points, bid=bid, ask=ask)
 
             if not allowed:
                 skip_reason = block_reason
