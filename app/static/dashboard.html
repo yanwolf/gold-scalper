@@ -577,6 +577,77 @@
     幾萬美元，箱寬還是1會切出大量沒意義的小格子。這是驗證這套訊號邏輯
     換到別的商品適不適用的實驗功能，不影響即時模擬單(即時系統仍固定追蹤黃金)。
   </div>
+
+  <div class="settings-group" style="margin-top:12px;">
+    <button type="button" class="settings-group-header" id="backtestParamsToggle">
+      <span>回測交易參數(獨立於正式設定，不會影響即時模擬單)</span>
+      <span class="settings-group-caret" id="backtestParamsCaret">▸</span>
+    </button>
+    <div class="settings-group-body" id="backtestParamsBody" style="display:none;">
+      <div style="font-size:11px; color:var(--muted); margin-bottom:10px; line-height:1.6;">
+        這裡填的值只影響「這次回測」，不會寫進「設定」分頁的正式參數，
+        即時模擬單完全不受影響——想測試不同參數組合，直接在這裡改就好，
+        不用去改正式設定(那樣會導致模擬單績效統計排除舊交易、變成又要
+        重新開始累積)。留空的欄位會沿用目前正式設定的值當基準。
+      </div>
+
+      <div class="settings-field">
+        <label>停損模式</label>
+        <select id="backtestUseAtr">
+          <option value="">沿用目前正式設定</option>
+          <option value="1">強制用ATR動態</option>
+          <option value="0">強制用固定點數</option>
+        </select>
+      </div>
+
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">ATR動態模式參數(停損模式選ATR動態時才有效)</div>
+      <div class="settings-field">
+        <label>ATR初始停損倍數</label>
+        <input type="number" id="backtestAtrSlMult" placeholder="留空=沿用正式設定" step="0.1" min="0.1" />
+      </div>
+      <div class="settings-field">
+        <label>ATR移動停損觸發倍數</label>
+        <input type="number" id="backtestAtrTriggerMult" placeholder="留空=沿用正式設定" step="0.1" min="0.1" />
+      </div>
+      <div class="settings-field">
+        <label>ATR移動停損跟隨倍數</label>
+        <input type="number" id="backtestAtrTrailMult" placeholder="留空=沿用正式設定" step="0.1" min="0.1" />
+      </div>
+
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">固定點數模式參數(停損模式選固定點數時才有效)</div>
+      <div class="settings-field">
+        <label>初始停損 (points)</label>
+        <input type="number" id="backtestSlPoints" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
+      </div>
+      <div class="settings-field">
+        <label>移動停損觸發距離 (points)</label>
+        <input type="number" id="backtestTrailTrigger" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
+      </div>
+      <div class="settings-field">
+        <label>移動停損跟隨距離 (points)</label>
+        <input type="number" id="backtestTrailDistance" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
+      </div>
+
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">通用參數</div>
+      <div class="settings-field">
+        <label>訊號反轉確認次數</label>
+        <input type="number" id="backtestReversalConfirm" placeholder="留空=沿用正式設定" step="1" min="1" />
+      </div>
+      <div class="settings-field">
+        <label>震盪濾網</label>
+        <select id="backtestUseChop">
+          <option value="">沿用目前正式設定</option>
+          <option value="1">強制開啟</option>
+          <option value="0">強制關閉</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>震盪濾網門檻(濾網開啟時才有效)</label>
+        <input type="number" id="backtestChopThreshold" placeholder="留空=沿用正式設定" step="1" min="0" max="100" />
+      </div>
+    </div>
+  </div>
+
   <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
@@ -829,6 +900,19 @@ const els = {
   backtestResonanceThreshold: document.getElementById('backtestResonanceThreshold'),
   backtestSymbol: document.getElementById('backtestSymbol'),
   backtestBucketSize: document.getElementById('backtestBucketSize'),
+  backtestParamsToggle: document.getElementById('backtestParamsToggle'),
+  backtestParamsBody: document.getElementById('backtestParamsBody'),
+  backtestParamsCaret: document.getElementById('backtestParamsCaret'),
+  backtestUseAtr: document.getElementById('backtestUseAtr'),
+  backtestAtrSlMult: document.getElementById('backtestAtrSlMult'),
+  backtestAtrTriggerMult: document.getElementById('backtestAtrTriggerMult'),
+  backtestAtrTrailMult: document.getElementById('backtestAtrTrailMult'),
+  backtestSlPoints: document.getElementById('backtestSlPoints'),
+  backtestTrailTrigger: document.getElementById('backtestTrailTrigger'),
+  backtestTrailDistance: document.getElementById('backtestTrailDistance'),
+  backtestReversalConfirm: document.getElementById('backtestReversalConfirm'),
+  backtestUseChop: document.getElementById('backtestUseChop'),
+  backtestChopThreshold: document.getElementById('backtestChopThreshold'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -1758,6 +1842,34 @@ els.paperInterval.addEventListener('change', fetchPaperTrading);
 
 // --- 歷史回測 ---
 
+// 收合/展開回測交易參數區塊
+els.backtestParamsToggle.addEventListener('click', () => {
+  const isHidden = els.backtestParamsBody.style.display === 'none';
+  els.backtestParamsBody.style.display = isHidden ? '' : 'none';
+  els.backtestParamsCaret.textContent = isHidden ? '▾' : '▸';
+});
+
+// 把回測參數欄位組成query string——留空的欄位完全不加進去(讓後端retreat回讀取
+// 正式設定當基準)，只有使用者真的填了值才會覆寫，這樣使用者可以自由測試不同
+// 組合，完全不用去動「策略參數設定」那邊的正式設定(修正記錄見README)
+function buildBacktestParamOverrides(){
+  const params = new URLSearchParams();
+  const addIfPresent = (key, el) => {
+    if(el.value !== '') params.set(key, el.value);
+  };
+  addIfPresent('use_atr', els.backtestUseAtr);
+  addIfPresent('atr_sl_multiplier', els.backtestAtrSlMult);
+  addIfPresent('atr_trigger_multiplier', els.backtestAtrTriggerMult);
+  addIfPresent('atr_trail_multiplier', els.backtestAtrTrailMult);
+  addIfPresent('sl_points', els.backtestSlPoints);
+  addIfPresent('trail_trigger_points', els.backtestTrailTrigger);
+  addIfPresent('trail_distance_points', els.backtestTrailDistance);
+  addIfPresent('reversal_confirm_count', els.backtestReversalConfirm);
+  addIfPresent('use_chop_filter', els.backtestUseChop);
+  addIfPresent('chop_threshold', els.backtestChopThreshold);
+  return params.toString();
+}
+
 els.backtestRunBtn.addEventListener('click', async () => {
   const days = els.backtestDays.value;
   const intervalSeconds = els.backtestInterval.value;
@@ -1765,12 +1877,13 @@ els.backtestRunBtn.addEventListener('click', async () => {
   const resonanceMinConditions = els.backtestResonanceThreshold.value;
   const symbol = els.backtestSymbol.value;
   const bucketSize = els.backtestBucketSize.value;
+  const paramOverrides = buildBacktestParamOverrides();
   els.backtestRunBtn.disabled = true;
   els.backtestRunBtn.textContent = '回測中...';
   els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
 
   try{
-    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}`);
+    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}${paramOverrides ? '&' + paramOverrides : ''}`);
     if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
     const data = await res.json();
 

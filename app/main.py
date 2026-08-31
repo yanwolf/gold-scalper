@@ -435,6 +435,12 @@ async def backtest_run(
     trail_trigger_points: Optional[float] = None,
     trail_distance_points: Optional[float] = None,
     reversal_confirm_count: Optional[int] = None,
+    use_atr: Optional[bool] = None,
+    atr_sl_multiplier: Optional[float] = None,
+    atr_trigger_multiplier: Optional[float] = None,
+    atr_trail_multiplier: Optional[float] = None,
+    use_chop_filter: Optional[bool] = None,
+    chop_threshold: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
 ):
@@ -449,8 +455,17 @@ async def backtest_run(
     放大(例如BTC可以試50~100)。這個參數只影響回測，不影響即時模擬單。
     這是on-demand計算，天數越多、跑的時間越久(纏論分析在大量K棒上會變慢)。
 
-    sl_points等四個風控參數沒有明確指定的話，會自動使用目前dashboard設定面板
-    生效中的參數(跟即時模擬單一致)，不用每次呼叫都重複帶入。
+    sl_points等這些交易參數沒有明確指定的話，會自動退回使用目前dashboard
+    設定面板生效中的參數(跟即時模擬單一致)。**但dashboard的回測面板現在
+    會把所有這些參數當作獨立輸入欄位讓使用者直接填**，不用先去「策略參數
+    設定」把正式設定改掉才能測試不同組合——這是刻意的設計：如果使用者
+    只是想「試試看回測結果」，不該被迫先動到正式設定(那會觸發
+    settings_changed_at更新，讓即時模擬單的績效統計排除舊交易、變成
+    「又要重新開始累積」，這是使用者實際遇到的困擾，回測本身從來不會
+    寫入設定，只是介面沒有提供獨立輸入欄位，逼得使用者繞去改正式設定
+    才能測試，修正記錄見README)。真的想要「正式套用」某組參數到即時
+    模擬單時，再自己去策略參數設定手動填入、儲存，那個動作才會(也應該)
+    觸發settings_changed_at。
 
     strategy_type不指定時預設"chan_profile"(即時模擬單目前使用的策略)，可以
     指定"resonance_fvg"測試多條件共振+FVG這套實驗性策略——這是目前唯一能
@@ -478,6 +493,12 @@ async def backtest_run(
         trail_trigger_points=trail_trigger_points,
         trail_distance_points=trail_distance_points,
         reversal_confirm_count=reversal_confirm_count,
+        use_atr=use_atr,
+        atr_sl_multiplier=atr_sl_multiplier,
+        atr_trigger_multiplier=atr_trigger_multiplier,
+        atr_trail_multiplier=atr_trail_multiplier,
+        use_chop_filter=use_chop_filter,
+        chop_threshold=chop_threshold,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
     )
