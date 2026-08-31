@@ -1910,3 +1910,39 @@ sl_points等)，組成`baseline_overrides`往下傳。Dashboard的「參數掃�
 正確依照覆寫後的模式去決定要測固定點數候選、不測ATR倍數候選(避免
 模式判斷用錯基準、白測一堆無意義的組合)；(4)`/backtest/sweep`API端到端
 測試確認正確接收覆寫參數、job結果裡的對照組確實使用指定的基準值。
+
+## 新增：滑價資料持久化 + 按時段統計分析
+
+**問題**：使用者觀察到多筆Telegram通知顯示不小的滑點(+12.55、+4.25、
++4.85points)，懷疑跟特定時段有關，想要有統計數據佐證，而不是靠肉眼
+從Telegram訊息裡一則一則回頭找、憑印象猜。但原本這些滑價/價差數字只是
+「曇花一現」顯示在Telegram通知和伺服器log裡，從來沒有真正存進資料庫，
+沒辦法回頭做任何統計分析。
+
+**修正**：`paper_trades`表新增8個欄位——開倉/平倉各自獨立的
+`{entry,exit}_expected_price`(依決策當下ask/bid算出的預期成交價)、
+`{entry,exit}_actual_price`(幣安實際成交價)、`{entry,exit}_slippage_points`
+(真正執行滑點)、`{entry,exit}_spread_points`(決策當下的買賣價差)，純模擬
+或沒有真實下單的交易這幾欄會是NULL，不影響任何既有查詢。
+
+新增`db.update_paper_trade_entry_execution()`/`update_paper_trade_exit_execution()`：
+因為滑價資料是在下單「送出之後」才算得出來，這時候該筆交易紀錄早已經
+insert(開倉)或即將close(平倉)，沒辦法一次到位塞進原本的INSERT/UPDATE，
+改用獨立的小型UPDATE在算完滑價資料後補寫回去。`paper_trading.py`的
+`_open_position()`/`_close_position()`算出`quality`後，會呼叫對應的
+update函式把資料存下來。
+
+新增`db.get_slippage_stats_by_hour()`：按小時(UTC)分組統計，開倉/平倉
+分開算(進出場當下的市況不一定相關，混在一起看會模糊掉規律)，回傳每個
+小時的樣本數、平均滑點、最大絕對值滑點、平均價差。新增API endpoint
+`/paper-trading/slippage-by-hour`，Dashboard新增「滑價時段分析」面板，
+可以選引擎、按小時查看統計表格，平均滑點超過1point的小時會用紅色標示，
+方便一眼看出哪個時段特別容易出現大滑點。
+
+已用測試驗證：(1)開倉/平倉的執行品質資料正確傳給對應的DB更新函式，
+數值(expected_fill_price、actual_fill_price、slippage_points、spread)
+都正確無誤；(2)API endpoint正確回傳按小時分組的統計結果。
+
+**使用方式**：累積一段時間的真實下單資料後(需要有真實下單發生過，純
+模擬不會產生這些資料)，去dashboard「滑價時段分析」面板查詢，就能用
+數據驗證「是不是某些時段特別容易滑價」，而不是憑印象猜。

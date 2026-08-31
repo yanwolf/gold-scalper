@@ -277,6 +277,15 @@ class PaperTradingEngine:
                                 f"，當下價差{quality['spread']:.2f}points"
                             )
                             logger.info(f"開倉滑點({self.label}): {slippage_note}")
+                            # 把這筆的執行品質資料補寫回資料庫(insert當下還沒有這些
+                            # 資料，因為要先真的送出下單、拿到成交價才能算出來)，
+                            # 之後才能回頭做「哪個時段特別容易滑價」的統計分析，不然
+                            # 這些數字原本只是曇花一現顯示在Telegram通知裡，沒有真正
+                            # 留存(修正記錄見README)
+                            db.update_paper_trade_entry_execution(
+                                position.get("id"), quality["expected_fill_price"], actual_fill_price,
+                                quality["slippage_points"], quality["spread"],
+                            )
                         else:
                             # 不要靜默略過——明確講出是「成交價拿不到」還是「盤口
                             # bid/ask拿不到」，不然使用者只會看到完全沒有滑價資訊，
@@ -356,6 +365,10 @@ class PaperTradingEngine:
                             f"，當下價差{quality['spread']:.2f}points"
                         )
                         logger.info(f"平倉滑點({self.label}): {slippage_note}")
+                        db.update_paper_trade_exit_execution(
+                            position.get("id"), quality["expected_fill_price"], actual_fill_price,
+                            quality["slippage_points"], quality["spread"],
+                        )
                     else:
                         if not actual_fill_price:
                             slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"

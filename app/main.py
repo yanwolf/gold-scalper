@@ -424,6 +424,21 @@ async def paper_trading_summary(limit: int = 50, engine_id: str = "chan_profile_
     return engine.get_summary(limit=limit)
 
 
+@app.get("/paper-trading/slippage-by-hour")
+async def paper_trading_slippage_by_hour(engine_id: str = "chan_profile_300"):
+    """
+    按小時(UTC)分組統計真實下單的滑價/價差資料，用來找出「哪個時段特別
+    容易滑價」這種規律——原本這些數字只是曇花一現顯示在Telegram通知裡，
+    使用者實際觀察到某幾筆單滑點特別大、懷疑跟時段有關，這支endpoint
+    讓他能用資料驗證，不用肉眼從Telegram訊息裡一則一則回頭找、憑印象猜
+    (修正記錄見README)。
+
+    只統計「有真實下單過」的交易，純模擬的交易不會有滑價資料、不會被
+    納入統計。開倉/平倉滑點分開統計，因為進場和出場當下的市況不一定相關。
+    """
+    return db.get_slippage_stats_by_hour(engine_id=engine_id)
+
+
 @app.get("/backtest/run")
 async def backtest_run(
     days: int = 2,

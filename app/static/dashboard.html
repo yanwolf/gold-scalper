@@ -776,6 +776,27 @@
 </div>
 
 <div class="panel">
+  <div class="section-title" style="margin-top:0;">滑價時段分析</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
+    按小時(UTC)統計真實下單的滑價/價差資料，用來看哪個時段特別容易出現
+    大滑點——只統計有真實下單過的交易，純模擬的訊號不會算在裡面。開倉/
+    平倉分開統計，因為進場和出場當下的市況不一定相關。
+  </div>
+
+  <div class="controls" style="margin-bottom:12px;">
+    <select id="slippageStatsEngine">
+      <option value="chan_profile_60">1分K(纏論)</option>
+      <option value="chan_profile_300">5分K(纏論)</option>
+      <option value="chan_profile_900" selected>15分K(纏論)</option>
+      <option value="resonance_fvg_60">1分K(共振)</option>
+    </select>
+    <button id="slippageStatsBtn" class="btn-secondary">查詢</button>
+  </div>
+
+  <div id="slippageStatsResult"></div>
+</div>
+
+<div class="panel">
   <div class="section-title" style="margin-top:0;">幣安下單測試（測試網）</div>
   <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
     手動驗證下單流程能不能跑通，跟即時模擬單真實下單用同一套邏輯，會計算
@@ -940,6 +961,9 @@ const els = {
   qtyCalcTargetPnl: document.getElementById('qtyCalcTargetPnl'),
   qtyCalcBtn: document.getElementById('qtyCalcBtn'),
   qtyCalcResult: document.getElementById('qtyCalcResult'),
+  slippageStatsEngine: document.getElementById('slippageStatsEngine'),
+  slippageStatsBtn: document.getElementById('slippageStatsBtn'),
+  slippageStatsResult: document.getElementById('slippageStatsResult'),
   sweepInterval: document.getElementById('sweepInterval'),
   sweepDays: document.getElementById('sweepDays'),
   sweepStartBtn: document.getElementById('sweepStartBtn'),
@@ -1569,6 +1593,46 @@ els.qtyCalcBtn.addEventListener('click', async () => {
     showQtyCalcResult(`試算失敗：${err.message}`, true);
   }
   els.qtyCalcBtn.disabled = false;
+});
+
+// --- 滑價時段分析 ---
+
+function renderSlippageHourTable(rows, title){
+  if(!rows || rows.length === 0){
+    return `<div style="font-size:12px; color:var(--muted); margin-bottom:14px;">${title}：目前沒有真實下單的滑價資料</div>`;
+  }
+  const lines = rows.map(r =>
+    `<div class="cfg-row">
+      <span class="cfg-label">${String(r.hour_utc).padStart(2,'0')}:00 UTC (${r.count}筆)</span>
+      <span class="cfg-value ${r.avg_slippage > 1 ? '' : 'on'}" style="${r.avg_slippage > 1 ? 'color:var(--resistance);' : ''}">
+        平均滑點 ${r.avg_slippage >= 0 ? '+' : ''}${r.avg_slippage}pt / 最大 ${r.max_abs_slippage}pt / 均價差 ${r.avg_spread}pt
+      </span>
+    </div>`
+  ).join('');
+  return `<div style="margin-bottom:16px;"><div class="cfg-title">${title}</div>${lines}</div>`;
+}
+
+els.slippageStatsBtn.addEventListener('click', async () => {
+  const engineId = els.slippageStatsEngine.value;
+  els.slippageStatsBtn.disabled = true;
+  els.slippageStatsResult.innerHTML = '<div class="loading-spinner">查詢中...</div>';
+  try{
+    const res = await fetch(`/paper-trading/slippage-by-hour?engine_id=${engineId}`);
+    const data = await res.json();
+    els.slippageStatsResult.innerHTML = `
+      <div class="active-config-card">
+        ${renderSlippageHourTable(data.entry, '開倉滑價(依進場時間分組)')}
+        ${renderSlippageHourTable(data.exit, '平倉滑價(依出場時間分組)')}
+      </div>
+      <div style="font-size:11px; color:var(--muted); margin-top:8px;">
+        時間是UTC，台灣時間要+8小時對照。紅色代表該小時平均滑點超過1point，
+        可以參考看看是不是特定時段(例如低流動性的亞洲深夜時段)特別容易出現大滑點。
+      </div>
+    `;
+  }catch(err){
+    els.slippageStatsResult.innerHTML = `<div class="error">查詢失敗：${err.message}</div>`;
+  }
+  els.slippageStatsBtn.disabled = false;
 });
 
 fetchExecutionStatus();
