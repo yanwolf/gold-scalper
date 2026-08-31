@@ -660,7 +660,9 @@
   <div style="font-size:11.5px; color:var(--muted); margin-bottom:12px; line-height:1.6;">
     一次改一個風控參數(其他維持目前設定)，跑約10組回測，自動比較哪個方向、
     哪個數值表現比較好，不用手動一個一個試。全部跑完約需1-2分鐘，可以離開
-    這頁再回來看，結果會保留。
+    這頁再回來看，結果會保留。<b>會沿用上方「歷史回測」面板「回測交易參數」
+    區塊裡填的值當基準</b>(留空則用正式設定當基準)，兩邊共用同一組欄位，
+    不用重複填、也不會寫入正式設定、不影響即時模擬單。
   </div>
 
   <div class="controls">
@@ -2151,12 +2153,16 @@ async function pollSweep(jobId){
 els.sweepStartBtn.addEventListener('click', async () => {
   const days = els.sweepDays.value;
   const intervalSeconds = els.sweepInterval.value;
+  // 重用回測面板同一組「回測交易參數(獨立於正式設定)」欄位當掃描基準——
+  // 兩邊共用同一組輸入欄位，不用重複填兩次，也不會意外只有其中一邊套用到
+  // 使用者指定的基準值(修正記錄見README)
+  const paramOverrides = buildBacktestParamOverrides();
   els.sweepStartBtn.disabled = true;
   els.sweepStartBtn.textContent = '掃描中...';
   els.sweepResult.innerHTML = '<div class="loading-spinner">正在啟動掃描...</div>';
 
   try{
-    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}`, { method: 'POST' });
+    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}${paramOverrides ? '&' + paramOverrides : ''}`, { method: 'POST' });
     if(!res.ok) throw new Error(`啟動失敗 (${res.status})`);
     const data = await res.json();
 

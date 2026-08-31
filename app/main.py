@@ -505,7 +505,20 @@ async def backtest_run(
 
 
 @app.post("/backtest/sweep")
-async def backtest_sweep_start(days: int = 2, interval_seconds: int = 300):
+async def backtest_sweep_start(
+    days: int = 2,
+    interval_seconds: int = 300,
+    use_atr: Optional[bool] = None,
+    atr_sl_multiplier: Optional[float] = None,
+    atr_trigger_multiplier: Optional[float] = None,
+    atr_trail_multiplier: Optional[float] = None,
+    sl_points: Optional[float] = None,
+    trail_trigger_points: Optional[float] = None,
+    trail_distance_points: Optional[float] = None,
+    reversal_confirm_count: Optional[int] = None,
+    use_chop_filter: Optional[bool] = None,
+    chop_threshold: Optional[float] = None,
+):
     """
     參數掃描：對模擬單風控參數做「一次改一個參數」的敏感度測試，一次跑多組回測，
     自動比較哪個參數方向、哪個數值表現比較好，不用手動一個一個試。
@@ -517,8 +530,36 @@ async def backtest_sweep_start(days: int = 2, interval_seconds: int = 300):
     天數預設用2天(單組回測較快)，掃描本身會跑約10組回測，全部跑完可能要
     1-2分鐘，請求發起後用輪詢確認進度，不要每次都拉長天數，跑更多天在
     掃描情境下時間會乘以組數，容易太久。
+
+    use_atr等這些參數不指定的話，掃描一律用「目前正式設定」當基準(對照組)，
+    這是原本的行為。指定的話，會疊加在正式設定上面組成真正要用的基準，
+    不用被迫先去改動正式設定才能用某組假設參數當基準做敏感度分析——跟單次
+    回測面板的「回測交易參數(獨立於正式設定)」是同一組欄位、同一個概念，
+    不會寫入正式設定、不會影響即時模擬單(修正記錄見README)。
     """
-    job_id = sweep_module.start_sweep(days=days, interval_seconds=interval_seconds)
+    baseline_overrides = {}
+    if use_atr is not None:
+        baseline_overrides["paper_use_atr_stops"] = 1 if use_atr else 0
+    if atr_sl_multiplier is not None:
+        baseline_overrides["paper_atr_sl_multiplier"] = atr_sl_multiplier
+    if atr_trigger_multiplier is not None:
+        baseline_overrides["paper_atr_trigger_multiplier"] = atr_trigger_multiplier
+    if atr_trail_multiplier is not None:
+        baseline_overrides["paper_atr_trail_multiplier"] = atr_trail_multiplier
+    if sl_points is not None:
+        baseline_overrides["paper_sl_points"] = sl_points
+    if trail_trigger_points is not None:
+        baseline_overrides["paper_trail_trigger_points"] = trail_trigger_points
+    if trail_distance_points is not None:
+        baseline_overrides["paper_trail_distance_points"] = trail_distance_points
+    if reversal_confirm_count is not None:
+        baseline_overrides["paper_reversal_confirm_count"] = reversal_confirm_count
+    if use_chop_filter is not None:
+        baseline_overrides["paper_use_chop_filter"] = 1 if use_chop_filter else 0
+    if chop_threshold is not None:
+        baseline_overrides["paper_chop_threshold"] = chop_threshold
+
+    job_id = sweep_module.start_sweep(days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None)
     return {"job_id": job_id}
 
 

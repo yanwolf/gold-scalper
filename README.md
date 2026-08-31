@@ -1886,3 +1886,27 @@ bid=None, ask=None)`，向後相容(不傳就不做這項檢查)，新增的擋�
 `settings_changed_at`前後完全一致，證實回測不會寫入/影響正式設定；
 (2)API endpoint正確接收並套用所有新增的覆寫參數(`use_atr=False`、
 `sl_points=15.0`等自訂值都正確反映在回測結果裡)。
+
+## 修正記錄：參數掃描原本沒接上「回測交易參數」獨立欄位
+
+**使用者問**：參數掃描是不是也讀取回測面板那組獨立參數欄位去掃描？
+**答案原本是否定的**——查證後發現`/backtest/sweep`API當時只接受`days`
+跟`interval_seconds`兩個參數，完全沒有管道傳入use_atr/sl_points等覆寫
+值，`sweep.py`的`_build_combos()`固定寫死讀取`settings_module.get_settings()`
+(正式設定)當基準，跟剛新增的回測面板獨立欄位是兩條完全沒有交集的路徑。
+
+**修正**：`sweep.py`的`_build_combos()`新增`baseline_overrides`參數，
+可以疊加在正式設定上面組成真正要用的基準，不提供時完全比照原本行為
+(用正式設定當baseline)。`start_sweep()`同步擴充支援這個參數。
+`/backtest/sweep`API新增跟`/backtest/run`同一組覆寫參數(use_atr、
+sl_points等)，組成`baseline_overrides`往下傳。Dashboard的「參數掃描」
+面板現在會**沿用「歷史回測」面板同一組「回測交易參數」欄位**當基準，
+兩邊共用同一份輸入、不用重複填，也都不會寫入正式設定、不影響即時模擬單。
+
+已用完整情境測試驗證：(1)不指定覆寫時，baseline完全等於正式設定(向後
+相容)；(2)指定覆寫值(例如sl_points=99)時，baseline正確疊加該值，且
+`settings_changed_at`完全沒有被觸發，證實不會寫入正式設定；(3)**關鍵
+測試**：baseline被覆寫成固定點數模式(`paper_use_atr_stops=0`)時，掃描
+正確依照覆寫後的模式去決定要測固定點數候選、不測ATR倍數候選(避免
+模式判斷用錯基準、白測一堆無意義的組合)；(4)`/backtest/sweep`API端到端
+測試確認正確接收覆寫參數、job結果裡的對照組確實使用指定的基準值。

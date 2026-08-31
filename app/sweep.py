@@ -62,9 +62,17 @@ _jobs = {}
 _jobs_lock = threading.Lock()
 
 
-def _build_combos():
+def _build_combos(baseline_overrides=None):
     """
-    baseline(目前生效中的設定)當對照組，其他每組都是「改一個參數」的變化版本。
+    baseline(目前生效中的設定，或使用者指定的覆寫參數疊加上去之後的結果)當
+    對照組，其他每組都是「改一個參數」的變化版本。
+
+    baseline_overrides：使用者可以指定一組覆寫值，疊加在正式設定上面組成
+    真正要用的baseline，不需要真的去改「策略參數設定」那邊的正式設定——
+    跟單次回測面板的「回測交易參數(獨立於正式設定)」是同一個概念，讓使用者
+    想用某組假設參數當基準做敏感度分析時，不用被迫先去改動正式設定
+    (那樣會導致即時模擬單的績效統計排除舊交易，修正記錄見README)。
+    不提供的話(None)完全比照原本行為，直接用正式設定當baseline。
 
     重要：只測「在目前模式下真的會影響結果」的參數——如果baseline目前是ATR
     動態模式，就測ATR的三個倍數，不測固定點數(因為固定點數模式關閉時完全不會
@@ -75,8 +83,13 @@ def _build_combos():
     另外固定加兩組「切換開關」的對照(ATR動態停損、震盪濾網)，方便直接比較
     開啟/關閉哪個表現比較好。
     """
-    baseline = settings_module.get_settings()
-    combos = [{"label": "目前設定(對照組)", "params": dict(baseline)}]
+    baseline = dict(settings_module.get_settings())
+    if baseline_overrides:
+        for key, value in baseline_overrides.items():
+            if value is not None and key in baseline:
+                baseline[key] = value
+
+    combos = [{"label": "目前設定(對照組)" if not baseline_overrides else "指定基準(對照組)", "params": dict(baseline)}]
 
     mode_specific_candidates = (
         ATR_MODE_PARAM_CANDIDATES if baseline["paper_use_atr_stops"] else FIXED_MODE_PARAM_CANDIDATES
@@ -109,10 +122,10 @@ def _build_combos():
     return combos
 
 
-def start_sweep(days=2, interval_seconds=60):
+def start_sweep(days=2, interval_seconds=60, baseline_overrides=None):
     """啟動一次掃描，立刻回傳job_id，實際運算在背景執行緒進行。"""
     job_id = str(uuid.uuid4())[:8]
-    combos = _build_combos()
+    combos = _build_combos(baseline_overrides=baseline_overrides)
 
     job = {
         "id": job_id,
