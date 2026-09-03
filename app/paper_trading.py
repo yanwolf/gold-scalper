@@ -78,6 +78,18 @@ class PaperTradingEngine:
     def last_tick_at(self):
         return self._last_tick_at
 
+    def _is_execution_engine(self, s):
+        """
+        這個引擎目前是不是被綁定真實下單。支援兩個槽位(execution_engine_index /
+        execution_engine_index_2)，讓兩個引擎能同時真實下單——用途是加快累積滑價
+        統計資料(例如15分K跟1分K同時跑)。前提是兩個引擎各自綁不同的幣安帳戶
+        (execution_account)，同一個帳戶被兩個引擎同時下單會發生部位互相抵銷
+        (修正記錄見README)。
+        """
+        if self.execution_index is None:
+            return False
+        return self.execution_index in (s.get("execution_engine_index"), s.get("execution_engine_index_2"))
+
     def start(self):
         if not self._seeded_from_db:
             with self._lock:
@@ -210,7 +222,7 @@ class PaperTradingEngine:
         bid, ask = signal_result.get("bid"), signal_result.get("ask")
 
         s = settings_module.get_settings()
-        is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
+        is_execution_engine = self._is_execution_engine(s)
 
         if is_execution_engine:
             quantity = s["execution_quantity"]
@@ -342,7 +354,7 @@ class PaperTradingEngine:
         # 平倉方向要反過來：多單出場是賣出(市價賣單成交在買一bid)，空單出場
         # 是買回(市價買單成交在賣一ask)——跟開倉時的方向剛好相反(修正記錄見README)
         s = settings_module.get_settings()
-        is_execution_engine = self.execution_index is not None and s["execution_engine_index"] == self.execution_index
+        is_execution_engine = self._is_execution_engine(s)
 
         if is_execution_engine:
             try:
@@ -445,7 +457,7 @@ class PaperTradingEngine:
             position = self._position
 
         circuit_breaker = None
-        if self.execution_index is not None and s["execution_engine_index"] == self.execution_index:
+        if self._is_execution_engine(s):
             circuit_breaker = risk_guard.status(self, s["execution_quantity"])
 
         return {
@@ -472,7 +484,14 @@ class PaperTradingEngine:
 # interval_seconds——因為現在1分K纏論跟1分K共振都是60秒週期，光用interval_seconds
 # 已經無法唯一區分，會互相打架(修正記錄見README)。
 # health_monitor.py是直接遍歷這個字典做心跳監控，新增引擎不用改健康監控邏輯。
-paper_trading_1m = PaperTradingEngine(interval_seconds=60, label="1分K", strategy_type="chan_profile", execution_index=1)
+# 1分K纏論引擎綁定獨立的幣安帳戶「gold_1m」(讀BINANCE_API_KEY_GOLD_1M / BINANCE_API_SECRET_GOLD_1M)，
+# 讓它能跟15分K(帳戶gold)同時真實下單而不互相干擾——用途是加快累積滑價統計資料。
+# execution_symbol要明確給，因為execution.py的symbol預設值只會為預設帳戶"gold"自動補
+# DEFAULT_SYMBOL，其他帳戶名稱不會自動補(那是為未來BTC帳戶預留的設計)(修正記錄見README)。
+paper_trading_1m = PaperTradingEngine(
+    interval_seconds=60, label="1分K", strategy_type="chan_profile", execution_index=1,
+    execution_account="gold_1m", execution_symbol=execution_module.DEFAULT_SYMBOL,
+)
 paper_trading_5m = PaperTradingEngine(interval_seconds=300, label="5分K", strategy_type="chan_profile", execution_index=2)
 paper_trading_15m = PaperTradingEngine(interval_seconds=900, label="15分K", strategy_type="chan_profile", execution_index=3)
 # resonance_min_conditions=3：使用者用真實歷史資料回測後，4/4門檻樣本數太少(25筆)、

@@ -475,8 +475,8 @@
   <div class="controls" style="margin-bottom:14px;">
     <select id="chanInterval">
       <option value="60">1分鐘K線</option>
-      <option value="300" selected>5分鐘K線</option>
-      <option value="900">15分鐘K線</option>
+      <option value="300">5分鐘K線</option>
+      <option value="900" selected>15分鐘K線</option>
     </select>
   </div>
 
@@ -491,8 +491,8 @@
   <div class="controls" style="margin-bottom:12px;">
     <select id="paperInterval">
       <option value="chan_profile_60">1分K追蹤(纏論)</option>
-      <option value="chan_profile_300" selected>5分K追蹤(纏論)</option>
-      <option value="chan_profile_900">15分K追蹤(纏論)</option>
+      <option value="chan_profile_300">5分K追蹤(纏論)</option>
+      <option value="chan_profile_900" selected>15分K追蹤(纏論)</option>
       <option value="resonance_fvg_60">1分K追蹤(多條件共振，實驗性)</option>
     </select>
   </div>
@@ -534,8 +534,8 @@
   <div class="controls">
     <select id="backtestInterval">
       <option value="60">1分K</option>
-      <option value="300" selected>5分K</option>
-      <option value="900">15分K</option>
+      <option value="300">5分K</option>
+      <option value="900" selected>15分K</option>
     </select>
     <select id="backtestDays">
       <option value="1">回測 1 天</option>
@@ -668,8 +668,8 @@
   <div class="controls">
     <select id="sweepInterval">
       <option value="60">1分K</option>
-      <option value="300" selected>5分K</option>
-      <option value="900">15分K</option>
+      <option value="300">5分K</option>
+      <option value="900" selected>15分K</option>
     </select>
     <select id="sweepDays">
       <option value="1">用 1 天資料</option>
@@ -814,6 +814,13 @@
   </div>
 
   <div class="settings-field">
+    <label>測試用帳戶</label>
+    <select id="executionAccount">
+      <option value="gold" selected>gold (15分K/5分K用，BINANCE_API_KEY)</option>
+      <option value="gold_1m">gold_1m (1分K用，BINANCE_API_KEY_GOLD_1M)</option>
+    </select>
+  </div>
+  <div class="settings-field">
     <label>槓桿倍數</label>
     <input type="number" id="executionLeverage" value="10" step="1" min="1" />
   </div>
@@ -947,6 +954,7 @@ const els = {
   executionPositionBtn: document.getElementById('executionPositionBtn'),
   executionDirection: document.getElementById('executionDirection'),
   executionQuantity: document.getElementById('executionQuantity'),
+  executionAccount: document.getElementById('executionAccount'),
   executionLeverage: document.getElementById('executionLeverage'),
   executionLeverageBtn: document.getElementById('executionLeverageBtn'),
   executionOpenBtn: document.getElementById('executionOpenBtn'),
@@ -1366,14 +1374,16 @@ setInterval(refreshNotifyStatus, 30000);
 
 async function fetchExecutionStatus(){
   try{
-    const res = await fetch('/execution/status');
+    const res = await fetch(`/execution/status?account=${els.executionAccount.value}`);
     const data = await res.json();
+    const acct = data.account || els.executionAccount.value;
     if(!data.enabled){
-      els.executionStatusLine.innerHTML = '<span style="color:var(--muted);">尚未設定 BINANCE_API_KEY / BINANCE_API_SECRET</span>';
+      const envHint = acct === 'gold' ? 'BINANCE_API_KEY / BINANCE_API_SECRET' : `BINANCE_API_KEY_${acct.toUpperCase()} / BINANCE_API_SECRET_${acct.toUpperCase()}`;
+      els.executionStatusLine.innerHTML = `<span style="color:var(--muted);">帳戶「${acct}」尚未設定 ${envHint}</span>`;
     }else if(data.testnet){
-      els.executionStatusLine.innerHTML = '🟢 已啟用，目前打的是<b style="color:var(--gold);">測試網</b>（安全，不涉及真錢）';
+      els.executionStatusLine.innerHTML = `🟢 帳戶「${acct}」已啟用，目前打的是<b style="color:var(--gold);">測試網</b>（安全，不涉及真錢）`;
     }else{
-      els.executionStatusLine.innerHTML = '🔴 已啟用，目前打的是<b style="color:var(--resistance);">正式環境</b>（會動用真錢，請務必確認這是你要的）';
+      els.executionStatusLine.innerHTML = `🔴 帳戶「${acct}」已啟用，目前打的是<b style="color:var(--resistance);">正式環境</b>（會動用真錢，請務必確認這是你要的）`;
     }
   }catch(err){
     els.executionStatusLine.innerHTML = `<span class="error">狀態查詢失敗：${err.message}</span>`;
@@ -1398,7 +1408,7 @@ els.executionAccountBtn.addEventListener('click', async () => {
   els.executionAccountBtn.disabled = true;
   showExecutionResult('查詢中...', false);
   try{
-    const res = await fetch(`/execution/account?password=${encodeURIComponent(pwd)}`);
+    const res = await fetch(`/execution/account?password=${encodeURIComponent(pwd)}&account=${els.executionAccount.value}`);
     const data = await res.json();
     if(data.success){
       showExecutionResult(JSON.stringify(data.data, null, 2), false);
@@ -1417,7 +1427,7 @@ els.executionPositionBtn.addEventListener('click', async () => {
   els.executionPositionBtn.disabled = true;
   showExecutionResult('查詢中...', false);
   try{
-    const res = await fetch(`/execution/position?password=${encodeURIComponent(pwd)}`);
+    const res = await fetch(`/execution/position?password=${encodeURIComponent(pwd)}&account=${els.executionAccount.value}`);
     const data = await res.json();
     if(data.success){
       const positions = (data.data || []).filter(p => parseFloat(p.positionAmt) !== 0);
@@ -1456,6 +1466,7 @@ els.executionOpenBtn.addEventListener('click', async () => {
         password: pwd,
         direction: els.executionDirection.value,
         quantity: parseFloat(els.executionQuantity.value),
+        account: els.executionAccount.value,
       }),
     });
     const data = await res.json();
@@ -1487,7 +1498,7 @@ els.executionCloseBtn.addEventListener('click', async () => {
     const res = await fetch('/execution/test-close', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwd, direction: els.executionDirection.value }),
+      body: JSON.stringify({ password: pwd, direction: els.executionDirection.value, account: els.executionAccount.value }),
     });
     const data = await res.json();
     if(data.success){
@@ -1510,7 +1521,7 @@ els.executionLeverageBtn.addEventListener('click', async () => {
     const res = await fetch('/execution/set-leverage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwd, leverage: parseInt(els.executionLeverage.value) }),
+      body: JSON.stringify({ password: pwd, leverage: parseInt(els.executionLeverage.value), account: els.executionAccount.value }),
     });
     const data = await res.json();
     if(data.success){
@@ -1701,6 +1712,7 @@ els.slippageStatsBtn.addEventListener('click', async () => {
 
 fetchExecutionStatus();
 setInterval(fetchExecutionStatus, 30000);
+els.executionAccount.addEventListener('change', fetchExecutionStatus);
 
 // --- 系統健康告警橫幅 ---
 
@@ -2093,7 +2105,7 @@ const SETTINGS_GROUPS = [
   { title: '停損模式', keys: ['paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold'] },
-  { title: '真實下單', keys: ['execution_engine_index', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
+  { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },
 ];

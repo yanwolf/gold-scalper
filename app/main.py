@@ -406,7 +406,7 @@ async def execution_test_close(payload: dict = Body(...)):
 
 
 @app.get("/paper-trading/summary")
-async def paper_trading_summary(limit: int = 50, engine_id: str = "chan_profile_300"):
+async def paper_trading_summary(limit: int = 50, engine_id: str = "chan_profile_900"):
     """
     模擬單績效摘要：總筆數、勝率、總損益(points)、獲利因子、最大回撤、
     目前開倉狀態、最近N筆紀錄、以及對照「達標門檻」的評估結果。

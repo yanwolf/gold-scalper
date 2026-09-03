@@ -1974,3 +1974,41 @@ exit_time篩，回傳完整脈絡(精確時間、方向、進場理由、預期�
 
 已用測試驗證：DB函式在無資料庫/非法side時安全回傳空清單；API正確拒絕
 非法參數(side不是entry/exit、hour超出0~23)，正常查詢正確回傳個別交易資料。
+
+## 新增：第二個真實下單槽位 + 1分K綁獨立帳戶 + 預設顯示改15分K
+
+**背景**：使用者要用15分K當主要顯示頁面，並多接一個1分K做真實下單(用一組
+獨立申請的Demo API)，目的是增加交易次數、加快累積滑價統計資料。
+
+**架構限制**：原本`execution_engine_index`是單一整數，同一時間只能綁一個
+引擎真實下單(這是刻意的互斥設計，避免多引擎共用同一帳戶造成部位抵銷)。
+要讓兩個引擎同時真實下單，前提是各用不同的幣安帳戶——這正是先前預留的
+多帳戶架構(`execution.py`的`account`參數 / `PaperTradingEngine.execution_account`)
+派上用場的時候。
+
+**修正**：
+- `settings.py`新增`execution_engine_index_2`(真實下單引擎B，0=不綁)。
+- `paper_trading.py`新增`_is_execution_engine(s)`共用方法，同時檢查兩個
+  槽位；原本三處各自比對`execution_engine_index`的地方統一改呼叫它。
+- 1分K纏論引擎(`paper_trading_1m`)綁定`execution_account="gold_1m"`(讀
+  `BINANCE_API_KEY_GOLD_1M`/`BINANCE_API_SECRET_GOLD_1M`)，並**明確傳入
+  `execution_symbol=DEFAULT_SYMBOL`**——因為`execution.py`的symbol預設值只會
+  為預設帳戶`gold`自動補`DEFAULT_SYMBOL`，其他帳戶名稱不會自動補(那是為
+  未來BTC帳戶預留的設計)，不明確給的話1分K下單會因為「沒有指定symbol」失敗。
+- Dashboard：四個週期選單(纏論分析/模擬單/回測/掃描)預設改15分K，
+  `/paper-trading/summary`預設engine_id改`chan_profile_900`；「幣安下單
+  測試」面板新增帳戶選擇器(gold / gold_1m)，六個測試呼叫都帶`account`，
+  狀態列顯示帳戶名稱與對應的環境變數名稱，方便驗證新金鑰接得對不對。
+
+**啟用步驟**：Zeabur設定`BINANCE_API_KEY_GOLD_1M`/`BINANCE_API_SECRET_GOLD_1M`
+→ 部署 → 「幣安下單測試」選gold_1m確認狀態列顯示已啟用、查餘額成功 →
+「設定」把「真實下單引擎A」=3(15分K)、「真實下單引擎B」=1(1分K)。
+
+**注意**：`execution_quantity`/`execution_leverage`/`execution_margin_type`
+及風控門檻是共用設定，兩個引擎會用同一組口數與槓桿；風控斷路器(每日/
+連續虧損)則是各引擎依自己的交易歷史獨立計算，不會互相影響。
+
+已測試驗證：1分K綁gold_1m且symbol明確、其他引擎綁gold、兩組金鑰各自正確
+讀取；三個引擎同時觸發訊號時，15分K→gold、1分K→gold_1m各自真實下單並各自
+通知，未綁的5分K純模擬；兩槽位都設0時沒有任何真實下單(向後相容)；風控
+斷路器狀態對兩個綁定引擎各自顯示。
