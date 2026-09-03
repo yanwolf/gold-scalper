@@ -1597,19 +1597,53 @@ els.qtyCalcBtn.addEventListener('click', async () => {
 
 // --- 滑價時段分析 ---
 
-function renderSlippageHourTable(rows, title){
+function renderSlippageHourTable(rows, title, side){
   if(!rows || rows.length === 0){
     return `<div style="font-size:12px; color:var(--muted); margin-bottom:14px;">${title}：目前沒有真實下單的滑價資料</div>`;
   }
   const lines = rows.map(r =>
-    `<div class="cfg-row">
-      <span class="cfg-label">${String(r.hour_utc).padStart(2,'0')}:00 UTC (${r.count}筆)</span>
+    `<div class="cfg-row slippage-hour-row" data-hour="${r.hour_utc}" data-side="${side}" style="cursor:pointer;" title="點擊展開這個小時的個別交易">
+      <span class="cfg-label">▸ ${String(r.hour_utc).padStart(2,'0')}:00 UTC (${r.count}筆)</span>
       <span class="cfg-value ${r.avg_slippage > 1 ? '' : 'on'}" style="${r.avg_slippage > 1 ? 'color:var(--resistance);' : ''}">
         平均滑點 ${r.avg_slippage >= 0 ? '+' : ''}${r.avg_slippage}pt / 最大 ${r.max_abs_slippage}pt / 均價差 ${r.avg_spread}pt
       </span>
-    </div>`
+    </div>
+    <div class="slippage-hour-detail" id="slipDetail-${side}-${r.hour_utc}" style="display:none;"></div>`
   ).join('');
   return `<div style="margin-bottom:16px;"><div class="cfg-title">${title}</div>${lines}</div>`;
+}
+
+function fmtTs(iso){
+  if(!iso) return '--';
+  const d = new Date(iso);
+  const utc = d.toISOString().replace('T',' ').substring(0,19);
+  const local = d.toLocaleString('zh-TW', { hour12:false });
+  return `${utc} UTC (台灣 ${local})`;
+}
+
+function renderHourTradeDetail(trades, side){
+  if(!trades || trades.length === 0){
+    return '<div style="font-size:11px; color:var(--muted); padding:6px 0 10px 14px;">這個小時沒有個別交易資料</div>';
+  }
+  return trades.map(t => {
+    const isEntry = side === 'entry';
+    const slip = isEntry ? t.entry_slippage_points : t.exit_slippage_points;
+    const spread = isEntry ? t.entry_spread_points : t.exit_spread_points;
+    const expected = isEntry ? t.entry_expected_price : t.exit_expected_price;
+    const actual = isEntry ? t.entry_actual_price : t.exit_actual_price;
+    const focusTime = isEntry ? t.entry_time : t.exit_time;
+    const slipClass = slip > 1 ? 'style="color:var(--resistance); font-weight:700;"' : (slip < -1 ? 'style="color:var(--support); font-weight:700;"' : '');
+    const pnlClass = (t.pnl_points ?? 0) >= 0 ? 'color:var(--support);' : 'color:var(--resistance);';
+    return `
+      <div style="border-left:2px solid var(--grid); margin:6px 0 10px 8px; padding:6px 0 6px 10px; font-size:11.5px; line-height:1.7;">
+        <div><b>${isEntry ? '進場' : '出場'}時間：</b>${fmtTs(focusTime)}</div>
+        <div><b>方向：</b>${t.direction === 'bullish' ? '多單 ▲' : '空單 ▼'}</div>
+        <div><b>預期成交價：</b>${expected != null ? expected.toFixed(2) : '--'}　<b>實際成交價：</b>${actual != null ? actual.toFixed(2) : '--'}</div>
+        <div><b>真正執行滑點：</b><span ${slipClass}>${slip != null ? (slip >= 0 ? '+' : '') + slip.toFixed(2) : '--'}pt</span>　<b>當下價差：</b>${spread != null ? spread.toFixed(2) : '--'}pt</div>
+        <div><b>進場理由：</b>${t.chan_reason || '--'}</div>
+        <div><b>這筆結果：</b>${t.exit_reason || '(尚未平倉)'}　<b>損益：</b><span style="${pnlClass}">${t.pnl_points != null ? (t.pnl_points >= 0 ? '+' : '') + t.pnl_points.toFixed(2) : '--'}pt</span></div>
+      </div>`;
+  }).join('');
 }
 
 els.slippageStatsBtn.addEventListener('click', async () => {
@@ -1621,14 +1655,44 @@ els.slippageStatsBtn.addEventListener('click', async () => {
     const data = await res.json();
     els.slippageStatsResult.innerHTML = `
       <div class="active-config-card">
-        ${renderSlippageHourTable(data.entry, '開倉滑價(依進場時間分組)')}
-        ${renderSlippageHourTable(data.exit, '平倉滑價(依出場時間分組)')}
+        ${renderSlippageHourTable(data.entry, '開倉滑價(依進場時間分組)', 'entry')}
+        ${renderSlippageHourTable(data.exit, '平倉滑價(依出場時間分組)', 'exit')}
       </div>
       <div style="font-size:11px; color:var(--muted); margin-top:8px;">
-        時間是UTC，台灣時間要+8小時對照。紅色代表該小時平均滑點超過1point，
-        可以參考看看是不是特定時段(例如低流動性的亞洲深夜時段)特別容易出現大滑點。
+        時間是UTC，台灣時間要+8小時對照。紅色代表該小時平均滑點超過1point。
+        <b>點任一個小時可以展開該小時的個別交易</b>，看極端值到底發生在哪個確切時間、
+        當時是什麼訊號、最後這筆賺賠如何。
       </div>
     `;
+
+    // 綁定每個小時列的點擊事件：展開/收合該小時的個別交易，資料按需載入
+    // (只在第一次展開時打API，之後展開/收合用快取)
+    els.slippageStatsResult.querySelectorAll('.slippage-hour-row').forEach(row => {
+      row.addEventListener('click', async () => {
+        const hour = row.dataset.hour;
+        const side = row.dataset.side;
+        const detail = document.getElementById(`slipDetail-${side}-${hour}`);
+        const label = row.querySelector('.cfg-label');
+        if(detail.style.display !== 'none'){
+          detail.style.display = 'none';
+          label.textContent = label.textContent.replace('▾', '▸');
+          return;
+        }
+        label.textContent = label.textContent.replace('▸', '▾');
+        detail.style.display = '';
+        if(!detail.dataset.loaded){
+          detail.innerHTML = '<div style="font-size:11px; color:var(--muted); padding:6px 0 6px 14px;">載入中...</div>';
+          try{
+            const r = await fetch(`/paper-trading/trades-by-hour?engine_id=${engineId}&hour_utc=${hour}&side=${side}`);
+            const d = await r.json();
+            detail.innerHTML = renderHourTradeDetail(d.trades, side);
+            detail.dataset.loaded = '1';
+          }catch(err){
+            detail.innerHTML = `<div class="error" style="font-size:11px;">載入失敗：${err.message}</div>`;
+          }
+        }
+      });
+    });
   }catch(err){
     els.slippageStatsResult.innerHTML = `<div class="error">查詢失敗：${err.message}</div>`;
   }

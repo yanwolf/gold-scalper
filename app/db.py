@@ -520,6 +520,69 @@ def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, sl
         logger.error(f"更新平倉執行品質資料失敗: {e}")
 
 
+def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", limit=100):
+    """
+    撈某個UTC小時內、有真實下單滑價資料的個別交易，給「點進某個小時看個別
+    交易」的drill-down功能用——滑價時段統計只看平均/最大，看不出某個極端值
+    (例如一筆38點的滑點)到底發生在哪個確切時間、當時是什麼訊號、最後這筆
+    賺賠如何，這個函式把該小時的每一筆完整攤開，讓使用者能對照當時的市況
+    (例如是不是剛好碰到重大消息或倫敦開盤)去判斷極端值是系統性問題還是
+    單次意外(修正記錄見README)。
+
+    side="entry"依entry_time的小時篩選並回傳開倉滑價；side="exit"依exit_time
+    的小時篩選並回傳平倉滑價。兩者都會一併帶出這筆交易的完整資訊(進出場
+    價格/時間/理由/損益)，方便對照。
+    """
+    if not _enabled:
+        return []
+    if side not in ("entry", "exit"):
+        return []
+
+    time_col = "entry_time" if side == "entry" else "exit_time"
+    slip_col = "entry_slippage_points" if side == "entry" else "exit_slippage_points"
+
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, direction, entry_time, entry_price, exit_time, exit_price,
+                           exit_reason, pnl_points, chan_reason, profile_reason,
+                           entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points,
+                           exit_expected_price, exit_actual_price, exit_slippage_points, exit_spread_points
+                    FROM paper_trades
+                    WHERE engine_id = %s
+                      AND {slip_col} IS NOT NULL
+                      AND EXTRACT(HOUR FROM {time_col} AT TIME ZONE 'UTC')::int = %s
+                    ORDER BY {time_col} DESC
+                    LIMIT %s;
+                    """,
+                    (engine_id, hour_utc, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+
+        return [
+            {
+                "id": r[0], "direction": r[1],
+                "entry_time": r[2].isoformat() if r[2] else None, "entry_price": r[3],
+                "exit_time": r[4].isoformat() if r[4] else None, "exit_price": r[5],
+                "exit_reason": r[6], "pnl_points": r[7],
+                "chan_reason": r[8], "profile_reason": r[9],
+                "entry_expected_price": r[10], "entry_actual_price": r[11],
+                "entry_slippage_points": r[12], "entry_spread_points": r[13],
+                "exit_expected_price": r[14], "exit_actual_price": r[15],
+                "exit_slippage_points": r[16], "exit_spread_points": r[17],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"查詢指定小時的個別交易失敗: {e}")
+        return []
+
+
 def get_slippage_stats_by_hour(engine_id="chan_profile_60"):
     """
     按小時(UTC)分組統計真實下單的滑價/價差資料，用來找出「哪個時段特別

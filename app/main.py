@@ -439,6 +439,22 @@ async def paper_trading_slippage_by_hour(engine_id: str = "chan_profile_300"):
     return db.get_slippage_stats_by_hour(engine_id=engine_id)
 
 
+@app.get("/paper-trading/trades-by-hour")
+async def paper_trading_trades_by_hour(engine_id: str = "chan_profile_300", hour_utc: int = 0, side: str = "entry"):
+    """
+    滑價時段統計的drill-down：撈某個UTC小時內有真實下單滑價資料的個別交易，
+    讓使用者能點進統計表裡的某個小時、看到該小時每一筆交易的完整脈絡
+    (精確時間、方向、進場理由、預期價vs實際價、最後賺賠)，用來判斷某個
+    極端滑點值到底是系統性問題還是單次意外(修正記錄見README)。
+    side="entry"看開倉滑價、"exit"看平倉滑價。
+    """
+    if side not in ("entry", "exit"):
+        return {"error": "side必須是entry或exit"}
+    if not (0 <= hour_utc <= 23):
+        return {"error": "hour_utc必須在0~23之間"}
+    return {"trades": db.get_trades_by_hour(engine_id=engine_id, hour_utc=hour_utc, side=side)}
+
+
 @app.get("/backtest/run")
 async def backtest_run(
     days: int = 2,
