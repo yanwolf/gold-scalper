@@ -52,6 +52,20 @@ TESTNET_BASE_URL = "https://demo-fapi.binance.com"
 DEFAULT_ACCOUNT = "gold"
 DEFAULT_SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").upper()
 
+
+def _resolve_symbol(symbol):
+    """
+    沒指定symbol時一律退回DEFAULT_SYMBOL，不分帳戶。
+
+    修正記錄(見README)：原本寫成「只有預設帳戶gold才自動補DEFAULT_SYMBOL，其他
+    帳戶名稱回傳None」，本意是為未來BTC帳戶預留(BTC帳戶不該默默用到黃金symbol)，
+    但實際上變成一個地雷——使用者新增第二個黃金帳戶「gold_1m」後，手動測試面板
+    一下單就撞到「沒有指定symbol，也沒有預設值可用」。系統目前只交易黃金，任何
+    帳戶沒指定就用黃金才是合理預設；未來加BTC時，那個引擎會明確傳symbol="BTCUSDT"
+    覆寫，不受影響。
+    """
+    return (symbol or DEFAULT_SYMBOL).upper()
+
 _symbol_precision_cache = {}  # {(account, symbol): precision}
 
 
@@ -101,7 +115,7 @@ def status(account=DEFAULT_ACCOUNT, symbol=None):
         "enabled": is_enabled(account),
         "testnet": use_testnet(account),
         "base_url": _base_url(account),
-        "symbol": symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None),
+        "symbol": _resolve_symbol(symbol),
     }
 
 
@@ -148,9 +162,7 @@ def get_symbol_precision(symbol=None, account=DEFAULT_ACCOUNT):
     查同一個symbol也分開存，避免未來多帳戶情境下互相污染。這是公開端點，
     不需要簽章，但測試網/正式環境的base_url仍然依帳戶決定。
     """
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
-    if not symbol:
-        return 3
+    symbol = _resolve_symbol(symbol)
 
     cache_key = (account, symbol)
     if cache_key in _symbol_precision_cache:
@@ -280,9 +292,7 @@ def estimate_quantity_for_target(target_price_move, target_pnl_usd=1.0, symbol=N
     if target_pnl_usd <= 0:
         return False, "目標損益金額必須大於0"
 
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
-    if not symbol:
-        return False, f"帳戶「{account}」沒有指定symbol，也沒有預設值可用"
+    symbol = _resolve_symbol(symbol)
 
     quantity = target_pnl_usd / target_price_move
     precision = get_symbol_precision(symbol, account=account)
@@ -357,7 +367,7 @@ def estimate_risk(quantity, sl_points, account_balance=None, symbol=None, accoun
 
 
 def set_leverage(leverage, symbol=None, account=DEFAULT_ACCOUNT):
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    symbol = _resolve_symbol(symbol)
     return _signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, account=account)
 
 
@@ -374,7 +384,7 @@ def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
     這個特定錯誤視為「本來就設定好了、等同成功」，不會誤判成真的失敗，
     避免每次開倉都被這個誤判擋下(修正記錄見README)。
     """
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    symbol = _resolve_symbol(symbol)
     success, result = _signed_request(
         "POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type}, account=account
     )
@@ -389,7 +399,7 @@ def get_account_balance(account=DEFAULT_ACCOUNT):
 
 
 def get_position_info(symbol=None, account=DEFAULT_ACCOUNT):
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    symbol = _resolve_symbol(symbol)
     return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, account=account)
 
 
@@ -404,9 +414,7 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     reduce_only=True代表這是平倉單(只能減少部位、不會反向開新倉)，
     下平倉單時一律加這個保護，避免手誤或邏輯錯誤導致意外開出反向部位。
     """
-    symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
-    if not symbol:
-        return False, f"帳戶「{account}」沒有指定symbol，也沒有預設值可用"
+    symbol = _resolve_symbol(symbol)
     if quantity <= 0:
         return False, "下單數量必須大於0"
 
@@ -472,7 +480,7 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT):
         return False, position_data
 
     position_amt = 0.0
-    target_symbol = symbol or (DEFAULT_SYMBOL if account == DEFAULT_ACCOUNT else None)
+    target_symbol = _resolve_symbol(symbol)
     for p in position_data:
         if p["symbol"] == target_symbol:
             position_amt = float(p["positionAmt"])

@@ -2012,3 +2012,26 @@ exit_time篩，回傳完整脈絡(精確時間、方向、進場理由、預期�
 讀取；三個引擎同時觸發訊號時，15分K→gold、1分K→gold_1m各自真實下單並各自
 通知，未綁的5分K純模擬；兩槽位都設0時沒有任何真實下單(向後相容)；風控
 斷路器狀態對兩個綁定引擎各自顯示。
+
+## 修正記錄：gold_1m帳戶手動下單出現「沒有指定symbol，也沒有預設值可用」
+
+**問題**：使用者設好第二組金鑰後，手動測試面板選gold_1m下單，狀態列顯示
+已啟用(金鑰正確)，但開倉失敗：「帳戶「gold_1m」沒有指定symbol，也沒有
+預設值可用」。
+
+**根因**：`execution.py`裡有8處寫成`symbol or (DEFAULT_SYMBOL if account ==
+DEFAULT_ACCOUNT else None)`——只有預設帳戶gold才自動補XAUUSDT，其他帳戶
+名稱回傳None。本意是為未來BTC帳戶預留(不該默默用到黃金symbol)，但實際
+變成地雷：上一輪在1分K引擎那邊已經察覺並繞開(明確傳execution_symbol)，
+卻漏了main.py手動測試endpoint的同一個寫法，選gold_1m一下單就撞上。
+
+**修正**：新增`execution._resolve_symbol(symbol)`——沒指定就一律退回
+DEFAULT_SYMBOL、不分帳戶(系統目前只交易黃金，這才是合理預設)；未來加
+BTC時那個引擎明確傳symbol="BTCUSDT"覆寫即可。execution.py 8處 + main.py
+2處全部改用這個helper，並移除三處因此變成不可達的`if not symbol`防禦分支。
+與其每個呼叫點各自繞，直接把地雷拆掉，之後不會再有任何路徑撞到。
+
+已測試驗證：`_resolve_symbol(None)`→XAUUSDT、明確symbol保留並統一大寫；
+重現使用者情境(gold_1m不給symbol)開倉/平倉都正常且symbol=XAUUSDT；走手動
+測試endpoint選gold_1m下單成功並算出execution_quality；明確傳BTCUSDT時
+正確覆寫(未來BTC帳戶不受影響)；全面回歸通過。

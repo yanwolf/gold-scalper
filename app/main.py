@@ -304,7 +304,7 @@ async def execution_test_order(payload: dict = Body(...)):
 
     direction = payload.get("direction")
     quantity = payload.get("quantity", 1.0)
-    symbol = payload.get("symbol") or (execution_module.DEFAULT_SYMBOL if account == "gold" else None)
+    symbol = execution_module._resolve_symbol(payload.get("symbol"))
 
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
@@ -366,7 +366,7 @@ async def execution_test_close(payload: dict = Body(...)):
     if direction not in ("bullish", "bearish"):
         return {"success": False, "error": "direction必須是bullish或bearish"}
 
-    symbol = payload.get("symbol") or (execution_module.DEFAULT_SYMBOL if account == "gold" else None)
+    symbol = execution_module._resolve_symbol(payload.get("symbol"))
     book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
