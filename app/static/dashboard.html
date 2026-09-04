@@ -2171,8 +2171,15 @@ els.backtestRunBtn.addEventListener('click', async () => {
       </div>
       <div id="backtestSpreadAdjusted"></div>
       <div id="backtestDrawdownPeriod"></div>
-      <div class="section-title" style="margin-top:16px;">回測交易紀錄</div>
-      <div id="backtestTradeList" class="bi-list"></div>
+      <div class="settings-group" style="margin-top:16px;">
+        <button type="button" class="settings-group-header" id="backtestTradesToggle">
+          <span>回測交易紀錄（${(data.recent_trades || []).length} 筆）</span>
+          <span class="settings-group-caret" id="backtestTradesCaret">▸</span>
+        </button>
+        <div class="settings-group-body" id="backtestTradesBody" style="display:none;">
+          <div id="backtestTradeList" class="bi-list"></div>
+        </div>
+      </div>
     `;
 
     renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
@@ -2197,6 +2204,15 @@ els.backtestRunBtn.addEventListener('click', async () => {
 
     renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
     renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades);
+    // 回測筆數動輒上百筆，預設收合避免把績效數字擠到看不到，要看細節再展開
+    // (修正記錄見README)
+    document.getElementById('backtestTradesToggle').addEventListener('click', () => {
+      const body = document.getElementById('backtestTradesBody');
+      const caret = document.getElementById('backtestTradesCaret');
+      const hidden = body.style.display === 'none';
+      body.style.display = hidden ? '' : 'none';
+      caret.textContent = hidden ? '▾' : '▸';
+    });
   }catch(err){
     els.backtestResult.innerHTML = `<div class="error">回測失敗：${err.message}</div>`;
   }
