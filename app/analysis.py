@@ -71,6 +71,36 @@ def build_candles(trades, interval_seconds=300):
     return candles
 
 
+def resample_candles(candles, interval_seconds):
+    """
+    把細週期K棒(通常是1分鐘)重新取樣成粗週期K棒。輸入必須時間遞增。
+    interval_seconds=60時直接回傳原資料(複製)。最後一根是進行中的部分K棒，
+    跟build_candles從逐筆成交聚合出來的行為一致(修正記錄見README)。
+    """
+    if not candles:
+        return []
+    interval_ms = interval_seconds * 1000
+    out = []
+    cur = None
+    cur_bucket = None
+    for c in candles:
+        b = (c["bucket_start"] // interval_ms) * interval_ms
+        if b != cur_bucket:
+            if cur is not None:
+                out.append(cur)
+            cur_bucket = b
+            cur = {"bucket_start": b, "open": c["open"], "high": c["high"], "low": c["low"],
+                   "close": c["close"], "volume": c["volume"]}
+        else:
+            cur["high"] = max(cur["high"], c["high"])
+            cur["low"] = min(cur["low"], c["low"])
+            cur["close"] = c["close"]
+            cur["volume"] += c["volume"]
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 1b. ATR (Average True Range) — 讓停損距離跟著市場實際波動度動態調整
 # ---------------------------------------------------------------------------

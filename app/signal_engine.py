@@ -30,7 +30,8 @@ from app.analysis import (
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
 
-CHAN_LOOKBACK_TRADES = 100000  # 纏論固定用較大回看範圍，確保K棒數量足夠，不受trade_limit影響
+CHAN_LOOKBACK_TRADES = 100000  # (回測/舊路徑用)從逐筆成交建K棒時的回看筆數
+CHAN_MAX_CANDLES = 600  # 即時路徑從1分鐘K棒快取取樣時，最多餵給纏論/ATR的K棒數(控制每次tick的計算量)
                               # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
                               # 也沒用，實際能用的資料量是兩者取較小值)
 
@@ -38,7 +39,7 @@ DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_prof
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
-                                current_price=None, strategy_type=None, resonance_min_conditions=4):
+                                current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -63,8 +64,11 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     """
     strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
 
-    chan_trades = trades[-CHAN_LOOKBACK_TRADES:] if len(trades) > CHAN_LOOKBACK_TRADES else trades
-    candles = build_candles(chan_trades, interval_seconds=interval_seconds)
+    # candles有給(即時路徑從1分鐘K棒快取取樣)就直接用，歷史長度不受成交筆數限制；
+    # 沒給(回測/舊路徑)才從逐筆成交建(修正記錄見README)
+    if candles is None:
+        chan_trades = trades[-CHAN_LOOKBACK_TRADES:] if len(trades) > CHAN_LOOKBACK_TRADES else trades
+        candles = build_candles(chan_trades, interval_seconds=interval_seconds)
     chan_data = analyze_chan(candles)
     atr = compute_atr(candles)  # 給ATR動態停損模式用，資料不足時是None(呼叫端要處理)
     choppiness_index = compute_choppiness_index(candles)  # 給震盪濾網用，資料不足時是None
@@ -162,6 +166,7 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
             "book_mid": freshness.get("book_mid"),
         }
 
+    candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
     result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
@@ -170,6 +175,7 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         current_price=current_price,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
+        candles=candles or None,
     )
     result["bid"] = bid
     result["ask"] = ask

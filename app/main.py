@@ -711,8 +711,8 @@ async def analysis_candles(interval_seconds: int = 300, trade_limit: int = 10000
     K線聚合。預設5分鐘一根，資料源是 Binance 的逐筆成交(aggTrade)。
     interval_seconds 可調整週期，例如 60 就是1分鐘K線，方便之後往下切。
     """
-    trades = binance_streamer.get_recent_trades(limit=trade_limit)
-    candles = build_candles(trades, interval_seconds=interval_seconds)
+    # 改從1分鐘K棒快取取樣(修正記錄見README)，歷史長度不受成交筆數限制
+    candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=600)
     return {
         "interval_seconds": interval_seconds,
         "candle_count": len(candles),
@@ -744,8 +744,7 @@ async def analysis_chan(interval_seconds: int = 300, trade_limit: int = 100000):
     預設用5分鐘K線(interval_seconds=300)，之後要往下切1分鐘只要改參數即可，
     不用動到分析邏輯本身。
     """
-    trades = binance_streamer.get_recent_trades(limit=trade_limit)
-    candles = build_candles(trades, interval_seconds=interval_seconds)
+    candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=600)
     result = analyze_chan(candles)
     return {
         "interval_seconds": interval_seconds,

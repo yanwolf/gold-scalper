@@ -203,6 +203,54 @@ def init_schema():
         _enabled = False
 
 
+def load_minute_bars(days=3):
+    """
+    服務啟動時用：直接在資料庫端把最近N天的逐筆成交聚合成1分鐘OHLCV K棒
+    (修正記錄見README)。原本K棒是從記憶體「最近10萬筆成交」即時聚合，緩衝區
+    用筆數封頂，成交量大的日子10萬筆只涵蓋約1小時，15分K湊不到5根、ATR(14)
+    永遠是None，引擎靜悄悄失效。改成在DB聚合回填3天的1分鐘K棒(只有幾千筆)，
+    再由記憶體即時維護，K棒歷史長度就跟成交量脫鉤了。
+    回傳時間遞增的 [{"bucket_start","open","high","low","close","volume"}, ...]。
+    """
+    if not _enabled:
+        return []
+    from datetime import timedelta
+    since_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bucket,
+                           (array_agg(price ORDER BY trade_time ASC, id ASC))[1]  AS open,
+                           MAX(price) AS high,
+                           MIN(price) AS low,
+                           (array_agg(price ORDER BY trade_time DESC, id DESC))[1] AS close,
+                           SUM(qty) AS volume
+                    FROM (
+                        SELECT id, trade_time, price, qty, (trade_time / 60000) * 60000 AS bucket
+                        FROM gold_trades
+                        WHERE trade_time >= %s
+                    ) t
+                    GROUP BY bucket
+                    ORDER BY bucket ASC;
+                    """,
+                    (since_ms,),
+                )
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return [
+            {"bucket_start": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+             "low": float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"回填1分鐘K棒失敗: {e}")
+        return []
+
+
 def insert_trades(trades):
     """
     批次寫入逐筆成交。trades是 [{"time","price","qty","is_buyer_maker"}, ...]。

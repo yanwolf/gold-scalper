@@ -35,6 +35,10 @@ MARKET_WS_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@aggTr
 
 MAX_TICK_HISTORY = 2000
 MAX_TRADE_HISTORY = 100000  # 逐筆成交量比報價更新頻繁，保留更多筆給分析模組用
+# 1分鐘K棒快取(修正記錄見README)：K棒歷史長度不再受成交筆數限制。3天=4320根，
+# 記憶體幾乎不佔；粗週期(5分/15分)由它重新取樣。逐筆成交deque仍保留給分價量表用。
+MINUTE_BAR_HISTORY_DAYS = int(os.getenv("MINUTE_BAR_HISTORY_DAYS", "3"))
+MAX_MINUTE_BARS = MINUTE_BAR_HISTORY_DAYS * 24 * 60
                             # (從20000提高到100000：5分K/15分K纏論一根K棒平均要吃掉
                             # 5倍於1分K的成交筆數才能湊滿，同樣的筆數上限對5分K來說
                             # 一直偏緊，尤其服務重啟、記憶體歸零重新累積時特別明顯。
@@ -155,6 +159,7 @@ class BinanceGoldStreamer:
         self._latest_price = None
         self._tick_history = deque(maxlen=MAX_TICK_HISTORY)
         self._trade_history = deque(maxlen=MAX_TRADE_HISTORY)
+        self._minute_bars = deque(maxlen=MAX_MINUTE_BARS)  # 時間遞增的1分鐘OHLCV
         self._unflushed_trades = []  # 累積尚未寫入資料庫的新成交，由 flush thread 定期清空
         self._seeded_from_db = False
 
@@ -178,6 +183,7 @@ class BinanceGoldStreamer:
                 "latest_price": self._latest_price,
                 "tick_count": len(self._tick_history),
                 "trade_count": len(self._trade_history),
+                "minute_bar_count": len(self._minute_bars),
                 "latest_trade_time": latest_trade_time,  # epoch ms，給health_monitor.py判斷資料是否停滯用
                 "latest_book_time": self._latest_price.get("time") if self._latest_price else None,
                 "db_persistence_enabled": db.is_enabled(),
@@ -259,6 +265,35 @@ class BinanceGoldStreamer:
         with self._lock:
             return list(self._tick_history)[-limit:]
 
+    def _update_minute_bar(self, trade):
+        """呼叫端必須已持有self._lock。把一筆成交併進當前1分鐘K棒(或開新的一根)。"""
+        bucket = (trade["time"] // 60000) * 60000
+        price, qty = trade["price"], trade["qty"]
+        if self._minute_bars and self._minute_bars[-1]["bucket_start"] == bucket:
+            bar = self._minute_bars[-1]
+            bar["high"] = max(bar["high"], price)
+            bar["low"] = min(bar["low"], price)
+            bar["close"] = price
+            bar["volume"] += qty
+        elif not self._minute_bars or bucket > self._minute_bars[-1]["bucket_start"]:
+            self._minute_bars.append({"bucket_start": bucket, "open": price, "high": price,
+                                      "low": price, "close": price, "volume": qty})
+        # bucket比最後一根還舊(亂序/重播)：忽略，避免破壞遞增順序
+
+    def get_recent_candles(self, interval_seconds=60, limit=None):
+        """
+        給分析模組用的K棒(修正記錄見README)：從1分鐘K棒快取重新取樣成指定週期，
+        limit是最多回傳幾根(取最新的)。歷史長度由MINUTE_BAR_HISTORY_DAYS決定，
+        跟成交筆數無關——成交量暴增的日子15分K照樣有幾百根可用。
+        """
+        from app.analysis import resample_candles
+        with self._lock:
+            bars = list(self._minute_bars)
+        candles = bars if interval_seconds == 60 else resample_candles(bars, interval_seconds)
+        if limit and len(candles) > limit:
+            candles = candles[-limit:]
+        return candles
+
     def get_recent_trades(self, limit: int = 2000):
         """給分析模組（分價量表、K線聚合）用的逐筆成交資料。"""
         with self._lock:
@@ -286,6 +321,7 @@ class BinanceGoldStreamer:
         }
         with self._lock:
             self._trade_history.append(trade)
+            self._update_minute_bar(trade)
             self._unflushed_trades.append(trade)
 
     def _flush_loop(self):
@@ -306,6 +342,13 @@ class BinanceGoldStreamer:
             if seeded:
                 with self._lock:
                     self._trade_history.extend(seeded)
+            # 1分鐘K棒直接在DB端聚合回填(不是從那10萬筆成交建)，才能拿到完整的3天歷史
+            bars = db.load_minute_bars(days=MINUTE_BAR_HISTORY_DAYS)
+            if bars:
+                with self._lock:
+                    self._minute_bars.clear()
+                    self._minute_bars.extend(bars)
+                logger.info(f"已回填{len(bars)}根1分鐘K棒(最近{MINUTE_BAR_HISTORY_DAYS}天)")
             self._seeded_from_db = True
 
         self._public_conn.start()
