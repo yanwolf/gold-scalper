@@ -164,7 +164,7 @@ class PaperTradingEngine:
                 reversal_confirm_count=s["paper_reversal_confirm_count"],
             )
             if exit_reason:
-                self._close_position(position, current_price, exit_reason, bid=result.get("bid"), ask=result.get("ask"))
+                self._close_position(position, current_price, exit_reason, bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
@@ -288,6 +288,13 @@ class PaperTradingEngine:
                                 f"實際成交價{actual_fill_price:.2f}，真正執行滑點{quality['slippage_points']:+.2f}points"
                                 f"，當下價差{quality['spread']:.2f}points"
                             )
+                            if signal_result.get("book_stale"):
+                                bs = signal_result["book_stale"]
+                                lag = bs.get("lag_seconds")
+                                slippage_note += (
+                                    f"\n⚠️ 盤口報價過期(落後成交流{lag:.0f}秒)，基準改用最後成交價，價差不可信"
+                                    if lag is not None else "\n⚠️ 盤口報價缺失，基準改用最後成交價，價差不可信"
+                                )
                             logger.info(f"開倉滑點({self.label}): {slippage_note}")
                             # 把這筆的執行品質資料補寫回資料庫(insert當下還沒有這些
                             # 資料，因為要先真的送出下單、拿到成交價才能算出來)，
@@ -332,7 +339,7 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
-    def _close_position(self, position, exit_price, exit_reason, bid=None, ask=None):
+    def _close_position(self, position, exit_price, exit_reason, bid=None, ask=None, book_stale=None):
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = trading_core.close_position(position, exit_price, exit_reason, exit_time)
 
@@ -376,6 +383,12 @@ class PaperTradingEngine:
                             f"實際成交價{actual_fill_price:.2f}，真正執行滑點{quality['slippage_points']:+.2f}points"
                             f"，當下價差{quality['spread']:.2f}points"
                         )
+                        if book_stale:
+                            lag = book_stale.get("lag_seconds")
+                            slippage_note += (
+                                f"\n⚠️ 盤口報價過期(落後成交流{lag:.0f}秒)，基準改用最後成交價，價差不可信"
+                                if lag is not None else "\n⚠️ 盤口報價缺失，基準改用最後成交價，價差不可信"
+                            )
                         logger.info(f"平倉滑點({self.label}): {slippage_note}")
                         db.update_paper_trade_exit_execution(
                             position.get("id"), quality["expected_fill_price"], actual_fill_price,

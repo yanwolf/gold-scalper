@@ -16,6 +16,7 @@ Binance 把 WebSocket 資料流分成 /public、/market、/private 三個路由�
 
 import os
 import json
+import logging
 import threading
 import time
 from collections import deque
@@ -24,6 +25,8 @@ from datetime import datetime, timezone
 import websocket  # pip package: websocket-client
 
 from app import db
+
+logger = logging.getLogger("binance_client")
 
 SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").lower()
 
@@ -39,6 +42,16 @@ MAX_TRADE_HISTORY = 100000  # 逐筆成交量比報價更新頻繁，保留更�
                             # 15分K在這個資料量下能穩定拼出多個中樞，對趨勢/盤整背馳判斷
                             # 有實質幫助，見README修正記錄)
 DB_FLUSH_INTERVAL_SECONDS = 20  # 多久把新累積的逐筆成交寫進資料庫一次
+
+# 盤口(bookTicker)過期判定(修正記錄見README)：盤口事件時間落後最後成交超過
+# BOOK_STALE_LAG_SECONDS，或盤口中價偏離最後成交價超過價格的BOOK_STALE_DIVERGENCE_RATIO
+# (黃金4400時0.1%≈4.4點，正常情況中價與最後成交差不到1點)，視為過期不採用。
+# 落後超過BOOK_RECONNECT_LAG_SECONDS則由watchdog強制重連盤口連線。
+BOOK_STALE_LAG_SECONDS = 5.0
+BOOK_STALE_DIVERGENCE_RATIO = 0.001
+BOOK_WATCHDOG_INTERVAL_SECONDS = 10
+BOOK_RECONNECT_LAG_SECONDS = 30.0
+BOOK_RECONNECT_COOLDOWN = 60.0
 
 
 class _SingleStreamConnection:
@@ -78,6 +91,22 @@ class _SingleStreamConnection:
         self._stop_flag.set()
         if self._ws_app:
             self._ws_app.close()
+
+    def force_reconnect(self):
+        """
+        強制關閉目前的WebSocket，讓_run_forever的迴圈自動重連。給「連線還在、
+        但資料悶掉」的假死情況用——這種情況on_error/on_close都不會觸發，
+        ping/pong也可能還是通的，只有資料本身停了，得靠外部watchdog主動踢
+        (修正記錄見README)。
+        """
+        with self._status_lock:
+            self._connected = False
+            self._last_error = "watchdog強制重連(資料停滯)"
+        if self._ws_app:
+            try:
+                self._ws_app.close()
+            except Exception:
+                pass
 
     def _run_forever(self):
         while not self._stop_flag.is_set():
@@ -133,6 +162,8 @@ class BinanceGoldStreamer:
         self._market_conn = _SingleStreamConnection(MARKET_WS_URL, self._handle_agg_trade)
 
         self._flush_thread = None
+        self._watchdog_thread = None
+        self._watchdog_stop_flag = threading.Event()
         self._flush_stop_flag = threading.Event()
 
     @property
@@ -148,6 +179,7 @@ class BinanceGoldStreamer:
                 "tick_count": len(self._tick_history),
                 "trade_count": len(self._trade_history),
                 "latest_trade_time": latest_trade_time,  # epoch ms，給health_monitor.py判斷資料是否停滯用
+                "latest_book_time": self._latest_price.get("time") if self._latest_price else None,
                 "db_persistence_enabled": db.is_enabled(),
             }
 
@@ -166,6 +198,62 @@ class BinanceGoldStreamer:
     def get_latest(self):
         with self._lock:
             return self._latest_price
+
+    def get_book_freshness(self):
+        """
+        判斷盤口報價(bookTicker)相對成交流(aggTrade)有沒有過期(修正記錄見README)。
+
+        兩條WebSocket是獨立的：盤口那條一旦假死(連線還在、沒資料)，_latest_price
+        會凍結在舊值，成交流卻繼續跑。使用者實際遇到：訊號(用成交流算)說「站上
+        4437」，拿來當基準的bid/ask卻還停在4398，40點的落差被誤判成滑點，帳面
+        損益也跟著錯。這裡用兩邊的「交易所事件時間」直接比(不依賴本機時鐘)：
+        盤口E落後最後一筆成交T超過門檻，或盤口中價跟最後成交價偏離太多，就視為
+        過期。回傳dict：{"stale": bool, "lag_seconds": float|None,
+        "divergence": float|None, "book_mid": float|None, "last_trade_price": float|None}
+        """
+        with self._lock:
+            tick = self._latest_price
+            last_trade = self._trade_history[-1] if self._trade_history else None
+        info = {"stale": False, "lag_seconds": None, "divergence": None, "book_mid": None, "last_trade_price": None}
+        if not tick or not tick.get("bid") or not tick.get("ask"):
+            info["stale"] = True
+            return info
+        try:
+            mid = (float(tick["bid"]) + float(tick["ask"])) / 2
+        except (TypeError, ValueError):
+            info["stale"] = True
+            return info
+        info["book_mid"] = mid
+        if not last_trade:
+            return info
+        info["last_trade_price"] = last_trade["price"]
+        try:
+            lag = (float(last_trade["time"]) - float(tick["time"])) / 1000.0
+        except (TypeError, ValueError):
+            lag = None
+        info["lag_seconds"] = lag
+        info["divergence"] = abs(mid - last_trade["price"])
+        if (lag is not None and lag > BOOK_STALE_LAG_SECONDS) or info["divergence"] > mid * BOOK_STALE_DIVERGENCE_RATIO:
+            info["stale"] = True
+        return info
+
+    def _watchdog_loop(self):
+        """
+        每隔幾秒檢查盤口是否落後成交流太久；是的話強制重連盤口那條連線
+        (限速：兩次強制重連至少間隔BOOK_RECONNECT_COOLDOWN秒，避免一直踢)。
+        """
+        last_kick = 0.0
+        while not self._watchdog_stop_flag.is_set():
+            time.sleep(BOOK_WATCHDOG_INTERVAL_SECONDS)
+            try:
+                f = self.get_book_freshness()
+                lag = f.get("lag_seconds")
+                if lag is not None and lag > BOOK_RECONNECT_LAG_SECONDS and (time.time() - last_kick) > BOOK_RECONNECT_COOLDOWN:
+                    logger.warning(f"盤口報價落後成交流{lag:.0f}秒(偏離{f.get('divergence')})，強制重連bookTicker連線")
+                    self._public_conn.force_reconnect()
+                    last_kick = time.time()
+            except Exception as e:
+                logger.error(f"盤口watchdog檢查失敗: {e}")
 
     def get_recent_ticks(self, limit: int = 200):
         with self._lock:
@@ -228,10 +316,16 @@ class BinanceGoldStreamer:
             self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
             self._flush_thread.start()
 
+        if not (self._watchdog_thread and self._watchdog_thread.is_alive()):
+            self._watchdog_stop_flag.clear()
+            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+            self._watchdog_thread.start()
+
     def stop(self):
         self._public_conn.stop()
         self._market_conn.stop()
         self._flush_stop_flag.set()
+        self._watchdog_stop_flag.set()
 
 
 # 單例，供 main.py 匯入使用

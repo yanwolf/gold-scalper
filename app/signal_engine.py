@@ -135,13 +135,32 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     """
     trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
 
+    # 盤口報價過期防護(修正記錄見README)：盤口(bookTicker)跟成交(aggTrade)是兩條
+    # 獨立WebSocket，盤口那條一旦假死，bid/ask會凍結在舊值而成交流繼續跑——
+    # 訊號是新的、基準價是舊的。使用者實際遇到訊號說「站上4437」但bid/ask還在
+    # 4398，40點落差被誤判成滑點、帳面損益也跟著錯(真實-25pt記成+4pt)。
+    # 這裡用交易所事件時間+價格偏離兩個條件判斷盤口是否過期；過期就退回用
+    # 最後成交價當current_price，並把bid/ask也設成最後成交價(讓下游的執行品質
+    # 分析有一個「當下真實」的基準，價差會顯示0代表沒有可信盤口)，同時在result
+    # 帶book_stale讓通知與紀錄標示出來。
     current_price = None
     bid = ask = None
+    book_stale = None
+    freshness = binance_streamer.get_book_freshness()
     latest_tick = binance_streamer.get_latest()
-    if latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
+    if not freshness["stale"] and latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
         bid = float(latest_tick["bid"])
         ask = float(latest_tick["ask"])
         current_price = (bid + ask) / 2
+    elif trades:
+        last_trade_price = trades[-1]["price"]
+        current_price = last_trade_price
+        bid = ask = last_trade_price
+        book_stale = {
+            "lag_seconds": freshness.get("lag_seconds"),
+            "divergence": freshness.get("divergence"),
+            "book_mid": freshness.get("book_mid"),
+        }
 
     result = compute_signal_from_trades(
         trades,
@@ -154,4 +173,5 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     )
     result["bid"] = bid
     result["ask"] = ask
+    result["book_stale"] = book_stale
     return result

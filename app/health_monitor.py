@@ -35,6 +35,7 @@ logger = logging.getLogger("health_monitor")
 
 HEALTH_CHECK_POLL_SECONDS = int(os.getenv("HEALTH_CHECK_POLL_SECONDS", "60"))
 HEALTH_DISCONNECT_THRESHOLD_SECONDS = int(os.getenv("HEALTH_DISCONNECT_THRESHOLD_SECONDS", "120"))
+HEALTH_BOOK_STALE_THRESHOLD_SECONDS = 30
 HEALTH_TRADE_STALL_THRESHOLD_SECONDS = int(os.getenv("HEALTH_TRADE_STALL_THRESHOLD_SECONDS", "300"))
 HEALTH_PAPER_STALL_THRESHOLD_SECONDS = int(os.getenv("HEALTH_PAPER_STALL_THRESHOLD_SECONDS", "180"))
 
@@ -50,6 +51,7 @@ class HealthMonitor:
         self._alert_active = {
             "binance_connection": False,
             "trade_data_stall": False,
+            "book_ticker_stale": False,
             "db_write_failure": False,
         }
         # 模擬單心跳告警是每個引擎各自獨立一個key(例如paper_trading_stall_chan_profile_60、
@@ -86,6 +88,7 @@ class HealthMonitor:
 
         self._check_binance_connection(now)
         self._check_trade_data_flow(now)
+        self._check_book_ticker_freshness(now)
         for engine_id, engine in PAPER_TRADING_ENGINES.items():
             self._check_paper_trading_heartbeat(now, engine_id, engine)
         self._check_db_write_health()
@@ -163,6 +166,25 @@ class HealthMonitor:
             f"Binance連線狀態正常，但逐筆成交資料已經超過{HEALTH_TRADE_STALL_THRESHOLD_SECONDS}秒沒有更新，"
             f"可能是連線假死，建議檢查Zeabur服務日誌",
             "Binance逐筆成交資料已恢復正常更新",
+        )
+
+    def _check_book_ticker_freshness(self, now):
+        """
+        盤口(bookTicker)相對成交流(aggTrade)是否過期(修正記錄見README)。兩條
+        WebSocket獨立，盤口假死時連線狀態仍顯示正常、成交也還在流，只有盤口
+        凍結——signal_engine已經會自動退回用最後成交價，這裡再發告警讓使用者
+        知道發生過，因為盤口凍結期間的「當下價差」數字不可信。
+        """
+        f = binance_streamer.get_book_freshness()
+        lag = f.get("lag_seconds")
+        is_problem = lag is not None and lag >= HEALTH_BOOK_STALE_THRESHOLD_SECONDS
+        lag_txt = f"{lag:.0f}" if lag is not None else "?"
+        self._set_alert(
+            "book_ticker_stale",
+            is_problem,
+            f"盤口報價(bookTicker)已落後成交流{lag_txt}秒，訊號基準價已自動改用最後成交價，"
+            f"watchdog會嘗試強制重連；這段期間的價差/滑點數字不可信",
+            "盤口報價已恢復與成交流同步",
         )
 
     def _check_paper_trading_heartbeat(self, now, engine_id, engine):
