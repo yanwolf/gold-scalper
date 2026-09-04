@@ -121,7 +121,7 @@ class PaperTradingEngine:
         # 這樣使用者在dashboard調整過設定後，下一次tick馬上就會用新的參數，
         # 不用重新部署。已開倉的部位維持原本的移動停損進度，只有「新的判斷」
         # 才會套用最新參數(例如新開倉的初始停損、觸發距離)。
-        s = settings_module.get_settings()
+        s = settings_module.get_settings(engine_id=self.engine_id)
 
         result = compute_full_signal(
             interval_seconds=self.interval_seconds,
@@ -221,7 +221,7 @@ class PaperTradingEngine:
         # 會安全回傳None，不會顯示滑價資訊。
         bid, ask = signal_result.get("bid"), signal_result.get("ask")
 
-        s = settings_module.get_settings()
+        s = settings_module.get_settings(engine_id=self.engine_id)
         is_execution_engine = self._is_execution_engine(s)
 
         if is_execution_engine:
@@ -353,7 +353,7 @@ class PaperTradingEngine:
 
         # 平倉方向要反過來：多單出場是賣出(市價賣單成交在買一bid)，空單出場
         # 是買回(市價買單成交在賣一ask)——跟開倉時的方向剛好相反(修正記錄見README)
-        s = settings_module.get_settings()
+        s = settings_module.get_settings(engine_id=self.engine_id)
         is_execution_engine = self._is_execution_engine(s)
 
         if is_execution_engine:
@@ -433,13 +433,13 @@ class PaperTradingEngine:
         else:
             trades = list(self._closed_trades_memory)[::-1]
 
-        settings_changed_at = settings_module.get_last_changed_at()
+        settings_changed_at = settings_module.get_last_changed_at(engine_id=self.engine_id)
         if settings_changed_at:
             stats_trades = [t for t in trades if t.get("entry_time") and t["entry_time"] >= settings_changed_at]
         else:
             stats_trades = trades
 
-        s = settings_module.get_settings()
+        s = settings_module.get_settings(engine_id=self.engine_id)
 
         stats = compute_stats(stats_trades)
         readiness = assess_readiness(stats)
@@ -470,6 +470,7 @@ class PaperTradingEngine:
             "recent_trades": trades[:limit],
             "stats_excluded_old_trades": len(trades) - len(stats_trades),  # 給dashboard顯示排除了幾筆舊紀錄
             "active_settings": s,
+            "engine_overrides": settings_module.get_engine_overrides(self.engine_id),
             "settings_changed_at": settings_changed_at,
             "readiness": readiness,
             "circuit_breaker": circuit_breaker,  # None代表這個引擎沒有接真實下單，不適用風控斷路器

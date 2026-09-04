@@ -499,6 +499,27 @@
 
   <div id="paperActiveConfig"></div>
 
+  <div class="settings-group" style="margin-top:10px;">
+    <button type="button" class="settings-group-header" id="engineParamsToggle">
+      <span>此引擎專屬參數 <span id="engineParamsBadge" style="font-weight:400; color:var(--muted);"></span></span>
+      <span class="settings-group-caret" id="engineParamsCaret">▸</span>
+    </button>
+    <div class="settings-group-body" id="engineParamsBody" style="display:none;">
+      <div style="font-size:11px; color:var(--muted); margin-bottom:10px; line-height:1.6;">
+        這裡填的值只套用在<b>目前選的這個引擎</b>，蓋過「設定」分頁的全域參數；留空的欄位
+        沿用全域(placeholder顯示全域目前值)。不同週期的ATR量級差很多——同樣1x倍數在
+        1分K換算出來的停損只有1~2點、出場太快被滑點吃光，15分K卻沒問題——所以要分開調。
+        儲存後只有<b>這個引擎</b>的績效統計會重新分界，其他引擎不受影響。
+      </div>
+      <div id="engineParamsForm"></div>
+      <div class="settings-save-row">
+        <button id="engineParamsSaveBtn" class="btn-primary">儲存此引擎覆寫</button>
+        <button id="engineParamsClearBtn" class="btn-secondary">清除全部覆寫(沿用全域)</button>
+      </div>
+      <div id="engineParamsResult" class="notify-result"></div>
+    </div>
+  </div>
+
   <div id="paperOpenPosition"></div>
 
   <div id="paperReadiness"></div>
@@ -924,6 +945,14 @@ const els = {
   paperSpreadAdjusted: document.getElementById('paperSpreadAdjusted'),
   paperReadiness: document.getElementById('paperReadiness'),
   paperInterval: document.getElementById('paperInterval'),
+  engineParamsToggle: document.getElementById('engineParamsToggle'),
+  engineParamsBadge: document.getElementById('engineParamsBadge'),
+  engineParamsCaret: document.getElementById('engineParamsCaret'),
+  engineParamsBody: document.getElementById('engineParamsBody'),
+  engineParamsForm: document.getElementById('engineParamsForm'),
+  engineParamsSaveBtn: document.getElementById('engineParamsSaveBtn'),
+  engineParamsClearBtn: document.getElementById('engineParamsClearBtn'),
+  engineParamsResult: document.getElementById('engineParamsResult'),
   backtestInterval: document.getElementById('backtestInterval'),
   backtestDays: document.getElementById('backtestDays'),
   backtestStrategy: document.getElementById('backtestStrategy'),
@@ -1874,6 +1903,11 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
 
 function renderPaperTrading(data){
   renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
+  const ovCount = Object.keys(data.engine_overrides || {}).length;
+  if(ovCount){
+    const title = document.querySelector('#paperActiveConfig .cfg-title');
+    if(title) title.innerHTML += ` <span style="color:var(--gold); font-weight:400; font-size:11px;">(含 ${ovCount} 個此引擎專屬覆寫)</span>`;
+  }
 
   if(data.open_position){
     const p = data.open_position;
@@ -1980,7 +2014,91 @@ async function fetchPaperTrading(){
 
 fetchPaperTrading();
 setInterval(fetchPaperTrading, 15000);
-els.paperInterval.addEventListener('change', fetchPaperTrading);
+els.paperInterval.addEventListener('change', () => { fetchPaperTrading(); loadEngineParams(); });
+
+// --- 此引擎專屬參數(覆寫全域) ---
+const ENGINE_PARAM_ORDER = [
+  'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier',
+  'paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
+  'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
+];
+
+els.engineParamsToggle.addEventListener('click', () => {
+  const hidden = els.engineParamsBody.style.display === 'none';
+  els.engineParamsBody.style.display = hidden ? '' : 'none';
+  els.engineParamsCaret.textContent = hidden ? '▾' : '▸';
+});
+
+async function loadEngineParams(){
+  const engineId = els.paperInterval.value;
+  try{
+    const res = await fetch(`/settings/engine/${engineId}`);
+    const data = await res.json();
+    if(data.error){ els.engineParamsForm.innerHTML = `<div class="error">${data.error}</div>`; return; }
+    const n = Object.keys(data.overrides).length;
+    els.engineParamsBadge.textContent = n ? `(覆寫 ${n} 個欄位)` : '(目前完全沿用全域)';
+    els.engineParamsForm.innerHTML = ENGINE_PARAM_ORDER.map(key => {
+      const m = data.meta[key]; if(!m) return '';
+      const isOv = key in data.overrides;
+      return `
+        <div class="settings-field">
+          <label>${m.label} ${isOv ? '<span style="color:var(--gold); font-size:11px;">覆寫中</span>' : ''}</label>
+          <input type="number" data-engine-key="${key}" step="${m.step}" min="${m.min}" max="${m.max}"
+                 value="${isOv ? data.overrides[key] : ''}" placeholder="沿用全域：${data.global[key]}" />
+        </div>`;
+    }).join('');
+  }catch(err){
+    els.engineParamsForm.innerHTML = `<div class="error">載入失敗：${err.message}</div>`;
+  }
+}
+
+function showEngineParamsResult(msg, isError){
+  els.engineParamsResult.textContent = msg;
+  els.engineParamsResult.className = `notify-result ${isError ? 'error' : 'success'}`;
+}
+
+els.engineParamsSaveBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  const engineId = els.paperInterval.value;
+  const values = {};
+  els.engineParamsForm.querySelectorAll('input[data-engine-key]').forEach(inp => {
+    values[inp.dataset.engineKey] = inp.value === '' ? null : parseFloat(inp.value);
+  });
+  els.engineParamsSaveBtn.disabled = true;
+  try{
+    const res = await fetch(`/settings/engine/${engineId}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ password: pwd, values }),
+    });
+    const data = await res.json();
+    if(data.success){
+      const a = Object.keys(data.applied).length, c = data.cleared.length;
+      showEngineParamsResult(a || c ? `已儲存：覆寫 ${a} 個、清除 ${c} 個，此引擎績效統計已重新分界` : '沒有任何變更', false);
+      await loadEngineParams(); fetchPaperTrading();
+    }else{
+      showEngineParamsResult(`儲存失敗：${data.error}`, true);
+    }
+  }catch(err){ showEngineParamsResult(`儲存失敗：${err.message}`, true); }
+  els.engineParamsSaveBtn.disabled = false;
+});
+
+els.engineParamsClearBtn.addEventListener('click', async () => {
+  if(!confirm('清除此引擎全部專屬覆寫、回頭沿用全域設定？此引擎的績效統計會重新分界。')) return;
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  const engineId = els.paperInterval.value;
+  try{
+    const res = await fetch(`/settings/engine/${engineId}/clear`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd }),
+    });
+    const data = await res.json();
+    if(data.success){
+      showEngineParamsResult(`已清除 ${data.cleared.length} 個覆寫，此引擎現在完全沿用全域`, false);
+      await loadEngineParams(); fetchPaperTrading();
+    }else{ showEngineParamsResult(`清除失敗：${data.error}`, true); }
+  }catch(err){ showEngineParamsResult(`清除失敗：${err.message}`, true); }
+});
+
+loadEngineParams();
 
 // --- 歷史回測 ---
 

@@ -702,3 +702,20 @@ def save_app_settings(updates):
             _pool.putconn(conn)
     except Exception as e:
         logger.error(f"寫入設定失敗: {e}")
+
+
+def delete_app_settings(keys):
+    """刪除指定的設定key(給引擎專屬覆寫「清除→沿用全域」用)。keys是可迭代的字串集合。"""
+    keys = list(keys)
+    if not _enabled or not keys:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM app_settings WHERE key = ANY(%s);", (keys,))
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"刪除設定失敗: {e}")

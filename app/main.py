@@ -172,6 +172,59 @@ async def update_settings(payload: dict = Body(...)):
     return {"success": True, "values": updated}
 
 
+@app.get("/settings/engine/{engine_id}")
+async def get_engine_settings(engine_id: str):
+    """
+    引擎專屬參數(修正記錄見README)：回傳這個引擎目前的覆寫值、實際生效的
+    完整設定、以及可覆寫欄位的meta。四個模擬單引擎原本共用同一組策略參數，
+    但1分K跟15分K的ATR量級差很多(同樣1x倍數在1分K換算出來的停損只有1~2點，
+    出場太快、利潤被滑點吃光)，所以讓每個引擎可以各自覆寫TRADING_RELEVANT_KEYS
+    裡的欄位，沒覆寫的沿用全域。不需要密碼，純讀取。
+    """
+    if engine_id not in PAPER_TRADING_ENGINES:
+        return {"error": f"沒有engine_id={engine_id}的追蹤引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
+    return {
+        "engine_id": engine_id,
+        "overrides": settings_module.get_engine_overrides(engine_id),
+        "effective": settings_module.get_settings(engine_id=engine_id),
+        "global": settings_module.get_settings(),
+        "meta": {k: settings_module.FIELD_META[k] for k in settings_module.TRADING_RELEVANT_KEYS},
+        "last_changed_at": settings_module.get_last_changed_at(engine_id=engine_id),
+    }
+
+
+@app.post("/settings/engine/{engine_id}")
+async def update_engine_settings(engine_id: str, payload: dict = Body(...)):
+    """
+    更新引擎專屬覆寫。payload: {"password": "...", "values": {欄位: 值 或 null}}，
+    值是null/空字串代表清除該欄位覆寫、回頭沿用全域。只在值真的改變時才算
+    異動(才會更新這個引擎的績效統計分界)，整份表單重送不會誤觸。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    if engine_id not in PAPER_TRADING_ENGINES:
+        return {"success": False, "error": f"沒有engine_id={engine_id}的追蹤引擎"}
+    applied, cleared = settings_module.update_engine_overrides(engine_id, payload.get("values", {}))
+    return {
+        "success": True, "applied": applied, "cleared": cleared,
+        "overrides": settings_module.get_engine_overrides(engine_id),
+        "effective": settings_module.get_settings(engine_id=engine_id),
+    }
+
+
+@app.post("/settings/engine/{engine_id}/clear")
+async def clear_engine_settings(engine_id: str, payload: dict = Body(...)):
+    """清除這個引擎的全部專屬覆寫，回頭完全沿用全域設定。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    if engine_id not in PAPER_TRADING_ENGINES:
+        return {"success": False, "error": f"沒有engine_id={engine_id}的追蹤引擎"}
+    cleared = settings_module.clear_engine_overrides(engine_id)
+    return {"success": True, "cleared": cleared, "effective": settings_module.get_settings(engine_id=engine_id)}
+
+
 # ---------------------------------------------------------------------------
 # 幣安期貨下單執行(測試網優先)：手動測試用endpoint，還沒自動接上模擬單引擎的
 # 開倉/平倉事件——因為現在1分K/5分K/15分K三個引擎平行運作，如果都自動對同一個

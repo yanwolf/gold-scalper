@@ -247,6 +247,17 @@ FIELD_META = {
 
 _settings = {key: meta["default"] for key, meta in FIELD_META.items()}
 _LAST_CHANGED_DB_KEY = "_meta_last_changed_at"  # app_settings表裡的保留key，不是FIELD_META裡的一般設定項
+_KEY_CHANGED_DB_PREFIX = "_meta_changed_at:"     # 全域設定「每個欄位各自」的最後修改時間，key格式 _meta_changed_at:<欄位>
+
+# 引擎專屬覆寫(修正記錄見README)：四個模擬單引擎原本共用同一組策略參數，
+# 1分K跟15分K的ATR量級差很多(同樣1x倍數在1分K換算出來的停損只有1~2點，
+# 出場太快、利潤被滑點吃光；15分K卻活得好好的)。這裡讓每個引擎可以針對
+# TRADING_RELEVANT_KEYS裡的欄位各自覆寫，沒覆寫的欄位沿用全域設定。
+# 資料庫key格式：engine:<engine_id>:<欄位>，時間戳記 engine:<engine_id>:_meta_changed_at:<欄位>
+_ENGINE_DB_PREFIX = "engine:"
+_engine_overrides = {}        # {engine_id: {key: value}}
+_engine_key_changed_at = {}   # {engine_id: {key: iso}}  覆寫或清除覆寫的時間
+_global_key_changed_at = {}   # {key: iso}  全域設定每個欄位的最後修改時間
 
 # 真正會影響模擬單交易行為的欄位。readiness_*(達標門檻)只影響「怎麼評估績效」，
 # 不影響實際交易邏輯本身——改了門檻不代表舊交易是「別的規則」跑出來的，
@@ -286,6 +297,23 @@ def _load_from_db():
             if _LAST_CHANGED_DB_KEY in stored:
                 _last_changed_at = stored[_LAST_CHANGED_DB_KEY]
 
+            # 全域設定每個欄位各自的最後修改時間 / 引擎專屬覆寫與其時間戳記
+            for key, raw_value in stored.items():
+                if key.startswith(_KEY_CHANGED_DB_PREFIX):
+                    _global_key_changed_at[key[len(_KEY_CHANGED_DB_PREFIX):]] = raw_value
+                elif key.startswith(_ENGINE_DB_PREFIX):
+                    rest = key[len(_ENGINE_DB_PREFIX):]
+                    engine_id, _, field = rest.partition(":")
+                    if not engine_id or not field:
+                        continue
+                    if field.startswith(_KEY_CHANGED_DB_PREFIX):
+                        _engine_key_changed_at.setdefault(engine_id, {})[field[len(_KEY_CHANGED_DB_PREFIX):]] = raw_value
+                    elif field in TRADING_RELEVANT_KEYS:
+                        try:
+                            _engine_overrides.setdefault(engine_id, {})[field] = _cast(field, raw_value)
+                        except (TypeError, ValueError):
+                            logger.warning(f"引擎覆寫設定 {key}={raw_value} 型別轉換失敗，忽略")
+
             # 一次性遷移：舊版設定欄位是execution_interval_seconds(0/60/300/900)，
             # 改版後換成execution_engine_index(0~4)，兩者欄位名稱不同，直接改名
             # 會讓使用者原本設定好的值悄悄消失、被重置回預設值0(全部純模擬)——
@@ -310,14 +338,98 @@ def _load_from_db():
         # 直接讀到execution_engine_index這個新欄位，不用每次都重新判斷
         if migrated_engine_index is not None:
             db.save_app_settings({"execution_engine_index": migrated_engine_index})
+
+        # 一次性遷移：舊版只有一個全域的_meta_last_changed_at，沒有「每欄位」的
+        # 修改時間。把它種進每個還沒有時間戳的交易相關欄位並持久化——語意上
+        # 舊版就是「所有欄位最後一次改動都在那個時間」。只做這一次，之後
+        # 不再動態退回全域時間戳，否則全域任何一個欄位改動都會讓沒被碰到的
+        # 欄位跟著「看起來剛改過」，導致有覆寫的引擎被錯誤重置統計。
+        with _lock:
+            seed = {
+                k: _last_changed_at for k in TRADING_RELEVANT_KEYS
+                if k not in _global_key_changed_at and _last_changed_at
+            }
+            _global_key_changed_at.update(seed)
+        if seed:
+            db.save_app_settings({f"{_KEY_CHANGED_DB_PREFIX}{k}": v for k, v in seed.items()})
     _loaded_from_db = True
 
 
-def get_settings():
-    """回傳目前生效的完整設定(dict)，數值已經是正確型別(float/int)。"""
+def get_settings(engine_id=None):
+    """
+    回傳目前生效的完整設定(dict)，數值已經是正確型別(float/int)。
+    engine_id有給的話，會把該引擎的專屬覆寫疊在全域設定上再回傳(只有
+    TRADING_RELEVANT_KEYS能被覆寫，execution_*/readiness_*永遠是全域)。
+    """
     _load_from_db()
     with _lock:
-        return dict(_settings)
+        merged = dict(_settings)
+        if engine_id:
+            merged.update(_engine_overrides.get(engine_id, {}))
+        return merged
+
+
+def get_engine_overrides(engine_id):
+    """回傳某個引擎目前的專屬覆寫(只含真的被覆寫的欄位)。"""
+    _load_from_db()
+    with _lock:
+        return dict(_engine_overrides.get(engine_id, {}))
+
+
+def update_engine_overrides(engine_id, updates: dict):
+    """
+    設定/清除某個引擎的專屬覆寫。updates是 {欄位: 值 或 None}，值是None代表
+    「清除這個欄位的覆寫、回頭沿用全域」。只接受TRADING_RELEVANT_KEYS。
+    跟update_settings一樣只在「值真的有改變」時才算異動、才更新時間戳記，
+    避免整份表單重送導致誤觸發績效統計的新舊分界。回傳(applied, cleared)。
+    """
+    _load_from_db()
+    from app import db
+    now = datetime.now(timezone.utc).isoformat()
+    applied, cleared = {}, []
+    with _lock:
+        current = _engine_overrides.setdefault(engine_id, {})
+        for key, value in updates.items():
+            if key not in TRADING_RELEVANT_KEYS:
+                continue
+            if value is None or value == "":
+                if key in current:
+                    del current[key]
+                    cleared.append(key)
+                    _engine_key_changed_at.setdefault(engine_id, {})[key] = now
+                continue
+            try:
+                casted = _cast(key, value)
+            except (TypeError, ValueError):
+                continue
+            meta = FIELD_META[key]
+            casted = max(meta["min"], min(meta["max"], casted))
+            if current.get(key) == casted:
+                continue
+            current[key] = casted
+            applied[key] = casted
+            _engine_key_changed_at.setdefault(engine_id, {})[key] = now
+        if not current:
+            _engine_overrides.pop(engine_id, None)
+
+    if db.is_enabled():
+        if applied:
+            payload = {f"{_ENGINE_DB_PREFIX}{engine_id}:{k}": v for k, v in applied.items()}
+            payload.update({f"{_ENGINE_DB_PREFIX}{engine_id}:{_KEY_CHANGED_DB_PREFIX}{k}": now for k in applied})
+            db.save_app_settings(payload)
+        if cleared:
+            db.delete_app_settings([f"{_ENGINE_DB_PREFIX}{engine_id}:{k}" for k in cleared])
+            db.save_app_settings({f"{_ENGINE_DB_PREFIX}{engine_id}:{_KEY_CHANGED_DB_PREFIX}{k}": now for k in cleared})
+    return applied, cleared
+
+
+def clear_engine_overrides(engine_id):
+    """清除某個引擎的全部專屬覆寫，回頭完全沿用全域設定。"""
+    current = get_engine_overrides(engine_id)
+    if not current:
+        return []
+    _, cleared = update_engine_overrides(engine_id, {k: None for k in current})
+    return cleared
 
 
 def get_settings_with_meta():
@@ -325,7 +437,7 @@ def get_settings_with_meta():
     return {"values": get_settings(), "meta": FIELD_META, "last_changed_at": _last_changed_at}
 
 
-def get_last_changed_at():
+def get_last_changed_at(engine_id=None):
     """
     給paper_trading.py的get_summary()用：回傳「交易相關參數」上次被實際修改的
     時間(ISO字串，從未修改過則是None)。只有TRADING_RELEVANT_KEYS裡的欄位被
@@ -337,8 +449,28 @@ def get_last_changed_at():
     只計算新設定底下的交易，避免使用者誤以為改參數後畫面/數字沒反應——
     舊的已平倉交易本來就不會被追溯修改，只有進場時間晚於這個時間點的交易
     才是新設定底下的結果。
+
+    engine_id有給的話，算的是「這個引擎實際生效的參數」上次改變的時間：
+    有覆寫的欄位只看該引擎的覆寫時間(全域改了不影響它)；沒覆寫的欄位看
+    全域該欄位的修改時間(以及這個引擎清除覆寫、回頭沿用全域的時間)。
+    這樣改15分K用的全域參數時，1分K如果自己有覆寫就不會被連帶重置統計
+    (修正記錄見README)。
     """
-    return _last_changed_at
+    if engine_id is None:
+        return _last_changed_at
+    _load_from_db()
+    with _lock:
+        ov = _engine_overrides.get(engine_id, {})
+        ek = _engine_key_changed_at.get(engine_id, {})
+        times = []
+        for key in TRADING_RELEVANT_KEYS:
+            if ek.get(key):
+                times.append(ek[key])
+            if key not in ov:
+                t = _global_key_changed_at.get(key)
+                if t:
+                    times.append(t)
+        return max(times) if times else None
 
 
 def update_settings(updates: dict):
@@ -380,13 +512,19 @@ def update_settings(updates: dict):
         # 只有「真正影響交易行為」的欄位被改動，才更新這個時間戳記——
         # 單純調整達標門檻(readiness_*)不算，因為那不影響交易邏輯本身，
         # 舊交易依然有效，不該被排除在績效統計之外
-        if applied and (set(applied.keys()) & TRADING_RELEVANT_KEYS):
+        changed_trading_keys = set(applied.keys()) & TRADING_RELEVANT_KEYS
+        if changed_trading_keys:
             _last_changed_at = datetime.now(timezone.utc).isoformat()
+            # 同時記錄「每個欄位各自」的修改時間，給引擎專屬覆寫的新舊分界計算用
+            for k in changed_trading_keys:
+                _global_key_changed_at[k] = _last_changed_at
 
     if db.is_enabled() and applied:
         db_applied = dict(applied)
-        if set(applied.keys()) & TRADING_RELEVANT_KEYS:
+        if changed_trading_keys:
             db_applied[_LAST_CHANGED_DB_KEY] = _last_changed_at
+            for k in changed_trading_keys:
+                db_applied[f"{_KEY_CHANGED_DB_PREFIX}{k}"] = _last_changed_at
         db.save_app_settings(db_applied)
 
     return dict(_settings)
