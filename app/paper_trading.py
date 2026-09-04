@@ -28,7 +28,7 @@ from app import settings as settings_module
 from app import notifier as notifier_module
 from app import execution as execution_module
 from app import risk_guard
-from app.trading_stats import compute_stats, assess_readiness
+from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact
 
 logger = logging.getLogger("paper_trading")
 
@@ -453,6 +453,11 @@ class PaperTradingEngine:
         stats_spread_adjusted = compute_stats(stats_trades, spread_cost_points=spread_points)
         readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
 
+        # 用每筆「實際存下來」的真正執行滑點算真實影響(含肥尾佔比與調整後PF)，
+        # 跟上面用假設固定值的版本並列，讓使用者用真實數字決定該擋極端值
+        # 還是壓平均(修正記錄見README)。同一批stats_trades，口徑一致。
+        slippage_impact = compute_slippage_impact(stats_trades)
+
         with self._lock:
             position = self._position
 
@@ -477,6 +482,7 @@ class PaperTradingEngine:
             "stats_spread_adjusted": stats_spread_adjusted,
             "readiness_spread_adjusted": readiness_spread_adjusted,
             "assumed_spread_points": spread_points,
+            "slippage_impact": slippage_impact,
         }
 
 

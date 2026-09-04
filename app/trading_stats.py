@@ -98,6 +98,55 @@ def compute_stats(trades, spread_cost_points=0.0):
     }
 
 
+def compute_slippage_impact(trades, tail_threshold=3.0):
+    """
+    用每筆交易「實際存下來」的開倉+平倉真正執行滑點，算滑點對績效的真實影響
+    (修正記錄見README)。「扣掉假設價差成本」那組統計是把成本攤成固定值，但
+    15分K的實際損失結構是肥尾——大多數交易滑點在±1點內，少數幾筆(+12、+38)
+    一筆吃掉好幾筆利潤。用固定假設值會失真，所以這裡直接用真實資料：
+
+    - total_cost / avg_cost / max_cost：累積、平均、最大單筆滑點成本(正=不利)
+    - tail_count / tail_cost / tail_share：滑點超過tail_threshold的筆數、合計、
+      佔總成本比例——這個數字直接回答「問題是常態成本還是肥尾」：若少數幾筆
+      佔了大半成本，該做的是擋極端值(時段過濾/限價封頂)，不是壓平均
+    - adjusted_stats：把每筆pnl扣掉「該筆實際滑點」後重算的compute_stats，
+      這才是真實執行下的獲利因子
+    只計入有真實下單滑點資料的交易(純模擬的沒有這些欄位、視為0、不計入筆數)。
+    """
+    with_data = 0
+    per_trade_cost = []
+    adjusted = []
+    for t in trades:
+        e = t.get("entry_slippage_points")
+        x = t.get("exit_slippage_points")
+        cost = (e or 0.0) + (x or 0.0)
+        has = e is not None or x is not None
+        if has:
+            with_data += 1
+            per_trade_cost.append(cost)
+        t2 = dict(t)
+        if t2.get("pnl_points") is not None:
+            t2["pnl_points"] = t2["pnl_points"] - cost
+        adjusted.append(t2)
+
+    total_cost = sum(per_trade_cost)
+    tail = [c for c in per_trade_cost if c > tail_threshold]
+    tail_cost = sum(tail)
+    return {
+        "trades_with_data": with_data,
+        "trades_total": len(trades),
+        "total_cost": round(total_cost, 2),
+        "avg_cost": round(total_cost / with_data, 3) if with_data else 0.0,
+        "max_cost": round(max(per_trade_cost), 2) if per_trade_cost else 0.0,
+        "favorable_count": sum(1 for c in per_trade_cost if c < 0),
+        "tail_threshold": tail_threshold,
+        "tail_count": len(tail),
+        "tail_cost": round(tail_cost, 2),
+        "tail_share": round(tail_cost / total_cost * 100, 1) if total_cost > 0 else 0.0,
+        "adjusted_stats": compute_stats(adjusted),
+    }
+
+
 def assess_readiness(stats):
     """
     對照「達標門檻」評估目前的績效統計，回傳是否達標、以及每一項門檻各自的通過狀況，

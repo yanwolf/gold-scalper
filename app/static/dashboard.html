@@ -533,6 +533,7 @@
   </div>
 
   <div id="paperSpreadAdjusted"></div>
+  <div id="paperSlippageImpact"></div>
 
   <div id="paperDrawdownPeriod"></div>
 
@@ -943,6 +944,7 @@ const els = {
   paperTradeList: document.getElementById('paperTradeList'),
   paperMaxDrawdown: document.getElementById('paperMaxDrawdown'),
   paperSpreadAdjusted: document.getElementById('paperSpreadAdjusted'),
+  paperSlippageImpact: document.getElementById('paperSlippageImpact'),
   paperReadiness: document.getElementById('paperReadiness'),
   paperInterval: document.getElementById('paperInterval'),
   engineParamsToggle: document.getElementById('engineParamsToggle'),
@@ -1956,10 +1958,43 @@ function renderPaperTrading(data){
   els.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
 
   renderSpreadAdjusted(els.paperSpreadAdjusted, data);
+  renderSlippageImpact(els.paperSlippageImpact, data.slippage_impact, data);
 
   renderDrawdownPeriod(document.getElementById('paperDrawdownPeriod'), data);
 
   renderTradeList(els.paperTradeList, data.recent_trades, data.settings_changed_at);
+}
+
+function renderSlippageImpact(el, si, data){
+  if(!el) return;
+  if(!si || !si.trades_with_data){ el.innerHTML = ''; return; }
+  const adj = si.adjusted_stats;
+  const pfText = adj.profit_factor != null ? adj.profit_factor.toFixed(2) : (adj.total_trades ? '∞' : '--');
+  const rawPf = data.profit_factor != null ? data.profit_factor.toFixed(2) : '--';
+  const pnlClass = adj.total_pnl_points >= 0 ? 'positive' : 'negative';
+  const tailClass = si.tail_share >= 50 ? 'style="color:var(--resistance); font-weight:700;"' : '';
+  el.innerHTML = `
+    <div class="spread-adjusted-card" style="border-color:var(--gold);">
+      <div class="spread-adjusted-title">實際累積滑點成本（用每筆真實成交價算，非假設值；${si.trades_with_data}/${si.trades_total} 筆有真實下單資料）</div>
+      <div class="stat-row">
+        <div class="stat"><div class="lbl">累積成本</div><div class="val mono ${si.total_cost > 0 ? 'negative' : 'positive'}">${si.total_cost.toFixed(2)}pt</div></div>
+        <div class="stat"><div class="lbl">平均/筆</div><div class="val mono">${si.avg_cost.toFixed(2)}pt</div></div>
+        <div class="stat"><div class="lbl">最大單筆</div><div class="val mono">${si.max_cost.toFixed(2)}pt</div></div>
+      </div>
+      <div class="stat-row" style="margin-top:8px;">
+        <div class="stat"><div class="lbl">肥尾(>${si.tail_threshold}pt)</div><div class="val mono" ${tailClass}>${si.tail_count}筆 佔 ${si.tail_share}%</div></div>
+        <div class="stat"><div class="lbl">有利滑點</div><div class="val mono">${si.favorable_count}筆</div></div>
+      </div>
+      <div class="stat-row" style="margin-top:8px;">
+        <div class="stat"><div class="lbl">真實滑點調整後 獲利因子</div><div class="val mono">${pfText} <span style="font-size:11px; color:var(--muted); font-weight:400;">(原始 ${rawPf})</span></div></div>
+        <div class="stat"><div class="lbl">真實滑點調整後 總損益</div><div class="val mono ${pnlClass}">${adj.total_pnl_points.toFixed(2)}pt</div></div>
+        <div class="stat"><div class="lbl">勝率</div><div class="val mono">${adj.win_rate}%</div></div>
+      </div>
+      <div style="font-size:11px; color:var(--muted); margin-top:8px; line-height:1.6;">
+        肥尾佔比高(紅字)代表損失集中在少數幾筆極端值——該做的是擋極端值(時段過濾/限價封頂)，
+        不是壓平均；佔比低則代表是常態成本，要從出場參數下手。
+      </div>
+    </div>`;
 }
 
 function renderSpreadAdjusted(el, data){
