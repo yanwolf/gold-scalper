@@ -304,6 +304,7 @@ class PaperTradingEngine:
                             db.update_paper_trade_entry_execution(
                                 position.get("id"), quality["expected_fill_price"], actual_fill_price,
                                 quality["slippage_points"], quality["spread"],
+                                book_stale=bool(signal_result.get("book_stale")),
                             )
                         else:
                             # 不要靜默略過——明確講出是「成交價拿不到」還是「盤口
@@ -393,6 +394,7 @@ class PaperTradingEngine:
                         db.update_paper_trade_exit_execution(
                             position.get("id"), quality["expected_fill_price"], actual_fill_price,
                             quality["slippage_points"], quality["spread"],
+                            book_stale=bool(book_stale),
                         )
                     else:
                         if not actual_fill_price:

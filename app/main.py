@@ -213,6 +213,22 @@ async def update_engine_settings(engine_id: str, payload: dict = Body(...)):
     }
 
 
+@app.post("/settings/engine/{engine_id}/reset-stats")
+async def reset_engine_stats(engine_id: str, payload: dict = Body(...)):
+    """
+    「從現在起重新統計」：不改參數，只把這個引擎的績效統計分界設到現在。
+    修了資料層bug之後舊資料是髒的但參數沒變、原本分界機制不會觸發，用這個
+    手動畫線(修正記錄見README)。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    if engine_id not in PAPER_TRADING_ENGINES:
+        return {"success": False, "error": f"沒有engine_id={engine_id}的追蹤引擎"}
+    boundary = settings_module.reset_engine_stats_boundary(engine_id)
+    return {"success": True, "boundary": boundary}
+
+
 @app.post("/settings/engine/{engine_id}/clear")
 async def clear_engine_settings(engine_id: str, payload: dict = Body(...)):
     """清除這個引擎的全部專屬覆寫，回頭完全沿用全域設定。"""

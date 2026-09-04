@@ -114,6 +114,8 @@ def compute_slippage_impact(trades, tail_threshold=3.0):
     只計入有真實下單滑點資料的交易(純模擬的沒有這些欄位、視為0、不計入筆數)。
     """
     with_data = 0
+    guarded = 0        # 修正後(有盤口檢查)的交易：entry_book_stale/exit_book_stale不是NULL
+    stale_flagged = 0  # 修正後、且開倉或平倉當下盤口被判定過期(基準改用最後成交價)的交易
     per_trade_cost = []
     adjusted = []
     for t in trades:
@@ -124,6 +126,11 @@ def compute_slippage_impact(trades, tail_threshold=3.0):
         if has:
             with_data += 1
             per_trade_cost.append(cost)
+            ebs, xbs = t.get("entry_book_stale"), t.get("exit_book_stale")
+            if ebs is not None or xbs is not None:
+                guarded += 1
+                if ebs or xbs:
+                    stale_flagged += 1
         t2 = dict(t)
         if t2.get("pnl_points") is not None:
             t2["pnl_points"] = t2["pnl_points"] - cost
@@ -142,6 +149,8 @@ def compute_slippage_impact(trades, tail_threshold=3.0):
     return {
         "trades_with_data": with_data,
         "trades_total": len(trades),
+        "guarded_count": guarded,
+        "stale_flagged_count": stale_flagged,
         "total_cost": round(total_cost, 2),
         "adverse_cost": round(adverse_cost, 2),
         "favorable_gain": round(favorable_gain, 2),

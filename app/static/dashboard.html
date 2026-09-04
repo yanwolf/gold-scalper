@@ -515,6 +515,7 @@
       <div class="settings-save-row">
         <button id="engineParamsSaveBtn" class="btn-primary">儲存此引擎覆寫</button>
         <button id="engineParamsClearBtn" class="btn-secondary">清除全部覆寫(沿用全域)</button>
+        <button id="engineResetStatsBtn" class="btn-secondary">從現在起重新統計(不改參數)</button>
       </div>
       <div id="engineParamsResult" class="notify-result"></div>
     </div>
@@ -954,6 +955,7 @@ const els = {
   engineParamsForm: document.getElementById('engineParamsForm'),
   engineParamsSaveBtn: document.getElementById('engineParamsSaveBtn'),
   engineParamsClearBtn: document.getElementById('engineParamsClearBtn'),
+  engineResetStatsBtn: document.getElementById('engineResetStatsBtn'),
   engineParamsResult: document.getElementById('engineParamsResult'),
   backtestInterval: document.getElementById('backtestInterval'),
   backtestDays: document.getElementById('backtestDays'),
@@ -1976,6 +1978,11 @@ function renderSlippageImpact(el, si, data){
   el.innerHTML = `
     <div class="spread-adjusted-card" style="border-color:var(--gold);">
       <div class="spread-adjusted-title">實際累積滑點成本（用每筆真實成交價算，非假設值；${si.trades_with_data}/${si.trades_total} 筆有真實下單資料）</div>
+      <div style="font-size:11px; margin:-4px 0 10px; line-height:1.6;">
+        ${si.guarded_count > 0
+          ? `<span style="color:var(--support);">✓ ${si.guarded_count} 筆是盤口檢查修正後的資料</span>${si.stale_flagged_count ? `（其中 ${si.stale_flagged_count} 筆當下盤口過期、已自動改用成交價當基準）` : ''}${si.trades_with_data - si.guarded_count > 0 ? `<span style="color:var(--muted);">，另 ${si.trades_with_data - si.guarded_count} 筆是修正前舊資料(可能含假滑點)</span>` : ''}`
+          : `<span style="color:var(--resistance);">⚠ 全部 ${si.trades_with_data} 筆都是盤口檢查修正前的舊資料，滑點數字可能含假滑點——可用「從現在起重新統計」切掉</span>`}
+      </div>
       <div class="stat-row">
         <div class="stat"><div class="lbl">累積成本</div><div class="val mono ${si.total_cost > 0 ? 'negative' : 'positive'}">${si.total_cost.toFixed(2)}pt</div></div>
         <div class="stat"><div class="lbl">平均/筆</div><div class="val mono">${si.avg_cost.toFixed(2)}pt</div></div>
@@ -2131,6 +2138,20 @@ els.engineParamsClearBtn.addEventListener('click', async () => {
       await loadEngineParams(); fetchPaperTrading();
     }else{ showEngineParamsResult(`清除失敗：${data.error}`, true); }
   }catch(err){ showEngineParamsResult(`清除失敗：${err.message}`, true); }
+});
+
+els.engineResetStatsBtn.addEventListener('click', async () => {
+  if(!confirm('把此引擎的績效統計分界設到「現在」？參數不會改變，只是之後的統計會從這個時間點重新累積(修了資料層bug後用來切掉髒資料)。')) return;
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  const engineId = els.paperInterval.value;
+  try{
+    const res = await fetch(`/settings/engine/${engineId}/reset-stats`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd }),
+    });
+    const data = await res.json();
+    if(data.success){ showEngineParamsResult(`已重新分界：${new Date(data.boundary).toLocaleString('zh-TW',{hour12:false})} 之後的交易才計入統計`, false); fetchPaperTrading(); }
+    else{ showEngineParamsResult(`失敗：${data.error}`, true); }
+  }catch(err){ showEngineParamsResult(`失敗：${err.message}`, true); }
 });
 
 loadEngineParams();

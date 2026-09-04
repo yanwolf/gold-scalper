@@ -255,6 +255,8 @@ _KEY_CHANGED_DB_PREFIX = "_meta_changed_at:"     # 全域設定「每個欄位�
 # TRADING_RELEVANT_KEYS裡的欄位各自覆寫，沒覆寫的欄位沿用全域設定。
 # 資料庫key格式：engine:<engine_id>:<欄位>，時間戳記 engine:<engine_id>:_meta_changed_at:<欄位>
 _ENGINE_DB_PREFIX = "engine:"
+_MANUAL_BOUNDARY_FIELD = "_meta_manual_boundary"  # engine:<id>:_meta_manual_boundary
+_engine_manual_boundary = {}  # {engine_id: iso}  使用者手動「從現在起重新統計」的時間
 _engine_overrides = {}        # {engine_id: {key: value}}
 _engine_key_changed_at = {}   # {engine_id: {key: iso}}  覆寫或清除覆寫的時間
 _global_key_changed_at = {}   # {key: iso}  全域設定每個欄位的最後修改時間
@@ -306,7 +308,9 @@ def _load_from_db():
                     engine_id, _, field = rest.partition(":")
                     if not engine_id or not field:
                         continue
-                    if field.startswith(_KEY_CHANGED_DB_PREFIX):
+                    if field == _MANUAL_BOUNDARY_FIELD:
+                        _engine_manual_boundary[engine_id] = raw_value
+                    elif field.startswith(_KEY_CHANGED_DB_PREFIX):
                         _engine_key_changed_at.setdefault(engine_id, {})[field[len(_KEY_CHANGED_DB_PREFIX):]] = raw_value
                     elif field in TRADING_RELEVANT_KEYS:
                         try:
@@ -423,6 +427,24 @@ def update_engine_overrides(engine_id, updates: dict):
     return applied, cleared
 
 
+def reset_engine_stats_boundary(engine_id):
+    """
+    「從現在起重新統計」(修正記錄見README)：不改任何參數，只把這個引擎的績效
+    統計分界設到現在，之後get_summary只統計這個時間點之後的交易。用途：
+    修了資料層的bug(例如盤口過期導致帳面損益錯誤)之後，舊資料是髒的但參數
+    沒變，原本的分界機制不會觸發；與其等髒資料被稀釋，直接手動畫一條線。
+    回傳新的分界時間(ISO)。
+    """
+    _load_from_db()
+    from app import db
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        _engine_manual_boundary[engine_id] = now
+    if db.is_enabled():
+        db.save_app_settings({f"{_ENGINE_DB_PREFIX}{engine_id}:{_MANUAL_BOUNDARY_FIELD}": now})
+    return now
+
+
 def clear_engine_overrides(engine_id):
     """清除某個引擎的全部專屬覆寫，回頭完全沿用全域設定。"""
     current = get_engine_overrides(engine_id)
@@ -470,6 +492,9 @@ def get_last_changed_at(engine_id=None):
                 t = _global_key_changed_at.get(key)
                 if t:
                     times.append(t)
+        manual = _engine_manual_boundary.get(engine_id)
+        if manual:
+            times.append(manual)
         return max(times) if times else None
 
 

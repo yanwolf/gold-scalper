@@ -163,6 +163,17 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS exit_spread_points DOUBLE PRECISION;
                 """)
+                # 開/平倉當下盤口報價是否過期(修正記錄見README)。修正前的舊資料
+                # 這兩欄是NULL，修正後一律寫入True/False——NULL vs 非NULL就是
+                # 「修正前/修正後」的天然分界線，讓使用者分得出哪些統計是乾淨的。
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS entry_book_stale BOOLEAN;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS exit_book_stale BOOLEAN;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -437,7 +448,8 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                     SELECT direction, entry_price, entry_time, exit_price, exit_time,
                            exit_reason, pnl_points, chan_reason, profile_reason,
                            entry_slippage_points, entry_spread_points,
-                           exit_slippage_points, exit_spread_points
+                           exit_slippage_points, exit_spread_points,
+                           entry_book_stale, exit_book_stale
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -459,6 +471,7 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                 "chan_reason": r[7], "profile_reason": r[8],
                 "entry_slippage_points": r[9], "entry_spread_points": r[10],
                 "exit_slippage_points": r[11], "exit_spread_points": r[12],
+                "entry_book_stale": r[13], "exit_book_stale": r[14],
             }
             for r in rows
         ]
@@ -467,7 +480,7 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
         return []
 
 
-def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, slippage_points, spread_points):
+def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, slippage_points, spread_points, book_stale=False):
     """
     開倉的真實下單流程算出滑價/價差資料後，用這個函式補寫回去(insert_open_paper_trade()
     當下還沒有這些資料，因為要先送出真實下單、拿到成交價才能算出來)。trade_id是
@@ -484,10 +497,11 @@ def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, s
                     """
                     UPDATE paper_trades
                     SET entry_expected_price = %s, entry_actual_price = %s,
-                        entry_slippage_points = %s, entry_spread_points = %s
+                        entry_slippage_points = %s, entry_spread_points = %s,
+                        entry_book_stale = %s
                     WHERE id = %s;
                     """,
-                    (expected_price, actual_price, slippage_points, spread_points, trade_id),
+                    (expected_price, actual_price, slippage_points, spread_points, bool(book_stale), trade_id),
                 )
             conn.commit()
         finally:
@@ -496,7 +510,7 @@ def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, s
         logger.error(f"更新開倉執行品質資料失敗: {e}")
 
 
-def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, slippage_points, spread_points):
+def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, slippage_points, spread_points, book_stale=False):
     """平倉版本的update_paper_trade_entry_execution()，補寫exit_*系列欄位。"""
     if not _enabled or trade_id is None:
         return
@@ -508,10 +522,11 @@ def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, sl
                     """
                     UPDATE paper_trades
                     SET exit_expected_price = %s, exit_actual_price = %s,
-                        exit_slippage_points = %s, exit_spread_points = %s
+                        exit_slippage_points = %s, exit_spread_points = %s,
+                        exit_book_stale = %s
                     WHERE id = %s;
                     """,
-                    (expected_price, actual_price, slippage_points, spread_points, trade_id),
+                    (expected_price, actual_price, slippage_points, spread_points, bool(book_stale), trade_id),
                 )
             conn.commit()
         finally:
@@ -550,7 +565,8 @@ def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", li
                     SELECT id, direction, entry_time, entry_price, exit_time, exit_price,
                            exit_reason, pnl_points, chan_reason, profile_reason,
                            entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points,
-                           exit_expected_price, exit_actual_price, exit_slippage_points, exit_spread_points
+                           exit_expected_price, exit_actual_price, exit_slippage_points, exit_spread_points,
+                           entry_book_stale, exit_book_stale
                     FROM paper_trades
                     WHERE engine_id = %s
                       AND {slip_col} IS NOT NULL
@@ -575,6 +591,7 @@ def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", li
                 "entry_slippage_points": r[12], "entry_spread_points": r[13],
                 "exit_expected_price": r[14], "exit_actual_price": r[15],
                 "exit_slippage_points": r[16], "exit_spread_points": r[17],
+                "entry_book_stale": r[18], "exit_book_stale": r[19],
             }
             for r in rows
         ]

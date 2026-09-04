@@ -2148,3 +2148,25 @@ BTC時那個引擎明確傳symbol="BTCUSDT"覆寫即可。execution.py 8處 + ma
 已測試：重現交易A(盤口凍結4398、成交流4437)正確判定過期並退回成交價；
 盤口恢復後正常使用真實bid/ask；安靜市場不誤判；watchdog落後45秒踢一次且
 冷卻期內不重複；force_reconnect正確關閉連線；健康告警/恢復通知；全面回歸。
+
+## 新增：分辨「盤口修正前/後」的資料 + 「從現在起重新統計」按鈕
+
+**問題**：修了盤口過期bug後重新部署，但15分K那23筆仍混著修正前的髒資料
+(38.73那幾筆都在裡面)，帳面PF 2.26看再多次也分不出哪些是乾淨的。
+
+**修正1 — 每筆交易記錄「是否經過盤口檢查」**：`paper_trades`新增
+`entry_book_stale`/`exit_book_stale`(BOOLEAN)。修正後的交易一律寫入True/False，
+修正前的是NULL——NULL vs 非NULL就是天然分界線。`compute_slippage_impact`
+新增`guarded_count`(修正後筆數)與`stale_flagged_count`(修正後但當下盤口
+過期、已改用成交價當基準的筆數)，dashboard滑點卡片直接標示「✓ N筆是修正後
+資料，另M筆是修正前舊資料(可能含假滑點)」；全部都是舊資料時紅字提醒。
+
+**修正2 — 「從現在起重新統計(不改參數)」**：`settings.reset_engine_stats_boundary()`
+把該引擎的績效統計分界設到現在(存`engine:<id>:_meta_manual_boundary`，
+納入`get_last_changed_at(engine_id)`的max)。用途：修了資料層bug後舊資料是髒的
+但參數沒變，原本的分界機制不會觸發，與其等髒資料被稀釋直接手動畫線。
+API `POST /settings/engine/{id}/reset-stats`，按鈕在模擬單面板「此引擎專屬
+參數」區塊。只切統計、不動任何參數、不影響其他引擎。
+
+已測試：舊交易在分界後全部被排除且參數完全不變；分界後的新交易計入並
+標示為修正後資料；錯密碼/未知引擎拒絕；全面回歸。
