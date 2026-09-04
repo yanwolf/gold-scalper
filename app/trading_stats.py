@@ -130,19 +130,28 @@ def compute_slippage_impact(trades, tail_threshold=3.0):
         adjusted.append(t2)
 
     total_cost = sum(per_trade_cost)
+    adverse_cost = sum(c for c in per_trade_cost if c > 0)      # 所有不利滑點的總額(毛額)
+    favorable_gain = -sum(c for c in per_trade_cost if c < 0)   # 所有有利滑點幫你多賺的總額
     tail = [c for c in per_trade_cost if c > tail_threshold]
     tail_cost = sum(tail)
+    # 肥尾佔比的分母用「不利滑點毛額」而不是淨額——使用者實際資料出現過
+    # 「5筆極端值61pt、其他18筆淨有利15pt、淨成本46pt」的情況，若用淨額
+    # 當分母會顯示132.7%這種超過100%的數字，語意上正確(極端值比淨成本還多)
+    # 但很難讀。改成「極端值佔所有不利滑點的比例」，並另外回傳有利抵銷額
+    # (修正記錄見README)。
     return {
         "trades_with_data": with_data,
         "trades_total": len(trades),
         "total_cost": round(total_cost, 2),
+        "adverse_cost": round(adverse_cost, 2),
+        "favorable_gain": round(favorable_gain, 2),
         "avg_cost": round(total_cost / with_data, 3) if with_data else 0.0,
         "max_cost": round(max(per_trade_cost), 2) if per_trade_cost else 0.0,
         "favorable_count": sum(1 for c in per_trade_cost if c < 0),
         "tail_threshold": tail_threshold,
         "tail_count": len(tail),
         "tail_cost": round(tail_cost, 2),
-        "tail_share": round(tail_cost / total_cost * 100, 1) if total_cost > 0 else 0.0,
+        "tail_share": round(tail_cost / adverse_cost * 100, 1) if adverse_cost > 0 else 0.0,
         "adjusted_stats": compute_stats(adjusted),
     }
 

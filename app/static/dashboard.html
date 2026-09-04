@@ -1982,8 +1982,8 @@ function renderSlippageImpact(el, si, data){
         <div class="stat"><div class="lbl">最大單筆</div><div class="val mono">${si.max_cost.toFixed(2)}pt</div></div>
       </div>
       <div class="stat-row" style="margin-top:8px;">
-        <div class="stat"><div class="lbl">肥尾(>${si.tail_threshold}pt)</div><div class="val mono" ${tailClass}>${si.tail_count}筆 佔 ${si.tail_share}%</div></div>
-        <div class="stat"><div class="lbl">有利滑點</div><div class="val mono">${si.favorable_count}筆</div></div>
+        <div class="stat"><div class="lbl">肥尾(>${si.tail_threshold}pt)</div><div class="val mono" ${tailClass}>${si.tail_count}筆 ${si.tail_cost.toFixed(1)}pt<span style="font-size:11px; font-weight:400;">（佔不利滑點 ${si.tail_share}%）</span></div></div>
+        <div class="stat"><div class="lbl">有利滑點抵銷</div><div class="val mono positive">${si.favorable_count}筆 −${si.favorable_gain.toFixed(1)}pt</div></div>
       </div>
       <div class="stat-row" style="margin-top:8px;">
         <div class="stat"><div class="lbl">真實滑點調整後 獲利因子</div><div class="val mono">${pfText} <span style="font-size:11px; color:var(--muted); font-weight:400;">(原始 ${rawPf})</span></div></div>
