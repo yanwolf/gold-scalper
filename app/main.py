@@ -410,7 +410,11 @@ async def execution_test_order(payload: dict = Body(...)):
     book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
-    success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account)
+    hedge = bool(settings_module.get_settings().get("execution_hedge_mode", 1))
+    mode_ok, mode_result = execution_module.set_position_mode(hedge, account=account)
+    if not mode_ok:
+        return {"success": False, "error": f"持倉模式設定失敗({'雙向' if hedge else '單向'})：{mode_result}（帳戶有未平倉部位時不允許切換，請先平掉）"}
+    success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account, hedge=hedge)
 
     execution_quality = None
     actual_fill_price = None
@@ -468,7 +472,8 @@ async def execution_test_close(payload: dict = Body(...)):
     book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
-    success, result = execution_module.close_position(direction, symbol=symbol, account=account)
+    hedge = bool(settings_module.get_settings().get("execution_hedge_mode", 1))
+    success, result = execution_module.close_position(direction, symbol=symbol, account=account, hedge=hedge)
 
     execution_quality = None
     actual_fill_price = None

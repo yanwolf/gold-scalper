@@ -254,6 +254,15 @@ class PaperTradingEngine:
                     # 這個情況處理成「視同成功」，這裡不用額外判斷。任一項設定失敗就
                     # 直接放棄這筆下單，不會用不確定的保證金模式/槓桿去冒險
                     # (修正記錄見README)。
+                    # 持倉模式(單向/雙向)先確認，再確認保證金模式與槓桿(修正記錄見README)
+                    hedge = bool(s.get("execution_hedge_mode", 1))
+                    mode_ok, mode_result = execution_module.set_position_mode(hedge, account=self.execution_account)
+                    if not mode_ok:
+                        raise RuntimeError(
+                            f"持倉模式設定失敗({'雙向' if hedge else '單向'})，放棄下單: {mode_result}"
+                            "（若是帳戶有未平倉部位不允許切換，請先把該帳戶部位平掉一次）"
+                        )
+
                     margin_type = "ISOLATED" if s["execution_margin_type"] == 0 else "CROSSED"
                     margin_ok, margin_result = execution_module.set_margin_type(
                         margin_type,
@@ -276,6 +285,7 @@ class PaperTradingEngine:
                         quantity=quantity,
                         symbol=self.execution_symbol,
                         account=self.execution_account,
+                        hedge=hedge,
                     )
                     executed = success
                     # 把「這筆單有沒有真的開出真實部位、開了多少」記進部位跟資料庫，
@@ -392,6 +402,7 @@ class PaperTradingEngine:
                     symbol=self.execution_symbol,
                     account=self.execution_account,
                     quantity=position.get("real_open_quantity"),
+                    hedge=bool(s.get("execution_hedge_mode", 1)),
                 )
                 executed = success
                 if success:

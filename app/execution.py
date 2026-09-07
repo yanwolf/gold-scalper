@@ -53,6 +53,22 @@ DEFAULT_ACCOUNT = "gold"
 DEFAULT_SYMBOL = os.getenv("BINANCE_GOLD_SYMBOL", "xauusdt").upper()
 
 
+def physical_account_key(account):
+    """
+    把帳戶名稱對應到「實體帳戶」(修正記錄見README)。使用者確認gold與gold_1m是同一個
+    幣安帳戶的兩把金鑰——風控的「帳戶層級每日虧損上限」要把同一實體帳戶底下所有
+    引擎加總，用名稱分組會漏掉。對應關係由環境變數EXECUTION_SAME_PHYSICAL_ACCOUNTS
+    設定，格式「群組;群組」、群組內用逗號，例如 "gold,gold_1m;btc,btc_1m"。
+    預設 "gold,gold_1m"(符合使用者目前狀況)。不在任何群組的帳戶各自獨立。
+    """
+    groups = os.getenv("EXECUTION_SAME_PHYSICAL_ACCOUNTS", "gold,gold_1m")
+    for group in groups.split(";"):
+        members = [m.strip() for m in group.split(",") if m.strip()]
+        if account in members:
+            return members[0]
+    return account
+
+
 def _resolve_symbol(symbol):
     """
     沒指定symbol時一律退回DEFAULT_SYMBOL，不分帳戶。
@@ -371,6 +387,37 @@ def set_leverage(leverage, symbol=None, account=DEFAULT_ACCOUNT):
     return _signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, account=account)
 
 
+def set_position_mode(hedge, account=DEFAULT_ACCOUNT):
+    """
+    設定帳戶的持倉模式(修正記錄見README)：hedge=True是雙向持倉(Hedge Mode，LONG跟
+    SHORT是兩個獨立部位)，False是單向持倉(只有一個淨部位)。
+
+    使用者確認gold/gold_1m兩把金鑰指向同一個帳戶。單向模式下兩個引擎方向相反時
+    「開倉」會互相抵銷(15分K空1、1分K開多1→淨0，15分K的空單等於被平掉)，這是
+    交易所模式的本質，程式邏輯繞不過；雙向模式下兩側獨立，搭配「只平自己口數」
+    才能真正互不影響。
+
+    這支API跟marginType一樣不是冪等的：已經是目標模式會回-4059「No need to
+    change position side」，視為成功。帳戶有未平倉部位或掛單時不能切換(-4068)，
+    這種情況回傳失敗、呼叫端會放棄這次下單並在通知裡說明——使用者把部位平掉
+    一次之後就會自動切過去。這是帳戶層級設定，跟symbol無關。
+    """
+    success, result = _signed_request(
+        "POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true" if hedge else "false"}, account=account
+    )
+    if not success and isinstance(result, dict) and result.get("code") == -4059:
+        return True, {"msg": "已經是目標持倉模式，不需要變更"}
+    return success, result
+
+
+def get_position_mode(account=DEFAULT_ACCOUNT):
+    """查詢帳戶目前是不是雙向持倉。回傳(success, bool或錯誤)。"""
+    success, result = _signed_request("GET", "/fapi/v1/positionSide/dual", account=account)
+    if success and isinstance(result, dict):
+        return True, bool(result.get("dualSidePosition"))
+    return False, result
+
+
 def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
     """
     設定保證金模式：margin_type是"ISOLATED"(逐倉)或"CROSSED"(全倉)。逐倉是
@@ -408,11 +455,16 @@ def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)
 
 
-def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT):
+def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT, position_side=None):
     """
     送出市價單(指定帳戶)。side是"BUY"或"SELL"，quantity是張數(已經套用過精度)。
     reduce_only=True代表這是平倉單(只能減少部位、不會反向開新倉)，
-    下平倉單時一律加這個保護，避免手誤或邏輯錯誤導致意外開出反向部位。
+    單向模式下平倉單一律加這個保護，避免手誤或邏輯錯誤導致意外開出反向部位。
+
+    position_side="LONG"/"SHORT"代表雙向持倉模式(修正記錄見README)：訂單要指定
+    要動哪一側的部位；雙向模式下幣安不接受reduceOnly參數(改由side+positionSide
+    的組合決定是開倉還是平倉：BUY+LONG開多、SELL+LONG平多、SELL+SHORT開空、
+    BUY+SHORT平空)，所以有position_side時不會送reduceOnly。
     """
     symbol = _resolve_symbol(symbol)
     if quantity <= 0:
@@ -427,7 +479,9 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
         "type": "MARKET",
         "quantity": quantity,
     }
-    if reduce_only:
+    if position_side:
+        params["positionSide"] = position_side
+    elif reduce_only:
         params["reduceOnly"] = "true"
     success, result = _signed_request("POST", "/fapi/v1/order", params, account=account)
 
@@ -447,7 +501,7 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     return success, result
 
 
-def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT):
+def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT, hedge=False):
     """
     依訊號方向在指定帳戶開倉，quantity是直接指定的下單數量(張數)。
     account預設"gold"，之後新增BTC等其他商品時，讓對應的模擬單引擎傳入
@@ -463,26 +517,26 @@ def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT):
         return False, "下單數量必須大於0"
 
     side = "BUY" if direction == "bullish" else "SELL"
-    return place_market_order(side, quantity, symbol=symbol, account=account)
+    position_side = ("LONG" if direction == "bullish" else "SHORT") if hedge else None
+    return place_market_order(side, quantity, symbol=symbol, account=account, position_side=position_side)
 
 
-def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=None):
+def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=None, hedge=False):
     """
     平掉指定帳戶「屬於這筆單」的部位(修正記錄見README)。
 
     修正前的做法是：查帳戶淨部位、有多少平多少、方向由淨部位正負決定——完全
     不看呼叫端原本的方向跟口數。使用者實際遇到：1分K開多單被風控擋下(只有
     帳面部位)，帳面出場時照樣呼叫這裡，帳戶上只有15分K的空單(淨-1)，於是
-    送出BUY把15分K的空單平掉了；15分K之後要出場時發現「沒有部位可以平」。
-    (前提是兩把金鑰其實指向同一個帳戶；但就算帳戶獨立，這種寫法也會把
-    別筆殘留的部位一起平掉。)
+    送出BUY把15分K的空單平掉了。
 
     現在的規則：
-    1. 帳戶淨部位的『方向』必須跟這筆單的方向一致(多單→淨部位必須>0；
-       空單→必須<0)，否則拒絕並回報mismatch，不會把別人的反向部位平掉。
-    2. 只平『這筆單的口數』(quantity)，不是整個淨部位；quantity不給時退回
-       平整個淨部位(舊行為，只給手動測試用)。
-    direction是原本開倉時的方向；回傳(success, order_result_or_error)。
+    1. 雙向模式(hedge=True)：只看這筆單方向那一側(LONG/SHORT)的部位，另一側
+       完全不碰；平倉單帶positionSide、不帶reduceOnly。
+    2. 單向模式：帳戶淨部位的方向必須跟這筆單一致，否則拒絕(不平掉別人的
+       反向部位)。
+    3. 兩種模式都只平『這筆單的口數』(quantity)；不給時退回平整側/整個淨部位
+       (只給手動測試用)。
     """
     if not is_enabled(account):
         return False, f"帳戶「{account}」的執行模組未啟用(未設定API金鑰)"
@@ -492,20 +546,34 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=Non
         return False, position_data
 
     target_symbol = _resolve_symbol(symbol)
+    is_long = direction == "bullish"
+
+    if hedge:
+        want_side = "LONG" if is_long else "SHORT"
+        position_amt = 0.0
+        for p in position_data:
+            if p["symbol"] == target_symbol and p.get("positionSide") == want_side:
+                position_amt = float(p["positionAmt"])
+                break
+        if position_amt == 0:
+            return False, f"雙向模式下{want_side}側目前沒有未平倉部位可以平"
+        side = "SELL" if is_long else "BUY"
+        close_qty = abs(position_amt) if quantity is None else min(abs(position_amt), float(quantity))
+        return place_market_order(side, close_qty, symbol=symbol, account=account, position_side=want_side)
+
     position_amt = 0.0
     for p in position_data:
-        if p["symbol"] == target_symbol:
+        if p["symbol"] == target_symbol and p.get("positionSide", "BOTH") == "BOTH":
             position_amt = float(p["positionAmt"])
             break
 
     if position_amt == 0:
         return False, "目前沒有未平倉部位可以平"
 
-    expected_sign = 1 if direction == "bullish" else -1
-    if (position_amt > 0) != (expected_sign > 0):
+    if (position_amt > 0) != is_long:
         return False, (
             f"帳戶淨部位方向({'多' if position_amt > 0 else '空'} {abs(position_amt)})跟這筆單的方向"
-            f"({'多' if expected_sign > 0 else '空'})不一致，拒絕平倉以免平掉別的引擎的部位"
+            f"({'多' if is_long else '空'})不一致，拒絕平倉以免平掉別的引擎的部位"
         )
 
     side = "SELL" if position_amt > 0 else "BUY"

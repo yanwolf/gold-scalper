@@ -225,6 +225,27 @@ FIELD_META = {
                 "「幣安下單測試」面板多測幾次、觀察真實價差的正常範圍，再抓一個"
                 "合理的上限。",
     },
+    "execution_hedge_mode": {
+        "label": "雙向持倉模式 (0 = 單向 / 1 = 雙向 Hedge Mode)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("EXECUTION_HEDGE_MODE", "1")),
+        "help": "每次真實開倉前系統會自動確認/設定。使用者確認gold/gold_1m是同一個"
+                "帳戶的兩把金鑰：單向模式下兩個引擎方向相反時『開倉』會互相抵銷"
+                "(15分K空1、1分K開多1→淨0，15分K的空單等於被平掉)，這是交易所模式"
+                "的本質、程式繞不過；雙向模式(預設)下LONG/SHORT是兩個獨立部位，"
+                "搭配「只平自己口數」兩個引擎才真正互不影響。注意：帳戶有未平倉"
+                "部位時幣安不允許切換模式，第一次切換前請先把該帳戶的部位平掉"
+                "(切換失敗時該筆單會放棄真實下單並在通知說明)。",
+    },
+    "execution_account_daily_loss_limit_usd": {
+        "label": "帳戶層級每日虧損上限 (USD，0=不啟用)",
+        "type": "float", "step": 5, "min": 0, "max": 100000,
+        "default": float(os.getenv("EXECUTION_ACCOUNT_DAILY_LOSS_LIMIT_USD", "0")),
+        "help": "下面的「每日虧損上限」是每個引擎各自算；但兩個引擎共用同一個帳戶時，"
+                "帳戶實際承受的是兩邊加總。這個上限把「同一個幣安帳戶」底下所有"
+                "真實下單引擎今日的已實現損益加總來看，達到就暫停該帳戶所有引擎"
+                "的新開倉(模擬單不受影響)。0代表不啟用。",
+    },
     "execution_daily_loss_limit_usd": {
         "label": "每日虧損上限 (USD)",
         "type": "float", "step": 5, "min": 1, "max": 100000,

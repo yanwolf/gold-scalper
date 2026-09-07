@@ -138,6 +138,20 @@ def check_current_spread(bid, ask, max_spread_points):
     return True, None
 
 
+def get_account_daily_pnl_usd(execution_account, quantity):
+    """同一個幣安帳戶底下、所有綁定真實下單的引擎，今日已實現損益加總(USD)。"""
+    from app.paper_trading import PAPER_TRADING_ENGINES  # 延遲import避免循環引用
+    s = settings_module.get_settings()
+    total = 0.0
+    from app import execution as execution_module
+    target = execution_module.physical_account_key(execution_account)
+    for eng in PAPER_TRADING_ENGINES.values():
+        if execution_module.physical_account_key(eng.execution_account) != target or not eng._is_execution_engine(s):
+            continue
+        total += get_daily_pnl_usd(eng, quantity)
+    return total
+
+
 def check(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
@@ -170,6 +184,19 @@ def check(engine, quantity, sl_points=None, bid=None, ask=None):
     max_consecutive = s["execution_max_consecutive_losses"]
     if consecutive_losses >= max_consecutive:
         return False, f"連續虧損 {consecutive_losses} 筆，達到連續虧損上限 {max_consecutive} 筆", "consecutive_loss"
+
+    # 帳戶層級每日虧損(修正記錄見README)：兩個引擎共用同一個幣安帳戶時，帳戶
+    # 實際承受的是兩邊加總。把「同一個execution_account」底下所有綁定真實下單
+    # 的引擎今日已實現損益加總，達到上限就擋。0=不啟用。
+    account_limit = s.get("execution_account_daily_loss_limit_usd") or 0
+    if account_limit > 0:
+        from app import execution as execution_module
+        account_pnl = get_account_daily_pnl_usd(engine.execution_account, quantity)
+        if account_pnl <= -account_limit:
+            return False, (
+                f"實體帳戶「{execution_module.physical_account_key(engine.execution_account)}」今日所有引擎合計已實現虧損 ${abs(account_pnl):.2f}，"
+                f"達到帳戶層級每日虧損上限 ${account_limit:.2f}"
+            ), "daily_loss"
 
     if sl_points is not None:
         edge_allowed, edge_reason = check_spread_edge(
