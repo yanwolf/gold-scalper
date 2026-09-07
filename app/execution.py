@@ -466,11 +466,23 @@ def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT):
     return place_market_order(side, quantity, symbol=symbol, account=account)
 
 
-def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT):
+def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=None):
     """
-    平掉指定帳戶目前的部位。direction是原本開倉時的方向(平倉方向要反過來)，
-    實際數量直接查詢目前帳戶部位大小，不用呼叫端自己算，避免因為
-    浮點數誤差或多筆疊加導致平倉數量對不上實際部位。
+    平掉指定帳戶「屬於這筆單」的部位(修正記錄見README)。
+
+    修正前的做法是：查帳戶淨部位、有多少平多少、方向由淨部位正負決定——完全
+    不看呼叫端原本的方向跟口數。使用者實際遇到：1分K開多單被風控擋下(只有
+    帳面部位)，帳面出場時照樣呼叫這裡，帳戶上只有15分K的空單(淨-1)，於是
+    送出BUY把15分K的空單平掉了；15分K之後要出場時發現「沒有部位可以平」。
+    (前提是兩把金鑰其實指向同一個帳戶；但就算帳戶獨立，這種寫法也會把
+    別筆殘留的部位一起平掉。)
+
+    現在的規則：
+    1. 帳戶淨部位的『方向』必須跟這筆單的方向一致(多單→淨部位必須>0；
+       空單→必須<0)，否則拒絕並回報mismatch，不會把別人的反向部位平掉。
+    2. 只平『這筆單的口數』(quantity)，不是整個淨部位；quantity不給時退回
+       平整個淨部位(舊行為，只給手動測試用)。
+    direction是原本開倉時的方向；回傳(success, order_result_or_error)。
     """
     if not is_enabled(account):
         return False, f"帳戶「{account}」的執行模組未啟用(未設定API金鑰)"
@@ -479,8 +491,8 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT):
     if not success:
         return False, position_data
 
-    position_amt = 0.0
     target_symbol = _resolve_symbol(symbol)
+    position_amt = 0.0
     for p in position_data:
         if p["symbol"] == target_symbol:
             position_amt = float(p["positionAmt"])
@@ -489,6 +501,13 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT):
     if position_amt == 0:
         return False, "目前沒有未平倉部位可以平"
 
+    expected_sign = 1 if direction == "bullish" else -1
+    if (position_amt > 0) != (expected_sign > 0):
+        return False, (
+            f"帳戶淨部位方向({'多' if position_amt > 0 else '空'} {abs(position_amt)})跟這筆單的方向"
+            f"({'多' if expected_sign > 0 else '空'})不一致，拒絕平倉以免平掉別的引擎的部位"
+        )
+
     side = "SELL" if position_amt > 0 else "BUY"
-    quantity = abs(position_amt)
-    return place_market_order(side, quantity, symbol=symbol, reduce_only=True, account=account)
+    close_qty = abs(position_amt) if quantity is None else min(abs(position_amt), float(quantity))
+    return place_market_order(side, close_qty, symbol=symbol, reduce_only=True, account=account)

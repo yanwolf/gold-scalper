@@ -230,6 +230,8 @@ class PaperTradingEngine:
 
             if not allowed:
                 skip_reason = block_reason
+                position["real_open_executed"] = False
+                db.update_paper_trade_real_open(position.get("id"), False, None)
                 logger.warning(f"真實下單被擋下({self.label}, 原因類型:{block_type}): {block_reason}")
                 # 只有「真正的風控斷路器」(每日/連續虧損)觸發時才發獨立警示，
                 # 且「剛觸發」的那一刻才發、避免之後每次被擋都重複騷擾。
@@ -276,6 +278,11 @@ class PaperTradingEngine:
                         account=self.execution_account,
                     )
                     executed = success
+                    # 把「這筆單有沒有真的開出真實部位、開了多少」記進部位跟資料庫，
+                    # 平倉時只有真的開過才會送真實平倉單(修正記錄見README)
+                    position["real_open_executed"] = bool(success)
+                    position["real_open_quantity"] = quantity if success else None
+                    db.update_paper_trade_real_open(position.get("id"), bool(success), quantity if success else None)
                     if success:
                         logger.info(f"同步下單成功({self.label}): {result}")
                         actual_fill_price = execution_module.extract_fill_price(result)
@@ -323,6 +330,8 @@ class PaperTradingEngine:
                     executed = False
                     execution_error = str(e)
                     slippage_note = None
+                    position["real_open_executed"] = False
+                    db.update_paper_trade_real_open(position.get("id"), False, None)
                     logger.error(f"同步下單發生例外({self.label}): {e}")
 
         # 事件驅動通知：只有「這個引擎目前綁定真實下單」才會發送Telegram通知，
@@ -364,12 +373,25 @@ class PaperTradingEngine:
         s = settings_module.get_settings(engine_id=self.engine_id)
         is_execution_engine = self._is_execution_engine(s)
 
+        # 平倉只有在「開倉當時真的送出真實下單」才送真實平倉單(修正記錄見README)。
+        # 開倉被風控擋下/下單失敗的帳面部位，出場時絕不能去動帳戶上的真實部位——
+        # 使用者實際遇到1分K的帳面多單「出場」時，把15分K的真實空單平掉了。
+        # real_open_executed是None代表修正前的舊部位(不知道有沒有真開)，維持舊行為
+        # 嘗試平倉，避免留下孤兒真實部位。
+        real_open = position.get("real_open_executed")
+        skip_close_reason = None
+        if is_execution_engine and real_open is False:
+            is_execution_engine = False
+            skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
+            logger.info(f"平倉跳過真實下單({self.label}): {skip_close_reason}")
+
         if is_execution_engine:
             try:
                 success, result = execution_module.close_position(
                     direction=position["direction"],
                     symbol=self.execution_symbol,
                     account=self.execution_account,
+                    quantity=position.get("real_open_quantity"),
                 )
                 executed = success
                 if success:
@@ -410,12 +432,13 @@ class PaperTradingEngine:
                 execution_error = str(e)
                 logger.error(f"同步平倉發生例外({self.label}): {e}")
 
+        if is_execution_engine or skip_close_reason:
             try:
                 notifier_module.notifier.notify_trade_event(
                     action="close", label=self.label,
                     direction=position["direction"], price=exit_price,
                     exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
-                    executed=executed, execution_error=execution_error,
+                    executed=executed, execution_error=execution_error, skip_reason=skip_close_reason,
                     account=self.execution_account, slippage_note=slippage_note,
                 )
             except Exception as e:

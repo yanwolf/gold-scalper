@@ -273,6 +273,35 @@ async def execution_account(password: str = "", account: str = "gold"):
     return {"success": success, "data": data}
 
 
+@app.get("/execution/account-identity")
+async def execution_account_identity(password: str = ""):
+    """
+    檢查gold與gold_1m兩把金鑰是不是指向同一個幣安帳戶(修正記錄見README)。
+    使用者「申請獨立demo API」可能只是同一個測試網帳戶下的第二把金鑰而非子帳戶；
+    若是同一帳戶，兩個引擎的部位會在同一個帳本上互相抵銷。判斷方式：兩邊的
+    餘額明細與部位快照完全相同就幾乎可以確定是同一帳戶。需要密碼。
+    """
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+    out = {}
+    for acct in ("gold", "gold_1m"):
+        if not execution_module.is_enabled(acct):
+            out[acct] = {"enabled": False}
+            continue
+        b_ok, bal = execution_module.get_account_balance(account=acct)
+        p_ok, pos = execution_module.get_position_info(account=acct)
+        out[acct] = {
+            "enabled": True,
+            "balances": {b["asset"]: b.get("balance") for b in bal} if b_ok and isinstance(bal, list) else bal,
+            "positions": [{"symbol": p["symbol"], "positionAmt": p["positionAmt"]} for p in pos if float(p.get("positionAmt", 0)) != 0] if p_ok and isinstance(pos, list) else pos,
+        }
+    same = None
+    if out.get("gold", {}).get("enabled") and out.get("gold_1m", {}).get("enabled"):
+        same = out["gold"].get("balances") == out["gold_1m"].get("balances") and out["gold"].get("positions") == out["gold_1m"].get("positions")
+    return {"success": True, "accounts": out, "likely_same_account": same}
+
+
 @app.get("/execution/position")
 async def execution_position(password: str = "", account: str = "gold", symbol: Optional[str] = None):
     """

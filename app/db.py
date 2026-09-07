@@ -174,6 +174,17 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS exit_book_stale BOOLEAN;
                 """)
+                # 開倉當時「有沒有真的送出真實下單」(修正記錄見README)。平倉時只有它是
+                # True才會送真實平倉單——被風控擋下/下單失敗的帳面部位，出場時絕不能
+                # 去動帳戶上的真實部位(那可能是別的引擎的)。NULL=修正前的舊資料。
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS real_open_executed BOOLEAN;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS real_open_quantity DOUBLE PRECISION;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -458,7 +469,8 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
-                           chan_reason, profile_reason, interval_seconds, engine_id
+                           chan_reason, profile_reason, interval_seconds, engine_id,
+                           real_open_executed, real_open_quantity
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -476,6 +488,7 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             "sl_price": row[4], "peak_price": row[5], "trailing_active": row[6],
             "chan_reason": row[7], "profile_reason": row[8], "interval_seconds": row[9],
             "engine_id": row[10],
+            "real_open_executed": row[11], "real_open_quantity": row[12],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")
@@ -526,6 +539,25 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
     except Exception as e:
         logger.error(f"讀取模擬單歷史失敗: {e}")
         return []
+
+
+def update_paper_trade_real_open(trade_id, executed, quantity=None):
+    """開倉真實下單的結果(成功/失敗/被擋)寫回資料庫，重啟後恢復部位時要靠它決定平倉能不能送真單。"""
+    if not _enabled or trade_id is None:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE paper_trades SET real_open_executed = %s, real_open_quantity = %s WHERE id = %s;",
+                    (bool(executed), quantity, trade_id),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"更新開倉真實下單狀態失敗: {e}")
 
 
 def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, slippage_points, spread_points, book_stale=False):

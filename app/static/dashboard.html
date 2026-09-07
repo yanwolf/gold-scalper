@@ -834,6 +834,7 @@
   <div class="controls" style="margin-bottom:12px;">
     <button id="executionAccountBtn" class="btn-secondary">查詢帳戶餘額</button>
     <button id="executionPositionBtn" class="btn-secondary">查詢目前部位(含強平價)</button>
+    <button id="executionIdentityBtn" class="btn-secondary">檢查gold/gold_1m是否同一帳戶</button>
   </div>
 
   <div class="settings-field">
@@ -985,6 +986,7 @@ const els = {
   executionStatusLine: document.getElementById('executionStatusLine'),
   executionAccountBtn: document.getElementById('executionAccountBtn'),
   executionPositionBtn: document.getElementById('executionPositionBtn'),
+  executionIdentityBtn: document.getElementById('executionIdentityBtn'),
   executionDirection: document.getElementById('executionDirection'),
   executionQuantity: document.getElementById('executionQuantity'),
   executionAccount: document.getElementById('executionAccount'),
@@ -1484,6 +1486,23 @@ els.executionPositionBtn.addEventListener('click', async () => {
     showExecutionResult(`查詢失敗：${err.message}`, true);
   }
   els.executionPositionBtn.disabled = false;
+});
+
+els.executionIdentityBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  els.executionIdentityBtn.disabled = true; showExecutionResult('查詢中...', false);
+  try{
+    const res = await fetch(`/execution/account-identity?password=${encodeURIComponent(pwd)}`);
+    const d = await res.json();
+    if(!d.success){ showExecutionResult(`查詢失敗：${d.error}`, true); }
+    else{
+      const verdict = d.likely_same_account === null ? '（有一邊未設定金鑰，無法比對）'
+        : d.likely_same_account ? '⚠️ 兩把金鑰的餘額與部位完全相同 → 幾乎可以確定是「同一個帳戶」，兩個引擎會共用同一個部位帳本'
+        : '✓ 餘額/部位不同 → 是獨立帳戶';
+      showExecutionResult(`${verdict}\n\n${JSON.stringify(d.accounts, null, 2)}`, d.likely_same_account === true);
+    }
+  }catch(err){ showExecutionResult(`查詢失敗：${err.message}`, true); }
+  els.executionIdentityBtn.disabled = false;
 });
 
 els.executionOpenBtn.addEventListener('click', async () => {
