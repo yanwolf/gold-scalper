@@ -418,6 +418,73 @@ def get_position_mode(account=DEFAULT_ACCOUNT):
     return False, result
 
 
+def get_open_orders(symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    查詢帳戶目前所有「未成交掛單」(不是部位)。symbol=None時查整個帳戶——切換
+    持倉模式是帳戶層級的檢查，別的symbol殘留掛單一樣會擋住切換。
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = _resolve_symbol(symbol)
+    return _signed_request("GET", "/fapi/v1/openOrders", params, account=account)
+
+
+def cancel_all_open_orders(symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    取消指定symbol(預設是本專案交易的symbol)所有未成交掛單。這支API需要symbol。
+    回傳(success, result)。
+    """
+    symbol = _resolve_symbol(symbol)
+    return _signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, account=account)
+
+
+def ensure_position_mode(hedge, account=DEFAULT_ACCOUNT, auto_cancel_orders=True):
+    """
+    確保帳戶是目標持倉模式，但盡量「不切換」：
+      1. 先GET目前模式，已經一致就直接回成功，完全不打切換API。
+      2. 不一致才POST切換。切換被-4067(有掛單)擋下時，如果auto_cancel_orders
+         =True，會先把帳戶上殘留的掛單全部取消(逐symbol呼叫allOpenOrders)再重試
+         一次；殘留掛單通常是之前開倉留下的止損/止盈條件單，本來就該清掉。
+      3. 被-4068(有未平倉部位)擋下時無法自動處理，回傳失敗並說明。
+
+    回傳(success, result)。失敗時result是dict，帶有code/msg以及人看得懂的hint。
+    這樣就不會因為每次進場都硬切一次模式而被交易所擋下，
+    自動觸發的訊號跟dashboard手動測試單都改走這支。
+    """
+    ok, current = get_position_mode(account=account)
+    if ok and current == bool(hedge):
+        return True, {"msg": "持倉模式已符合，未切換", "hedge": bool(hedge)}
+
+    success, result = set_position_mode(hedge, account=account)
+    if success:
+        return True, result
+
+    code = result.get("code") if isinstance(result, dict) else None
+    if code == -4067 and auto_cancel_orders:
+        oo_ok, orders = get_open_orders(account=account)
+        symbols = sorted({o.get("symbol") for o in orders if o.get("symbol")}) if oo_ok and isinstance(orders, list) else []
+        cancelled = []
+        for sym in symbols:
+            c_ok, _ = cancel_all_open_orders(symbol=sym, account=account)
+            if c_ok:
+                cancelled.append(sym)
+        success, result = set_position_mode(hedge, account=account)
+        if success:
+            if isinstance(result, dict):
+                result = dict(result, cancelled_open_orders=cancelled)
+            return True, result
+        if isinstance(result, dict):
+            result = dict(result, hint=f"已嘗試取消掛單({cancelled or '無'})後仍無法切換")
+        return False, result
+
+    if isinstance(result, dict):
+        if code == -4067:
+            result = dict(result, hint="帳戶有未成交掛單，請先取消掛單再切換")
+        elif code == -4068:
+            result = dict(result, hint="帳戶有未平倉部位，請先平倉再切換")
+    return False, result
+
+
 def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
     """
     設定保證金模式：margin_type是"ISOLATED"(逐倉)或"CROSSED"(全倉)。逐倉是

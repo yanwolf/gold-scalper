@@ -256,11 +256,14 @@ class PaperTradingEngine:
                     # (修正記錄見README)。
                     # 持倉模式(單向/雙向)先確認，再確認保證金模式與槓桿(修正記錄見README)
                     hedge = bool(s.get("execution_hedge_mode", 1))
-                    mode_ok, mode_result = execution_module.set_position_mode(hedge, account=self.execution_account)
+                    # 先查再切：已經是目標模式就不會打切換API；被殘留掛單(-4067)擋下時
+                    # 會自動取消掛單再重試一次，避免每次進場都被交易所擋下(修正記錄見README)
+                    mode_ok, mode_result = execution_module.ensure_position_mode(hedge, account=self.execution_account)
                     if not mode_ok:
+                        hint = mode_result.get("hint", "") if isinstance(mode_result, dict) else ""
                         raise RuntimeError(
                             f"持倉模式設定失敗({'雙向' if hedge else '單向'})，放棄下單: {mode_result}"
-                            "（若是帳戶有未平倉部位不允許切換，請先把該帳戶部位平掉一次）"
+                            + (f"（{hint}）" if hint else "")
                         )
 
                     margin_type = "ISOLATED" if s["execution_margin_type"] == 0 else "CROSSED"

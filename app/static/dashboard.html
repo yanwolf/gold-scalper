@@ -835,6 +835,8 @@
     <button id="executionAccountBtn" class="btn-secondary">查詢帳戶餘額</button>
     <button id="executionPositionBtn" class="btn-secondary">查詢目前部位(含強平價)</button>
     <button id="executionIdentityBtn" class="btn-secondary">檢查gold/gold_1m是否同一帳戶</button>
+    <button id="executionOpenOrdersBtn" class="btn-secondary">查詢未成交掛單</button>
+    <button id="executionCancelOrdersBtn" class="btn-secondary">取消全部掛單</button>
   </div>
 
   <div class="settings-field">
@@ -987,6 +989,8 @@ const els = {
   executionAccountBtn: document.getElementById('executionAccountBtn'),
   executionPositionBtn: document.getElementById('executionPositionBtn'),
   executionIdentityBtn: document.getElementById('executionIdentityBtn'),
+  executionOpenOrdersBtn: document.getElementById('executionOpenOrdersBtn'),
+  executionCancelOrdersBtn: document.getElementById('executionCancelOrdersBtn'),
   executionDirection: document.getElementById('executionDirection'),
   executionQuantity: document.getElementById('executionQuantity'),
   executionAccount: document.getElementById('executionAccount'),
@@ -1486,6 +1490,56 @@ els.executionPositionBtn.addEventListener('click', async () => {
     showExecutionResult(`查詢失敗：${err.message}`, true);
   }
   els.executionPositionBtn.disabled = false;
+});
+
+els.executionOpenOrdersBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  els.executionOpenOrdersBtn.disabled = true;
+  showExecutionResult('查詢中...', false);
+  try{
+    const res = await fetch(`/execution/open-orders?password=${encodeURIComponent(pwd)}&account=${els.executionAccount.value}`);
+    const data = await res.json();
+    if(data.success){
+      const orders = data.data || [];
+      if(orders.length === 0){
+        showExecutionResult('目前沒有未成交掛單', false);
+      }else{
+        const lines = orders.map(o =>
+          `${o.symbol} ${o.side} ${o.type} 數量：${o.origQty} 價格：${o.price}${o.stopPrice && o.stopPrice !== '0' ? ' 觸發價：' + o.stopPrice : ''} (${o.positionSide || 'BOTH'})`
+        ).join('\n');
+        showExecutionResult(`共${orders.length}筆未成交掛單(這些會擋住持倉模式切換)：\n${lines}`, false);
+      }
+    }else{
+      showExecutionResult(`查詢失敗：${JSON.stringify(data.error)}`, true);
+    }
+  }catch(err){
+    showExecutionResult(`查詢失敗：${err.message}`, true);
+  }
+  els.executionOpenOrdersBtn.disabled = false;
+});
+
+els.executionCancelOrdersBtn.addEventListener('click', async () => {
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  if(!confirm('確定要取消該帳戶所有未成交掛單？(只取消掛單，不會平倉)')) return;
+  els.executionCancelOrdersBtn.disabled = true;
+  showExecutionResult('取消中...', false);
+  try{
+    const res = await fetch('/execution/cancel-open-orders', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pwd, account: els.executionAccount.value})
+    });
+    const data = await res.json();
+    if(data.success){
+      showExecutionResult(data.order_count === 0 ? '沒有掛單需要取消' : `已取消 ${data.order_count} 筆掛單：${data.cancelled_symbols.join(', ')}`, false);
+    }else{
+      showExecutionResult(`取消失敗：${JSON.stringify(data.error || data.results)}`, true);
+    }
+  }catch(err){
+    showExecutionResult(`取消失敗：${err.message}`, true);
+  }
+  els.executionCancelOrdersBtn.disabled = false;
 });
 
 els.executionIdentityBtn.addEventListener('click', async () => {

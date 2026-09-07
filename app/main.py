@@ -319,6 +319,38 @@ async def execution_position(password: str = "", account: str = "gold", symbol: 
     return {"success": success, "data": data}
 
 
+@app.get("/execution/open-orders")
+async def execution_open_orders(password: str = "", account: str = "gold"):
+    """查詢帳戶所有未成交掛單(整個帳戶、不限symbol)。殘留掛單會擋住持倉模式切換(-4067)。"""
+    ok, error = settings_module.verify_password(password)
+    if not ok:
+        return {"success": False, "error": error}
+    success, data = execution_module.get_open_orders(account=account)
+    return {"success": success, "data": data}
+
+
+@app.post("/execution/cancel-open-orders")
+async def execution_cancel_open_orders(payload: dict = Body(...)):
+    """
+    取消帳戶所有未成交掛單：payload {"password": "...", "account": "gold"}。
+    會先列出帳戶所有掛單的symbol，再逐一呼叫allOpenOrders取消。只動掛單、不碰部位。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    account = payload.get("account", "gold")
+    oo_ok, orders = execution_module.get_open_orders(account=account)
+    if not oo_ok:
+        return {"success": False, "error": orders}
+    symbols = sorted({o.get("symbol") for o in orders if o.get("symbol")})
+    results = {}
+    for sym in symbols:
+        c_ok, c_res = execution_module.cancel_all_open_orders(symbol=sym, account=account)
+        results[sym] = {"success": c_ok, "result": c_res}
+    return {"success": all(r["success"] for r in results.values()) if results else True,
+            "cancelled_symbols": symbols, "results": results, "order_count": len(orders)}
+
+
 @app.get("/execution/estimate-risk")
 async def execution_estimate_risk(quantity: float, sl_points: float, password: str = "", account: str = "gold"):
     """
@@ -411,9 +443,10 @@ async def execution_test_order(payload: dict = Body(...)):
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
     hedge = bool(settings_module.get_settings().get("execution_hedge_mode", 1))
-    mode_ok, mode_result = execution_module.set_position_mode(hedge, account=account)
+    mode_ok, mode_result = execution_module.ensure_position_mode(hedge, account=account)
     if not mode_ok:
-        return {"success": False, "error": f"持倉模式設定失敗({'雙向' if hedge else '單向'})：{mode_result}（帳戶有未平倉部位時不允許切換，請先平掉）"}
+        hint = mode_result.get("hint", "") if isinstance(mode_result, dict) else ""
+        return {"success": False, "error": f"持倉模式設定失敗({'雙向' if hedge else '單向'})：{mode_result}" + (f"（{hint}）" if hint else "")}
     success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account, hedge=hedge)
 
     execution_quality = None
