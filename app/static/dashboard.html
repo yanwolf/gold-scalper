@@ -1577,9 +1577,10 @@ els.executionOpenBtn.addEventListener('click', async () => {
     });
     const data = await res.json();
     if(data.success){
-      showExecutionResult(`開倉成功：\n${JSON.stringify(data.result, null, 2)}\n\n${formatExecutionQuality(data.execution_quality)}`, false);
+      const modeLine = `持倉模式：${data.hedge_mode_used ? '雙向' : '單向'}${data.warning ? '\n⚠️ ' + data.warning : ''}\n\n`;
+      showExecutionResult(`開倉成功：\n${modeLine}${JSON.stringify(data.result, null, 2)}\n\n${formatExecutionQuality(data.execution_quality)}`, false);
     }else{
-      showExecutionResult(`開倉失敗：${JSON.stringify(data.result || data.error)}`, true);
+      showExecutionResult(`開倉失敗：${JSON.stringify(data.result || data.error)}${data.warning ? '\n⚠️ ' + data.warning : ''}`, true);
     }
   }catch(err){
     showExecutionResult(`開倉失敗：${err.message}`, true);

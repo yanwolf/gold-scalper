@@ -485,6 +485,33 @@ def ensure_position_mode(hedge, account=DEFAULT_ACCOUNT, auto_cancel_orders=True
     return False, result
 
 
+def resolve_position_mode(hedge_wanted, account=DEFAULT_ACCOUNT):
+    """
+    決定「這筆單實際要用哪種持倉模式」，永遠不因為切不過去就放棄下單。
+
+    先嘗試ensure_position_mode()切到目標模式；切不過去(例如測試網明明沒掛單
+    也回-4067)就退回使用帳戶「目前」的模式下單，並帶回warning讓通知裡說明。
+    回傳(effective_hedge: bool, warning: str或None)。
+    """
+    ok, result = ensure_position_mode(hedge_wanted, account=account)
+    if ok:
+        return bool(hedge_wanted), None
+    mode_ok, current = get_position_mode(account=account)
+    effective = bool(current) if mode_ok else bool(hedge_wanted)
+    hint = result.get("hint", "") if isinstance(result, dict) else ""
+    warning = (
+        f"持倉模式無法切換成{'雙向' if hedge_wanted else '單向'}({result}{'，' + hint if hint else ''})，"
+        f"改用帳戶目前的{'雙向' if effective else '單向'}模式下單"
+    )
+    return effective, warning
+
+
+def current_hedge_mode(account=DEFAULT_ACCOUNT, default=True):
+    """平倉時用：直接問交易所目前是不是雙向，避免用設定值猜錯而平不掉。"""
+    ok, current = get_position_mode(account=account)
+    return bool(current) if ok else bool(default)
+
+
 def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
     """
     設定保證金模式：margin_type是"ISOLATED"(逐倉)或"CROSSED"(全倉)。逐倉是

@@ -443,10 +443,7 @@ async def execution_test_order(payload: dict = Body(...)):
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
     hedge = bool(settings_module.get_settings().get("execution_hedge_mode", 1))
-    mode_ok, mode_result = execution_module.ensure_position_mode(hedge, account=account)
-    if not mode_ok:
-        hint = mode_result.get("hint", "") if isinstance(mode_result, dict) else ""
-        return {"success": False, "error": f"持倉模式設定失敗({'雙向' if hedge else '單向'})：{mode_result}" + (f"（{hint}）" if hint else "")}
+    hedge, mode_warning = execution_module.resolve_position_mode(hedge, account=account)
     success, result = execution_module.open_position(direction, quantity, symbol=symbol, account=account, hedge=hedge)
 
     execution_quality = None
@@ -480,7 +477,8 @@ async def execution_test_order(payload: dict = Body(...)):
     except Exception as e:
         logger.error(f"手動測試下單通知發送失敗: {e}")
 
-    return {"success": success, "result": result, "execution_quality": execution_quality}
+    return {"success": success, "result": result, "execution_quality": execution_quality,
+            "hedge_mode_used": hedge, "warning": mode_warning}
 
 
 @app.post("/execution/test-close")
@@ -505,7 +503,10 @@ async def execution_test_close(payload: dict = Body(...)):
     book_ok, book = execution_module.get_book_ticker(symbol, account=account) if symbol else (False, None)
     bid, ask = (book["bid"], book["ask"]) if book_ok else (None, None)
 
-    hedge = bool(settings_module.get_settings().get("execution_hedge_mode", 1))
+    # 平倉直接問交易所目前模式，避免設定值跟實際不一致而平不掉
+    hedge = execution_module.current_hedge_mode(
+        account=account, default=bool(settings_module.get_settings().get("execution_hedge_mode", 1))
+    )
     success, result = execution_module.close_position(direction, symbol=symbol, account=account, hedge=hedge)
 
     execution_quality = None

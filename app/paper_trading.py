@@ -258,13 +258,10 @@ class PaperTradingEngine:
                     hedge = bool(s.get("execution_hedge_mode", 1))
                     # 先查再切：已經是目標模式就不會打切換API；被殘留掛單(-4067)擋下時
                     # 會自動取消掛單再重試一次，避免每次進場都被交易所擋下(修正記錄見README)
-                    mode_ok, mode_result = execution_module.ensure_position_mode(hedge, account=self.execution_account)
-                    if not mode_ok:
-                        hint = mode_result.get("hint", "") if isinstance(mode_result, dict) else ""
-                        raise RuntimeError(
-                            f"持倉模式設定失敗({'雙向' if hedge else '單向'})，放棄下單: {mode_result}"
-                            + (f"（{hint}）" if hint else "")
-                        )
+                    # 切不過去也不放棄下單：退回帳戶目前的模式，warning會寫進通知
+                    hedge, mode_warning = execution_module.resolve_position_mode(hedge, account=self.execution_account)
+                    if mode_warning:
+                        logger.warning(f"{self.label}: {mode_warning}")
 
                     margin_type = "ISOLATED" if s["execution_margin_type"] == 0 else "CROSSED"
                     margin_ok, margin_result = execution_module.set_margin_type(
@@ -405,7 +402,9 @@ class PaperTradingEngine:
                     symbol=self.execution_symbol,
                     account=self.execution_account,
                     quantity=position.get("real_open_quantity"),
-                    hedge=bool(s.get("execution_hedge_mode", 1)),
+                    hedge=execution_module.current_hedge_mode(
+                        account=self.execution_account, default=bool(s.get("execution_hedge_mode", 1))
+                    ),
                 )
                 executed = success
                 if success:
