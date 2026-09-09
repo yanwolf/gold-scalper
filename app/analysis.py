@@ -193,21 +193,35 @@ def compute_volume_profile(trades, bucket_size=1.0):
     if not trades:
         return []
 
+    # 每個價位分別累加「主動買」和「主動賣」量。幣安aggTrade的m(is_buyer_maker)
+    # =True代表買方是掛單方、成交是賣方主動打下去的；=False則是買方主動追價。
+    # 沒有這個欄位的資料(舊資料/OANDA)算進unknown，不參與多空分布判斷。
     buckets = {}
     for t in trades:
         level = round(t["price"] / bucket_size) * bucket_size
-        buckets[level] = buckets.get(level, 0.0) + t["qty"]
+        b = buckets.setdefault(level, {"volume": 0.0, "buy": 0.0, "sell": 0.0})
+        qty = t["qty"]
+        b["volume"] += qty
+        maker = t.get("is_buyer_maker")
+        if maker is False:
+            b["buy"] += qty
+        elif maker is True:
+            b["sell"] += qty
 
-    max_volume = max(buckets.values()) if buckets else 1.0
+    max_volume = max(b["volume"] for b in buckets.values()) if buckets else 1.0
 
-    result = [
-        {
+    result = []
+    for level, b in buckets.items():
+        known = b["buy"] + b["sell"]
+        result.append({
             "price_level": level,
-            "volume": volume,
-            "pct_of_max": round((volume / max_volume) * 100, 2),
-        }
-        for level, volume in buckets.items()
-    ]
+            "volume": b["volume"],
+            "pct_of_max": round((b["volume"] / max_volume) * 100, 2),
+            "buy_volume": b["buy"],
+            "sell_volume": b["sell"],
+            "delta": b["buy"] - b["sell"],
+            "buy_pct": round(b["buy"] / known * 100, 1) if known > 0 else None,
+        })
     result.sort(key=lambda x: x["price_level"], reverse=True)
     return result
 
@@ -239,6 +253,147 @@ def poc_and_value_area(volume_profile, value_area_pct=0.70):
         "value_area_high": max(included_levels),
         "value_area_low": min(included_levels),
     }
+
+
+def interpret_volume_profile(volume_profile, poc_info, current_price, bucket_size=1.0):
+    """
+    把分價量表翻成人看得懂的多空分布說明，給dashboard「分價量表」那格用。
+
+    回傳dict，欄位：
+      - summary: 一句話結論
+      - lines: 逐條說明(list of str)
+      - metrics: 數字(給前端顯示或之後做規則用)
+    判斷角度：
+      1. 主動買賣力道：整體delta、以及「最近」的delta(後半段成交)看資金正在往哪邊推
+      2. 價格位置：在Value Area裡面(平衡/盤整)還是外面(失衡/趨勢)，離POC多遠
+      3. 上下籌碼：目前價上方/下方各堆了多少量→上方是壓力(套牢賣壓)、下方是支撐
+      4. 最近的高量節點(HVN)和低量節點(LVN)：HVN是停頓/反彈區，LVN是真空區價格會快速穿過
+    """
+    if not volume_profile or current_price is None:
+        return {"summary": "資料不足", "lines": [], "metrics": {}}
+
+    poc = poc_info.get("poc")
+    vah = poc_info.get("value_area_high")
+    val = poc_info.get("value_area_low")
+
+    total = sum(r["volume"] for r in volume_profile) or 1.0
+    buy = sum(r["buy_volume"] for r in volume_profile)
+    sell = sum(r["sell_volume"] for r in volume_profile)
+    known = buy + sell
+    delta = buy - sell
+    buy_ratio = (buy / known) if known > 0 else None
+
+    above = sum(r["volume"] for r in volume_profile if r["price_level"] > current_price)
+    below = sum(r["volume"] for r in volume_profile if r["price_level"] < current_price)
+    at = total - above - below
+    above_pct = above / total * 100
+    below_pct = below / total * 100
+
+    lines = []
+    metrics = {
+        "buy_volume": round(buy, 4), "sell_volume": round(sell, 4),
+        "delta": round(delta, 4), "buy_ratio": round(buy_ratio * 100, 1) if buy_ratio is not None else None,
+        "above_pct": round(above_pct, 1), "below_pct": round(below_pct, 1), "at_price_pct": round(at / total * 100, 1),
+        "poc_distance": round(current_price - poc, 2) if poc is not None else None,
+        "value_area_width": round(vah - val, 2) if vah is not None and val is not None else None,
+    }
+
+    # 1. 主動買賣力道
+    if buy_ratio is not None:
+        if buy_ratio >= 0.58:
+            force = "主動買盤明顯佔優"
+        elif buy_ratio <= 0.42:
+            force = "主動賣盤明顯佔優"
+        elif buy_ratio >= 0.53:
+            force = "主動買盤略佔優"
+        elif buy_ratio <= 0.47:
+            force = "主動賣盤略佔優"
+        else:
+            force = "多空力道接近均衡"
+        lines.append(f"主動買 {buy_ratio*100:.1f}% / 主動賣 {(1-buy_ratio)*100:.1f}%，{force}(Delta {delta:+.2f})")
+
+    # 2. 價格位置
+    if vah is not None and val is not None:
+        width = vah - val
+        if current_price > vah:
+            lines.append(f"價格在 Value Area({val:.2f}~{vah:.2f})上方 {current_price - vah:.2f} 點：多方已把價格推出平衡區，"
+                         f"若回測 {vah:.2f} 不破，是多方接手、續漲的看法；跌回區內則視為假突破")
+        elif current_price < val:
+            lines.append(f"價格在 Value Area({val:.2f}~{vah:.2f})下方 {val - current_price:.2f} 點：空方已把價格壓出平衡區，"
+                         f"若反彈 {val:.2f} 不過，是空方接手、續跌的看法；漲回區內則視為假跌破")
+        else:
+            pos = (current_price - val) / width * 100 if width > 0 else 50
+            lines.append(f"價格在 Value Area 內部(區間 {val:.2f}~{vah:.2f}，位於 {pos:.0f}% 高度)：目前是平衡盤，"
+                         f"區內來回機率高，靠近 {vah:.2f} 偏向做空、靠近 {val:.2f} 偏向做多，除非帶量突破")
+        if width <= bucket_size * 2:
+            lines.append(f"Value Area 只有 {width:.2f} 點寬，成交極度集中——籌碼壓縮在一起，之後不管往哪邊出去通常都是快速行情")
+        elif width >= bucket_size * 8:
+            lines.append(f"Value Area 有 {width:.2f} 點寬，成交分散——沒有明確共識價位，訊號可信度較低")
+
+    # 3. 上下籌碼分布
+    if poc is not None:
+        dist = current_price - poc
+        if abs(dist) < bucket_size:
+            lines.append(f"價格貼著 POC {poc:.2f}：這裡是多空爭奪最激烈的價位，站穩之上偏多、跌回之下偏空")
+        elif dist > 0:
+            lines.append(f"價格在 POC {poc:.2f} 上方 {dist:.2f} 點，下方有 {below_pct:.0f}% 的成交量墊著當支撐，"
+                         f"上方只剩 {above_pct:.0f}% 的籌碼壓力")
+        else:
+            lines.append(f"價格在 POC {poc:.2f} 下方 {abs(dist):.2f} 點，上方有 {above_pct:.0f}% 的成交量形成套牢賣壓，"
+                         f"下方只有 {below_pct:.0f}% 的籌碼支撐")
+
+    # 4. 最近的HVN/LVN
+    sorted_levels = sorted(volume_profile, key=lambda r: r["price_level"])
+    hvn_threshold = 50.0   # pct_of_max >= 50% 視為高量節點
+    lvn_threshold = 15.0   # pct_of_max <= 15% 視為低量節點
+    hvn_above = [r for r in sorted_levels if r["price_level"] > current_price and r["pct_of_max"] >= hvn_threshold]
+    hvn_below = [r for r in sorted_levels if r["price_level"] < current_price and r["pct_of_max"] >= hvn_threshold]
+    lvn_above = [r for r in sorted_levels if r["price_level"] > current_price and r["pct_of_max"] <= lvn_threshold]
+    lvn_below = [r for r in sorted_levels if r["price_level"] < current_price and r["pct_of_max"] <= lvn_threshold]
+
+    parts = []
+    if hvn_above:
+        parts.append(f"上方最近高量節點 {hvn_above[0]['price_level']:.2f}(壓力，容易停頓)")
+    if hvn_below:
+        parts.append(f"下方最近高量節點 {hvn_below[-1]['price_level']:.2f}(支撐，容易反彈)")
+    if parts:
+        lines.append("；".join(parts))
+    parts = []
+    if lvn_above:
+        parts.append(f"上方 {lvn_above[0]['price_level']:.2f} 是低量真空區，突破後容易快速上衝")
+    if lvn_below:
+        parts.append(f"下方 {lvn_below[-1]['price_level']:.2f} 是低量真空區，跌破後容易快速下殺")
+    if parts:
+        lines.append("；".join(parts))
+
+    # 5. POC本身的買賣結構：最大量價位是被買方接走還是賣方倒出來的
+    poc_row = next((r for r in volume_profile if r["price_level"] == poc), None)
+    if poc_row and poc_row.get("buy_pct") is not None:
+        bp = poc_row["buy_pct"]
+        if bp >= 55:
+            lines.append(f"POC {poc:.2f} 的成交以主動買為主({bp:.0f}%)：這個價位是買方吸籌區，跌回來有承接")
+        elif bp <= 45:
+            lines.append(f"POC {poc:.2f} 的成交以主動賣為主({100-bp:.0f}%)：這個價位是賣方派發區，反彈上來有賣壓")
+        else:
+            lines.append(f"POC {poc:.2f} 買賣各半({bp:.0f}%買)：純粹是換手區，方向要看誰先離開")
+
+    # 一句話結論
+    if vah is not None and current_price > vah:
+        loc = "價格在平衡區上方"
+    elif val is not None and current_price < val:
+        loc = "價格在平衡區下方"
+    else:
+        loc = "價格在平衡區內"
+    if buy_ratio is None:
+        summary = loc
+    elif buy_ratio >= 0.53:
+        summary = f"{loc}，主動買盤佔優"
+    elif buy_ratio <= 0.47:
+        summary = f"{loc}，主動賣盤佔優"
+    else:
+        summary = f"{loc}，多空均衡"
+
+    return {"summary": summary, "lines": lines, "metrics": metrics}
 
 
 # ---------------------------------------------------------------------------

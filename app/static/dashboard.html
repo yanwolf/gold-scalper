@@ -88,7 +88,18 @@
   }
   .bar.resistance{ background: linear-gradient(90deg, var(--resistance-dim), var(--resistance)); }
   .bar.support{ background: linear-gradient(90deg, var(--support-dim), var(--support)); }
-  .bar .pct{ font-size: 10px; font-weight: 700; color: #0a0e17; white-space: nowrap; }
+  .bar .pct{ font-size: 10px; font-weight: 700; color: #0a0e17; white-space: nowrap; position:relative; z-index:1; }
+  /* 每根bar內部再切成主動買(左、綠)/主動賣(右、紅)兩段，寬度比例就是buy_pct */
+  .bar .split{ position:absolute; inset:0; border-radius:3px; overflow:hidden; display:flex; }
+  .bar .split .buy{ background: var(--support); opacity: .85; }
+  .bar .split .sell{ background: var(--resistance); opacity: .85; }
+  .bar.has-split{ background: transparent; }
+  .bar .delta-tag{ position:absolute; right:-2px; top:50%; transform:translate(100%,-50%); font-size:9px; color: var(--muted); white-space:nowrap; padding-left:6px; }
+  .profile-interp{ margin-top: 12px; background:#00000030; border-radius:8px; padding:10px 12px; font-size:12.5px; line-height:1.55; }
+  .profile-interp .summary{ font-weight:700; margin-bottom:6px; }
+  .profile-interp ul{ margin:0; padding-left:16px; color: var(--text); }
+  .profile-interp li{ margin: 3px 0; }
+  .profile-interp .legend{ font-size:10.5px; color: var(--muted); margin-top:6px; }
   .row.is-poc{ outline: 1px solid var(--gold); border-radius: 4px; box-shadow: 0 0 12px var(--gold-glow); }
   .row.is-poc .price-label{ color: var(--gold); font-weight: 700; }
   .price-label{ font-size: 12px; text-align:right; color: var(--text); }
@@ -1161,17 +1172,35 @@ function renderProfile(data, currentPrice){
       currentLineInserted = true;
     }
 
+    const hasSplit = row.buy_pct != null;
+    const splitHtml = hasSplit
+      ? `<div class="split"><div class="buy" style="width:${row.buy_pct}%"></div><div class="sell" style="width:${100 - row.buy_pct}%"></div></div>`
+      : '';
+    const deltaTag = hasSplit ? `<span class="delta-tag mono">買${row.buy_pct.toFixed(0)}%</span>` : '';
     rows.push(`
       <div class="row ${isPoc ? 'is-poc' : ''}">
         <div class="bar-track">
-          <div class="bar ${isResistance ? 'resistance' : 'support'}" style="width:${widthPct}%">
+          <div class="bar ${isResistance ? 'resistance' : 'support'} ${hasSplit ? 'has-split' : ''}" style="width:${widthPct}%">
+            ${splitHtml}
             <span class="pct">${row.pct_of_max.toFixed(1)}%</span>
+            ${deltaTag}
           </div>
         </div>
         <div class="price-label mono">${row.price_level.toFixed(2)}</div>
       </div>
     `);
   });
+
+  const interp = data.interpretation;
+  if(interp && interp.lines && interp.lines.length){
+    rows.push(`
+      <div class="profile-interp">
+        <div class="summary">${interp.summary}</div>
+        <ul>${interp.lines.map(l => `<li>${l}</li>`).join('')}</ul>
+        <div class="legend">每根bar左綠段=主動買(追價買)、右紅段=主動賣(砸價賣)，右側「買%」是該價位主動買佔比；粗bar=高量節點(容易停頓/反彈)，細bar=低量真空區(容易快速穿過)</div>
+      </div>
+    `);
+  }
 
   els.chart.innerHTML = rows.join('');
 }

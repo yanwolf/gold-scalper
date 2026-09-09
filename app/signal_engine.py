@@ -25,7 +25,7 @@ import os
 
 from app.binance_client import binance_streamer
 from app.analysis import (
-    build_candles, compute_volume_profile, poc_and_value_area, analyze_chan,
+    build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile,
     compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
@@ -111,6 +111,8 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         "trade_count": len(profile_trades),
         "profile": profile,
         **poc_info,
+        # 多空分布的文字解讀(主動買賣比、價格相對VA/POC位置、上下籌碼、HVN/LVN)
+        "interpretation": interpret_volume_profile(profile, poc_info, current_price, bucket_size=bucket_size),
     }
     return result
 

@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from app.oanda_client import streamer
 from app.binance_client import binance_streamer
-from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan
+from app.analysis import build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile
 from app.signal_engine import compute_full_signal
 from app.notifier import notifier
 from app.paper_trading import PAPER_TRADING_ENGINES
@@ -797,11 +797,13 @@ async def analysis_volume_profile(bucket_size: float = 1.0, trade_limit: int = 1
     trades = binance_streamer.get_recent_trades(limit=trade_limit)
     profile = compute_volume_profile(trades, bucket_size=bucket_size)
     poc_info = poc_and_value_area(profile)
+    current_price = trades[-1]["price"] if trades else None
     return {
         "bucket_size": bucket_size,
         "trade_count": len(trades),
         "profile": profile,
         **poc_info,
+        "interpretation": interpret_volume_profile(profile, poc_info, current_price, bucket_size=bucket_size),
     }
 
 
