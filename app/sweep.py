@@ -123,7 +123,8 @@ def _build_combos(baseline_overrides=None):
 
 
 def start_sweep(days=2, interval_seconds=60, baseline_overrides=None,
-                strategy_type=None, resonance_min_conditions=4, symbol="XAUUSDT", bucket_size=1.0):
+                strategy_type=None, resonance_min_conditions=4, symbol="XAUUSDT", bucket_size=1.0,
+                target_step_count=None):
     """
     啟動一次掃描，立刻回傳job_id，實際運算在背景執行緒進行。
     strategy_type/resonance_min_conditions/symbol/bucket_size跟單次回測面板選的
@@ -138,6 +139,7 @@ def start_sweep(days=2, interval_seconds=60, baseline_overrides=None,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,
         "bucket_size": bucket_size,
+        "target_step_count": target_step_count,
     }
 
     job = {
@@ -162,12 +164,27 @@ def start_sweep(days=2, interval_seconds=60, baseline_overrides=None,
 
 def _run_sweep(job_id, combos, days, interval_seconds, context=None):
     context = context or {}
+    symbol = context.get("symbol", "XAUUSDT")
+    # 整次掃描只抓一次歷史K線，所有組合共用：對照組和實驗組才是在同一份資料上
+    # 比較，也不會因為每組各自抓資料、視窗逐漸位移而彼此對不上
+    try:
+        shared_klines = backtest_module.fetch_historical_klines(symbol=symbol, days=days)
+    except Exception as e:
+        logger.error(f"參數掃描抓歷史資料失敗: {e}")
+        shared_klines = None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job and shared_klines:
+            job["data_start_time"] = int(shared_klines[0][0])
+            job["data_end_time"] = int(shared_klines[-1][6])
     for combo in combos:
         try:
             result = backtest_module.run_backtest(
                 days=days,
                 interval_seconds=interval_seconds,
-                symbol=context.get("symbol", "XAUUSDT"),
+                klines=shared_klines,
+                target_step_count=context.get("target_step_count"),
+                symbol=symbol,
                 bucket_size=context.get("bucket_size", 1.0),
                 strategy_type=context.get("strategy_type"),
                 resonance_min_conditions=context.get("resonance_min_conditions", 4),

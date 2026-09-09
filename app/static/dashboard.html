@@ -579,6 +579,15 @@
       <option value="14">回測 14 天</option>
       <option value="30">回測 30 天</option>
     </select>
+    <select id="backtestResolution">
+      <option value="1200" selected>標準精細度(約1200步)</option>
+      <option value="3000">高精細度(約3000步，慢2.5倍)</option>
+      <option value="6000">最高精細度(約6000步，慢5倍)</option>
+    </select>
+  </div>
+  <div style="font-size:11.5px; color:var(--muted); margin:-4px 0 12px; line-height:1.6;">
+    ↑ 精細度=重播步數上限，回測時間跟步數成正比。1分K每天1440根：標準精細度下1天每根都檢查、2天隔一根、7天隔8根、30天隔36根。
+    要讓2天1分K每根都檢查選「高精細度」；3天以上想每根都看請改用5分K/15分K，不要硬拉精細度，30天會跑不完。掃描也會沿用這個設定(時間再乘以組數)。
   </div>
   <div class="controls" style="margin-top:8px;">
     <select id="backtestStrategy">
@@ -974,6 +983,7 @@ const els = {
   engineParamsResult: document.getElementById('engineParamsResult'),
   backtestInterval: document.getElementById('backtestInterval'),
   backtestDays: document.getElementById('backtestDays'),
+  backtestResolution: document.getElementById('backtestResolution'),
   backtestStrategy: document.getElementById('backtestStrategy'),
   backtestResonanceThreshold: document.getElementById('backtestResonanceThreshold'),
   backtestSymbol: document.getElementById('backtestSymbol'),
@@ -2303,7 +2313,8 @@ els.backtestRunBtn.addEventListener('click', async () => {
   els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
 
   try{
-    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}${paramOverrides ? '&' + paramOverrides : ''}`);
+    const targetSteps = els.backtestResolution.value;
+    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`);
     if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
     const data = await res.json();
 
@@ -2319,6 +2330,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
       <div class="backtest-meta">
         回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根K線 ／ 還原成 ${data.synthetic_trade_count} 筆合成成交
         ／ 實際重播 ${data.replay_step_count} 步${data.replay_stride > 1 ? `(取樣間隔 ${data.replay_stride}，天數較長時自動降低精細度以控制運算時間)` : ''}
+        ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
       <div id="backtestActiveConfig"></div>
       ${readinessDiv.innerHTML}
@@ -2527,7 +2539,7 @@ let sweepPollTimer = null;
 
 function renderSweepResults(job){
   const progressText = job.status === 'done'
-    ? `已完成全部 ${job.total} 組（策略：${job.strategy_type === 'resonance_fvg' ? '多條件共振+FVG ' + job.resonance_min_conditions + '/4' : '纏論+分價量表'}，${job.symbol || 'XAUUSDT'}，${job.days} 天）`
+    ? `已完成全部 ${job.total} 組（策略：${job.strategy_type === 'resonance_fvg' ? '多條件共振+FVG ' + job.resonance_min_conditions + '/4' : '纏論+分價量表'}，${job.symbol || 'XAUUSDT'}，${job.days} 天${job.data_end_time ? '，資料截至 ' + new Date(job.data_end_time).toLocaleString('zh-TW', {hour12:false}) : ''}）`
     : `進度：${job.completed} / ${job.total} 組`;
 
   const results = job.results || [];
@@ -2601,7 +2613,8 @@ els.sweepStartBtn.addEventListener('click', async () => {
     const resonanceMinConditions = els.backtestResonanceThreshold.value;
     const symbol = els.backtestSymbol.value;
     const bucketSize = els.backtestBucketSize.value;
-    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&symbol=${symbol}&bucket_size=${bucketSize}${paramOverrides ? '&' + paramOverrides : ''}`, { method: 'POST' });
+    const targetSteps = els.backtestResolution.value;
+    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&symbol=${symbol}&bucket_size=${bucketSize}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`, { method: 'POST' });
     if(!res.ok) throw new Error(`啟動失敗 (${res.status})`);
     const data = await res.json();
 

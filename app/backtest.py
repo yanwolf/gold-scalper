@@ -18,6 +18,7 @@
 """
 
 import bisect
+import os
 import logging
 from datetime import datetime, timezone
 
@@ -51,7 +52,13 @@ MAX_BACKTEST_DAYS = 30  # 天數上限，從7天拉長到30天，為之後測試
                         # 會自動控制重播步數)，唯一會變長的是抓歷史K線的階段(要打更多次Binance
                         # API分頁請求)，這段是網路等待、不是佔用CPU運算，不會卡住伺服器
                         # (回測本來就是丟到背景執行緒跑，見main.py的asyncio.to_thread)。
-TARGET_STEP_COUNT = 1200  # 重播步數的目標上限，天數越長會自動拉大取樣間隔(stride)來控制在這附近
+TARGET_STEP_COUNT = int(os.getenv("BACKTEST_TARGET_STEP_COUNT", "1200"))  # 重播步數的目標上限(預設值)，天數越長會自動拉大取樣間隔(stride)來控制在這附近
+MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑要求每根都檢查30天(43200步)把伺服器跑死
+# 步數=實際跑訊號分析的次數，回測時間跟步數幾乎成正比(每一步都要重算纏論/指標)。
+# 1分K：1天=1440根、2天=2880根、7天=10080根、30天=43200根。
+# 預設1200步時：1天stride=1(每根都看)，2天stride=2，7天stride=8，30天stride=36。
+# 呼叫端可以用target_step_count拉高(例如3000讓2天資料每根都檢查)，但長天數請維持預設，
+# 30天回測就是因為以前沒有這個上限跑不完才加的。
 
 
 def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2):
@@ -60,8 +67,12 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2):
     公開市場資料，不需要API Key。
     """
     days = min(days, MAX_BACKTEST_DAYS)
-    end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_time = end_time - days * 24 * 60 * 60 * 1000
+    # 結束時間對齊到「上一根已收完的整分鐘」，起點也跟著對齊。以前直接用now()，
+    # 每次呼叫的視窗起點都差幾秒到幾分鐘，抓回來的K線集合會位移，跟下面的
+    # stride取樣疊在一起後，兩次回測檢查到的K線幾乎完全不同(修正記錄見README)。
+    minute_ms = 60 * 1000
+    end_time = (int(datetime.now(timezone.utc).timestamp() * 1000) // minute_ms) * minute_ms - 1
+    start_time = end_time - days * 24 * 60 * 60 * 1000 + 1
 
     all_klines = []
     cursor = start_time
@@ -137,6 +148,8 @@ def run_backtest(
     strategy_type=None,
     resonance_min_conditions=4,
     spread_cost_points=None,
+    klines=None,
+    target_step_count=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -207,7 +220,10 @@ def run_backtest(
     if spread_cost_points is None:
         spread_cost_points = s.get("execution_assumed_spread_points", 0.0)
 
-    klines = fetch_historical_klines(symbol=symbol, days=days)
+    # klines可由呼叫端預先抓好傳進來(參數掃描用：十幾組回測共用同一份資料，
+    # 對照組和每一組實驗才是在完全相同的K線上比較，也省掉重複抓資料的時間)
+    if klines is None:
+        klines = fetch_historical_klines(symbol=symbol, days=days)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}
 
@@ -220,8 +236,20 @@ def run_backtest(
     # 用stride(取樣間隔)把總重播步數控制在TARGET_STEP_COUNT附近：天數短時每根K線
     # 都檢查(stride=1)，天數長時跳著檢查，犧牲一些精確度換取能在合理時間內跑完。
     all_step_times = sorted({int(k[6]) for k in klines})
-    stride = max(1, len(all_step_times) // TARGET_STEP_COUNT)
-    step_times = all_step_times[::stride]
+    if not target_step_count:
+        target_step_count = TARGET_STEP_COUNT
+    target_step_count = max(100, min(int(target_step_count), MAX_TARGET_STEP_COUNT))
+    stride = max(1, len(all_step_times) // target_step_count)
+    # 取樣相位鎖定在絕對時間上：不是「從清單第0根開始每隔stride根取一根」，
+    # 而是「K線序號(收盤時間/週期) mod stride == 0 的那幾根」。這樣不管視窗
+    # 起點落在哪裡，被檢查到的永遠是同一批K線。以前用[::stride]，2天資料
+    # stride=2時，視窗只要位移一根K線，取樣到的就是完全互補的另一半K線，
+    # 同一組參數前後一分鐘跑出來的績效可以差到上百點(修正記錄見README)。
+    if stride > 1 and len(all_step_times) >= 2:
+        kline_ms = all_step_times[1] - all_step_times[0]
+        step_times = [t for t in all_step_times if (t // kline_ms) % stride == 0]
+    else:
+        step_times = all_step_times
 
     position = None
     closed_trades = []
@@ -332,6 +360,9 @@ def run_backtest(
         "synthetic_trade_count": len(trades),
         "replay_step_count": len(step_times),
         "replay_stride": stride,  # 1代表每根K線都檢查，>1代表跳著檢查(天數長時的效能取捨)
+        "target_step_count": target_step_count,
+        "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
+        "data_end_time": int(klines[-1][6]),
         "sl_points": sl_points,
         "trail_trigger_points": trail_trigger_points,
         "trail_distance_points": trail_distance_points,

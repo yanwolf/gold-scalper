@@ -611,6 +611,7 @@ async def backtest_run(
     chop_threshold: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
+    target_step_count: Optional[int] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -669,6 +670,7 @@ async def backtest_run(
         chop_threshold=chop_threshold,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
+        target_step_count=target_step_count,
     )
 
 
@@ -690,6 +692,7 @@ async def backtest_sweep_start(
     resonance_min_conditions: int = 4,
     symbol: str = "XAUUSDT",
     bucket_size: float = 1.0,
+    target_step_count: Optional[int] = None,
 ):
     """
     參數掃描：對模擬單風控參數做「一次改一個參數」的敏感度測試，一次跑多組回測，
@@ -734,7 +737,7 @@ async def backtest_sweep_start(
     job_id = sweep_module.start_sweep(
         days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None,
         strategy_type=strategy_type, resonance_min_conditions=resonance_min_conditions,
-        symbol=symbol, bucket_size=bucket_size,
+        symbol=symbol, bucket_size=bucket_size, target_step_count=target_step_count,
     )
     return {"job_id": job_id}
 
