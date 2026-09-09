@@ -712,6 +712,7 @@
     </select>
     <button id="sweepStartBtn" class="btn-secondary">開始掃描</button>
   </div>
+  <div style="font-size:11.5px; color:var(--muted); margin:8px 0 12px; line-height:1.6;">策略類型、共振門檻、商品、箱寬會沿用上方「歷史回測」面板目前的選擇；K線週期和天數在這裡另外選(掃描要跑十幾組，天數短一點比較快)。</div>
 
   <div id="sweepResult" style="margin-top:14px;"></div>
 </div>
@@ -2526,7 +2527,7 @@ let sweepPollTimer = null;
 
 function renderSweepResults(job){
   const progressText = job.status === 'done'
-    ? `已完成全部 ${job.total} 組`
+    ? `已完成全部 ${job.total} 組（策略：${job.strategy_type === 'resonance_fvg' ? '多條件共振+FVG ' + job.resonance_min_conditions + '/4' : '纏論+分價量表'}，${job.symbol || 'XAUUSDT'}，${job.days} 天）`
     : `進度：${job.completed} / ${job.total} 組`;
 
   const results = job.results || [];
@@ -2595,7 +2596,12 @@ els.sweepStartBtn.addEventListener('click', async () => {
   els.sweepResult.innerHTML = '<div class="loading-spinner">正在啟動掃描...</div>';
 
   try{
-    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}${paramOverrides ? '&' + paramOverrides : ''}`, { method: 'POST' });
+    // 策略類型/共振門檻/商品/箱寬也一併沿用回測面板的選擇，掃描出來的對照組才會跟單次回測同一套策略
+    const strategyType = els.backtestStrategy.value;
+    const resonanceMinConditions = els.backtestResonanceThreshold.value;
+    const symbol = els.backtestSymbol.value;
+    const bucketSize = els.backtestBucketSize.value;
+    const res = await fetch(`/backtest/sweep?days=${days}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&symbol=${symbol}&bucket_size=${bucketSize}${paramOverrides ? '&' + paramOverrides : ''}`, { method: 'POST' });
     if(!res.ok) throw new Error(`啟動失敗 (${res.status})`);
     const data = await res.json();
 

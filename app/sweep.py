@@ -122,10 +122,23 @@ def _build_combos(baseline_overrides=None):
     return combos
 
 
-def start_sweep(days=2, interval_seconds=60, baseline_overrides=None):
-    """啟動一次掃描，立刻回傳job_id，實際運算在背景執行緒進行。"""
+def start_sweep(days=2, interval_seconds=60, baseline_overrides=None,
+                strategy_type=None, resonance_min_conditions=4, symbol="XAUUSDT", bucket_size=1.0):
+    """
+    啟動一次掃描，立刻回傳job_id，實際運算在背景執行緒進行。
+    strategy_type/resonance_min_conditions/symbol/bucket_size跟單次回測面板選的
+    一致傳進來——以前掃描沒接這幾個參數，永遠用預設策略(纏論+分價量表)跑黃金，
+    使用者在回測面板選了「多條件共振+FVG」再按掃描，對照組跑的其實是另一套策略，
+    數字對不上(修正記錄見README)。
+    """
     job_id = str(uuid.uuid4())[:8]
     combos = _build_combos(baseline_overrides=baseline_overrides)
+    context = {
+        "strategy_type": strategy_type,
+        "resonance_min_conditions": resonance_min_conditions,
+        "symbol": symbol,
+        "bucket_size": bucket_size,
+    }
 
     job = {
         "id": job_id,
@@ -136,22 +149,28 @@ def start_sweep(days=2, interval_seconds=60, baseline_overrides=None):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "days": days,
         "interval_seconds": interval_seconds,
+        **context,
     }
     with _jobs_lock:
         _jobs[job_id] = job
 
-    thread = threading.Thread(target=_run_sweep, args=(job_id, combos, days, interval_seconds), daemon=True)
+    thread = threading.Thread(target=_run_sweep, args=(job_id, combos, days, interval_seconds, context), daemon=True)
     thread.start()
 
     return job_id
 
 
-def _run_sweep(job_id, combos, days, interval_seconds):
+def _run_sweep(job_id, combos, days, interval_seconds, context=None):
+    context = context or {}
     for combo in combos:
         try:
             result = backtest_module.run_backtest(
                 days=days,
                 interval_seconds=interval_seconds,
+                symbol=context.get("symbol", "XAUUSDT"),
+                bucket_size=context.get("bucket_size", 1.0),
+                strategy_type=context.get("strategy_type"),
+                resonance_min_conditions=context.get("resonance_min_conditions", 4),
                 sl_points=combo["params"]["paper_sl_points"],
                 trail_trigger_points=combo["params"]["paper_trail_trigger_points"],
                 trail_distance_points=combo["params"]["paper_trail_distance_points"],

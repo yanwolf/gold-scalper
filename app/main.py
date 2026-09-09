@@ -686,6 +686,10 @@ async def backtest_sweep_start(
     reversal_confirm_count: Optional[int] = None,
     use_chop_filter: Optional[bool] = None,
     chop_threshold: Optional[float] = None,
+    strategy_type: Optional[str] = None,
+    resonance_min_conditions: int = 4,
+    symbol: str = "XAUUSDT",
+    bucket_size: float = 1.0,
 ):
     """
     參數掃描：對模擬單風控參數做「一次改一個參數」的敏感度測試，一次跑多組回測，
@@ -727,7 +731,11 @@ async def backtest_sweep_start(
     if chop_threshold is not None:
         baseline_overrides["paper_chop_threshold"] = chop_threshold
 
-    job_id = sweep_module.start_sweep(days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None)
+    job_id = sweep_module.start_sweep(
+        days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None,
+        strategy_type=strategy_type, resonance_min_conditions=resonance_min_conditions,
+        symbol=symbol, bucket_size=bucket_size,
+    )
     return {"job_id": job_id}
 
 
