@@ -233,28 +233,86 @@ def run_backtest(
     # 以每根K線的收盤時間為一個重播步驟，跟即時模式「每次檢查訊號」的頻率概念一致。
     # 天數越長，K線數越多，全部逐根重播會讓運算時間暴增(纏論分析是K棒數量的函數，
     # 重播步數又跟K線數量同步成長，兩者疊加會讓耗時遠超過HTTP請求能負擔的時間)。
-    # 用stride(取樣間隔)把總重播步數控制在TARGET_STEP_COUNT附近：天數短時每根K線
-    # 都檢查(stride=1)，天數長時跳著檢查，犧牲一些精確度換取能在合理時間內跑完。
+    # 重播分兩層(修正記錄見README)：
+    #   1. 「訊號步」：只在使用者選的K線週期(interval_seconds)收盤時才跑一次完整的
+    #      訊號分析(纏論/分價量表/指標，這是最貴的部分)。以前不管選5分K還是15分K，
+    #      訊號步一律用1分K的收盤時間當格子，30天=43200步，被stride壓到每36分鐘
+    #      才看一次；使用者選5分K跑30天，畫面卻顯示43200根K線/取樣間隔36，
+    #      看起來像在跑1分K，實際上是每7根5分K才檢查一次訊號和停損，
+    #      中間的停損觸發全部漏掉，績效嚴重失真。
+    #   2. 「1分K停損步」：訊號步之間的每一根1分K都用高低價檢查停損/移動停損，
+    #      這一層很便宜(沒有訊號分析)，所以不管stride多大，停損永遠是1分K精度。
+    # stride只作用在訊號步上：5分K 30天=8640個訊號步，標準精細度stride=7、
+    # 高精細度stride=2、最高精細度每根5分K都檢查。
     all_step_times = sorted({int(k[6]) for k in klines})
+    interval_ms = int(interval_seconds) * 1000
+    kline_ms = (all_step_times[1] - all_step_times[0]) if len(all_step_times) >= 2 else 60_000
+    if interval_ms > kline_ms:
+        # 1分K的收盤時間是xx:59.999，+1後對齊到週期邊界的才是該週期的收盤
+        signal_step_times = [t for t in all_step_times if ((t + 1) % interval_ms) == 0]
+    else:
+        signal_step_times = all_step_times
+
     if not target_step_count:
         target_step_count = TARGET_STEP_COUNT
     target_step_count = max(100, min(int(target_step_count), MAX_TARGET_STEP_COUNT))
-    stride = max(1, len(all_step_times) // target_step_count)
+    stride = max(1, len(signal_step_times) // target_step_count)
     # 取樣相位鎖定在絕對時間上：不是「從清單第0根開始每隔stride根取一根」，
     # 而是「K線序號(收盤時間/週期) mod stride == 0 的那幾根」。這樣不管視窗
-    # 起點落在哪裡，被檢查到的永遠是同一批K線。以前用[::stride]，2天資料
-    # stride=2時，視窗只要位移一根K線，取樣到的就是完全互補的另一半K線，
-    # 同一組參數前後一分鐘跑出來的績效可以差到上百點(修正記錄見README)。
-    if stride > 1 and len(all_step_times) >= 2:
-        kline_ms = all_step_times[1] - all_step_times[0]
-        step_times = [t for t in all_step_times if (t // kline_ms) % stride == 0]
+    # 起點落在哪裡，被檢查到的永遠是同一批K線(修正記錄見README)。
+    step_period_ms = max(interval_ms, kline_ms)
+    if stride > 1:
+        step_times = [t for t in signal_step_times if ((t + 1) // step_period_ms) % stride == 0]
     else:
-        step_times = all_step_times
+        step_times = signal_step_times
+
+    # 1分K高低價序列(給停損步用)：kline欄位 [open_time, o, h, l, c, v, close_time, ...]
+    kline_close_times = [int(k[6]) for k in klines]
+    kline_highs = [float(k[2]) for k in klines]
+    kline_lows = [float(k[3]) for k in klines]
+    intrabar_checks = 0
 
     position = None
     closed_trades = []
+    # 目前生效的停損距離(每個訊號步用當下ATR重算一次，停損步沿用最近一次的值)
+    step_trail_trigger_points = trail_trigger_points
+    step_trail_distance_points = trail_distance_points
+    last_signal_step_time = None
+
+    def _run_intrabar_stops(position, from_time, to_time):
+        """
+        訊號步之間的每一根1分K都檢查停損：先用「更新移動停損前」的停損價對照這根
+        K線的不利極值(多單看低點、空單看高點)，命中就以停損價出場；沒命中才用有利
+        極值更新移動停損。順序是刻意的——同一根K線既創新高又打到停損時，不讓新高
+        先把停損墊高再被打掉(保守假設)。回傳(position, closed_trade或None)。
+        """
+        nonlocal intrabar_checks
+        lo = bisect.bisect_right(kline_close_times, from_time)
+        hi = bisect.bisect_right(kline_close_times, to_time)
+        for i in range(lo, hi):
+            intrabar_checks += 1
+            if position["direction"] == "bullish":
+                if kline_lows[i] <= position["sl_price"]:
+                    reason = "觸及移動停損" if position["trailing_active"] else "觸及停損"
+                    exit_iso = datetime.fromtimestamp(kline_close_times[i] / 1000, tz=timezone.utc).isoformat()
+                    return None, trading_core.close_position(position, position["sl_price"], reason, exit_iso)
+                trading_core.update_trailing_stop(position, kline_highs[i], step_trail_trigger_points, step_trail_distance_points)
+            else:
+                if kline_highs[i] >= position["sl_price"]:
+                    reason = "觸及移動停損" if position["trailing_active"] else "觸及停損"
+                    exit_iso = datetime.fromtimestamp(kline_close_times[i] / 1000, tz=timezone.utc).isoformat()
+                    return None, trading_core.close_position(position, position["sl_price"], reason, exit_iso)
+                trading_core.update_trailing_stop(position, kline_lows[i], step_trail_trigger_points, step_trail_distance_points)
+        return position, None
 
     for step_time in step_times:
+        # 先把上一個訊號步到這一步之間的每根1分K走一遍停損檢查
+        if position and last_signal_step_time is not None:
+            position, closed = _run_intrabar_stops(position, last_signal_step_time, step_time - 1)
+            if closed:
+                closed_trades.append(closed)
+        last_signal_step_time = step_time
+
         # 二分搜尋定位「這個時間點為止」的邊界，取代線性掃描，避免look-ahead bias
         cutoff_index = bisect.bisect_right(trade_times, step_time)
         if cutoff_index < 20:  # 資料太少，跳過這一步(通常是回測最一開始的幾步)
@@ -359,8 +417,11 @@ def run_backtest(
         "kline_count": len(klines),
         "synthetic_trade_count": len(trades),
         "replay_step_count": len(step_times),
-        "replay_stride": stride,  # 1代表每根K線都檢查，>1代表跳著檢查(天數長時的效能取捨)
+        "replay_stride": stride,  # 1代表每根(所選週期的)K線都檢查訊號，>1代表跳著檢查(天數長時的效能取捨)
         "target_step_count": target_step_count,
+        "signal_interval_seconds": int(interval_seconds),
+        "signal_kline_count": len(signal_step_times),  # 所選週期的K線總數(訊號步的母體)
+        "intrabar_stop_checks": intrabar_checks,  # 訊號步之間用1分K高低價檢查停損的次數
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),
         "sl_points": sl_points,

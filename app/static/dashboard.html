@@ -586,8 +586,8 @@
     </select>
   </div>
   <div style="font-size:11.5px; color:var(--muted); margin:-4px 0 12px; line-height:1.6;">
-    ↑ 精細度=重播步數上限，回測時間跟步數成正比。1分K每天1440根：標準精細度下1天每根都檢查、2天隔一根、7天隔8根、30天隔36根。
-    要讓2天1分K每根都檢查選「高精細度」；3天以上想每根都看請改用5分K/15分K，不要硬拉精細度，30天會跑不完。掃描也會沿用這個設定(時間再乘以組數)。
+    ↑ 精細度=訊號檢查步數上限，回測時間跟步數成正比。訊號只在所選週期的K線收盤時檢查，停損/移動停損則一律用1分K高低價逐根檢查(不受精細度影響)。
+    1分K：標準精細度1天每根都看、2天隔一根、30天隔36根(不可信)。5分K：7天每根都看、30天隔7根(高精細度隔2根、最高精細度每根)。15分K：14天每根都看、30天隔一根(高精細度每根)。掃描沿用這個設定(時間再乘以組數)。
   </div>
   <div class="controls" style="margin-top:8px;">
     <select id="backtestStrategy">
@@ -718,10 +718,16 @@
       <option value="1">用 1 天資料</option>
       <option value="2" selected>用 2 天資料</option>
       <option value="3">用 3 天資料</option>
+      <option value="7">用 7 天資料</option>
+      <option value="14">用 14 天資料</option>
+      <option value="30">用 30 天資料</option>
     </select>
     <button id="sweepStartBtn" class="btn-secondary">開始掃描</button>
   </div>
-  <div style="font-size:11.5px; color:var(--muted); margin:8px 0 12px; line-height:1.6;">策略類型、共振門檻、商品、箱寬會沿用上方「歷史回測」面板目前的選擇；K線週期和天數在這裡另外選(掃描要跑十幾組，天數短一點比較快)。</div>
+  <div style="font-size:11.5px; color:var(--muted); margin:8px 0 12px; line-height:1.6;">策略類型、共振門檻、商品、箱寬、精細度會沿用上方「歷史回測」面板目前的選擇；K線週期和天數在這裡另外選。
+    <b>長天期掃描請搭配大週期K線</b>：訊號只在所選週期的K線收盤時檢查，停損則一律用1分K逐根檢查。
+    5分K 30天=8640根，標準精細度每7根檢查一次訊號、高精細度每2根、最高精細度每根都看；15分K 30天=2880根，標準精細度隔一根、高精細度每根都看。
+    1分K 30天會被壓到每36根才看一次訊號，數字不能信。</div>
 
   <div id="sweepResult" style="margin-top:14px;"></div>
 </div>
@@ -2394,8 +2400,9 @@ els.backtestRunBtn.addEventListener('click', async () => {
 
     els.backtestResult.innerHTML = `
       <div class="backtest-meta">
-        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根K線 ／ 還原成 ${data.synthetic_trade_count} 筆合成成交
-        ／ 實際重播 ${data.replay_step_count} 步${data.replay_stride > 1 ? `(取樣間隔 ${data.replay_stride}，天數較長時自動降低精細度以控制運算時間)` : ''}
+        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根1分K(還原成 ${data.synthetic_trade_count} 筆合成成交)
+        ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
+        ／ 停損/移動停損以1分K高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
       <div id="backtestActiveConfig"></div>
@@ -2605,7 +2612,7 @@ let sweepPollTimer = null;
 
 function renderSweepResults(job){
   const progressText = job.status === 'done'
-    ? `已完成全部 ${job.total} 組（策略：${job.strategy_type === 'resonance_fvg' ? '多條件共振+FVG ' + job.resonance_min_conditions + '/4' : '纏論+分價量表'}，${job.symbol || 'XAUUSDT'}，${job.days} 天${job.data_end_time ? '，資料截至 ' + new Date(job.data_end_time).toLocaleString('zh-TW', {hour12:false}) : ''}）`
+    ? `已完成全部 ${job.total} 組（${(job.results.find(r => r.replay_stride) || {}).replay_stride > 1 ? '取樣間隔 ' + (job.results.find(r => r.replay_stride) || {}).replay_stride + '，' : '每根K線都檢查，'}策略：${job.strategy_type === 'resonance_fvg' ? '多條件共振+FVG ' + job.resonance_min_conditions + '/4' : '纏論+分價量表'}，${job.symbol || 'XAUUSDT'}，${job.days} 天${job.data_end_time ? '，資料截至 ' + new Date(job.data_end_time).toLocaleString('zh-TW', {hour12:false}) : ''}）`
     : `進度：${job.completed} / ${job.total} 組`;
 
   const results = job.results || [];

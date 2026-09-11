@@ -207,6 +207,8 @@ def _run_sweep(job_id, combos, days, interval_seconds, context=None):
                 "total_pnl_points": result.get("total_pnl_points"),
                 "profit_factor": result.get("profit_factor"),
                 "max_drawdown_points": result.get("max_drawdown_points"),
+                "replay_stride": result.get("replay_stride"),
+                "replay_step_count": result.get("replay_step_count"),
                 "error": result.get("error"),
             }
         except Exception as e:
