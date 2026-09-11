@@ -1755,20 +1755,82 @@ els.qtyCalcBtn.addEventListener('click', async () => {
 
 // --- 滑價時段分析 ---
 
+function slipColor(v){ return v > 1 ? 'color:var(--resistance);' : (v < -0.5 ? 'color:var(--support);' : ''); }
+function fmtSlip(v){ return v == null ? '--' : (v >= 0 ? '+' : '') + v.toFixed(2); }
+
 function renderSlippageHourTable(rows, title, side){
   if(!rows || rows.length === 0){
     return `<div style="font-size:12px; color:var(--muted); margin-bottom:14px;">${title}：目前沒有真實下單的滑價資料</div>`;
   }
-  const lines = rows.map(r =>
-    `<div class="cfg-row slippage-hour-row" data-hour="${r.hour_utc}" data-side="${side}" style="cursor:pointer;" title="點擊展開這個小時的個別交易">
+  const lines = rows.map(r => {
+    // 紅色條件：中位數>1(普遍差) 或 肥尾筆數佔該小時樣本≥15%(常炸)，不再只看平均
+    const fatRate = r.count ? r.fat_tail_count / r.count * 100 : 0;
+    const hot = (r.median_slippage != null && r.median_slippage > 1) || fatRate >= 15;
+    const fatTag = r.fat_tail_count > 0
+      ? `<span style="color:var(--resistance); font-weight:700;">肥尾 ${r.fat_tail_count}筆(${fatRate.toFixed(0)}%，佔不利滑點${r.fat_tail_share}%)</span>`
+      : '<span style="color:var(--muted);">無肥尾</span>';
+    return `<div class="cfg-row slippage-hour-row" data-hour="${r.hour_utc}" data-side="${side}" style="cursor:pointer;" title="點擊展開這個小時的個別交易(依滑點大小排序)">
       <span class="cfg-label">▸ ${String(r.hour_utc).padStart(2,'0')}:00 UTC (${r.count}筆)</span>
-      <span class="cfg-value ${r.avg_slippage > 1 ? '' : 'on'}" style="${r.avg_slippage > 1 ? 'color:var(--resistance);' : ''}">
-        平均滑點 ${r.avg_slippage >= 0 ? '+' : ''}${r.avg_slippage}pt / 最大 ${r.max_abs_slippage}pt / 均價差 ${r.avg_spread}pt
+      <span class="cfg-value ${hot ? '' : 'on'}" style="${hot ? 'color:var(--resistance);' : ''}">
+        中位 ${fmtSlip(r.median_slippage)} / 平均 ${fmtSlip(r.avg_slippage)} / P90 ${fmtSlip(r.p90_slippage)} / 最大 ${r.max_abs_slippage}pt<br>${fatTag}
       </span>
     </div>
-    <div class="slippage-hour-detail" id="slipDetail-${side}-${r.hour_utc}" style="display:none;"></div>`
-  ).join('');
+    <div class="slippage-hour-detail" id="slipDetail-${side}-${r.hour_utc}" style="display:none;"></div>`;
+  }).join('');
   return `<div style="margin-bottom:16px;"><div class="cfg-title">${title}</div>${lines}</div>`;
+}
+
+function renderSlippageDayTable(rows, title){
+  if(!rows || rows.length === 0) return '';
+  const lines = rows.map(r => {
+    const fatRate = r.count ? r.fat_tail_count / r.count * 100 : 0;
+    const hot = r.fat_tail_count >= 3 || (r.median_slippage != null && r.median_slippage > 1);
+    return `<div class="cfg-row">
+      <span class="cfg-label">${r.date_utc} (${new Date(r.date_utc + 'T00:00:00Z').toLocaleDateString('zh-TW',{weekday:'short', timeZone:'UTC'})}，${r.count}筆)</span>
+      <span class="cfg-value ${hot ? '' : 'on'}" style="${hot ? 'color:var(--resistance);' : ''}">
+        中位 ${fmtSlip(r.median_slippage)} / P90 ${fmtSlip(r.p90_slippage)} / 最大 ${r.max_abs_slippage}pt / 肥尾 ${r.fat_tail_count}筆(${fatRate.toFixed(0)}%)
+      </span>
+    </div>`;
+  }).join('');
+  return `<div style="margin-bottom:16px;"><div class="cfg-title">${title}</div>${lines}</div>`;
+}
+
+function renderFatTailEvents(events, threshold){
+  if(!events || events.length === 0){
+    return `<div style="font-size:12px; color:var(--muted); margin-bottom:14px;">肥尾事件(單筆不利滑點 > ${threshold}pt)：目前沒有</div>`;
+  }
+  // 依「日期+小時」聚合一次，直接看出是集中在某幾天還是某幾個時段
+  const byDay = {}; const byHour = {};
+  events.forEach(e => { byDay[e.date_utc] = (byDay[e.date_utc] || 0) + 1; byHour[e.hour_utc] = (byHour[e.hour_utc] || 0) + 1; });
+  const topDays = Object.entries(byDay).sort((a,b) => b[1]-a[1]).slice(0,3).map(([d,c]) => `${d}(${c}筆)`).join('、');
+  const topHours = Object.entries(byHour).sort((a,b) => b[1]-a[1]).slice(0,3).map(([h,c]) => `${String(h).padStart(2,'0')}:00 UTC(${c}筆)`).join('、');
+  const dayCount = Object.keys(byDay).length;
+  const maxDayShare = Math.max(...Object.values(byDay)) / events.length * 100;
+  const verdict = maxDayShare >= 50
+    ? `有 ${maxDayShare.toFixed(0)}% 的肥尾集中在同一天，比較像「事件日」(數據公布/突發消息)造成，優先考慮擋數據日而不是擋時段`
+    : `肥尾分散在 ${dayCount} 天，時段規律比日期規律明顯，優先考慮用時段過濾`;
+  const rows = events.map(e => `
+    <div style="border-left:2px solid var(--resistance); margin:6px 0 8px 8px; padding:4px 0 4px 10px; font-size:11.5px; line-height:1.6;">
+      <div><b style="color:var(--resistance);">${e.slippage.toFixed(2)}pt</b>　${e.side === 'entry' ? '開倉' : '平倉'}　${e.direction === 'bullish' ? '多單 ▲' : '空單 ▼'}　${fmtTs(e.time)}${e.book_stale ? '　<span style="color:var(--muted);">(盤口過期)</span>' : ''}</div>
+      <div style="color:var(--muted);">預期 ${e.expected_price} → 實際 ${e.actual_price}　價差 ${e.spread ?? '--'}pt　訊號：${e.chan_reason || '--'}　出場：${e.exit_reason || '(未平倉)'}　損益 <span style="${(e.pnl_points ?? 0) >= 0 ? 'color:var(--support);' : 'color:var(--resistance);'}">${e.pnl_points != null ? fmtSlip(e.pnl_points) : '--'}pt</span></div>
+    </div>`).join('');
+  return `<div style="margin-bottom:16px;">
+    <div class="cfg-title">肥尾事件清單(單筆不利滑點 > ${threshold}pt，共 ${events.length} 筆，依大小排序)</div>
+    <div style="font-size:11.5px; line-height:1.7; margin-bottom:6px;">最常出現的日期：${topDays}<br>最常出現的時段：${topHours}<br><b>${verdict}</b></div>
+    <details><summary style="font-size:11.5px; color:var(--muted); cursor:pointer;">展開全部 ${events.length} 筆</summary>${rows}</details>
+  </div>`;
+}
+
+function renderSlippageSummary(summary, threshold){
+  const parts = [];
+  ['entry','exit'].forEach(side => {
+    const s = summary && summary[side];
+    if(!s) return;
+    parts.push(`<div class="cfg-row"><span class="cfg-label">${side === 'entry' ? '開倉' : '平倉'}整體(${s.count}筆)</span>
+      <span class="cfg-value on">中位 ${fmtSlip(s.median_slippage)} / P90 ${fmtSlip(s.p90_slippage)} / 肥尾 ${s.fat_tail_count}筆(佔不利滑點 ${s.fat_tail_share}%)</span></div>`);
+  });
+  if(!parts.length) return '';
+  return `<div style="margin-bottom:16px;"><div class="cfg-title">整體分布(肥尾門檻 ${threshold}pt)</div>${parts.join('')}</div>`;
 }
 
 function fmtTs(iso){
@@ -1813,13 +1875,17 @@ els.slippageStatsBtn.addEventListener('click', async () => {
     const data = await res.json();
     els.slippageStatsResult.innerHTML = `
       <div class="active-config-card">
+        ${renderSlippageSummary(data.summary, data.fat_tail_threshold)}
+        ${renderFatTailEvents(data.fat_tail_events, data.fat_tail_threshold)}
         ${renderSlippageHourTable(data.entry, '開倉滑價(依進場時間分組)', 'entry')}
         ${renderSlippageHourTable(data.exit, '平倉滑價(依出場時間分組)', 'exit')}
+        ${renderSlippageDayTable(data.by_day && data.by_day.entry, '開倉滑價(依UTC日期分組)')}
+        ${renderSlippageDayTable(data.by_day && data.by_day.exit, '平倉滑價(依UTC日期分組)')}
       </div>
       <div style="font-size:11px; color:var(--muted); margin-top:8px;">
-        時間是UTC，台灣時間要+8小時對照。紅色代表該小時平均滑點超過1point。
-        <b>點任一個小時可以展開該小時的個別交易</b>，看極端值到底發生在哪個確切時間、
-        當時是什麼訊號、最後這筆賺賠如何。
+        時間是UTC，台灣時間要+8小時對照。滑點正值=不利。<b>中位數</b>看這個時段是不是普遍差、<b>P90</b>看十筆裡最差那筆大概多少、
+        <b>肥尾筆數</b>看炸的頻率——平均會被單筆極端值拉歪，判斷時段要不要擋請看中位數和肥尾比例。
+        紅色=中位數超過1pt或肥尾比例≥15%。<b>點任一個小時可以展開該小時的個別交易</b>(依滑點大小排序)。
       </div>
     `;
 

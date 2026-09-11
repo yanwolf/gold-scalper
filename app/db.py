@@ -651,7 +651,7 @@ def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", li
                     WHERE engine_id = %s
                       AND {slip_col} IS NOT NULL
                       AND EXTRACT(HOUR FROM {time_col} AT TIME ZONE 'UTC')::int = %s
-                    ORDER BY {time_col} DESC
+                    ORDER BY {slip_col} DESC, {time_col} DESC
                     LIMIT %s;
                     """,
                     (engine_id, hour_utc, limit),
@@ -680,6 +680,55 @@ def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", li
         return []
 
 
+FAT_TAIL_SLIPPAGE_POINTS = 3.0  # 單筆不利滑點超過這個值視為「肥尾事件」，跟dashboard累積滑點卡片的門檻一致
+
+
+def _slippage_group_sql(time_col, slip_col, spread_col, group_expr):
+    """
+    組出一段滑價統計SQL：按group_expr分組，回傳筆數/平均/中位數/P90/最大/均價差/
+    肥尾筆數/肥尾不利滑點合計/該組不利滑點合計。滑點正值=不利(成交比預期差)。
+    平均容易被單筆極端值帶著走，所以一起算中位數和P90——中位數看「這個時段是
+    普遍差還是偶爾炸」，P90看「十筆裡最差那筆大概多少」，肥尾筆數看「炸的頻率」。
+    """
+    return f"""
+        SELECT {group_expr} AS grp,
+               COUNT(*),
+               AVG({slip_col}),
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {slip_col}),
+               PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY {slip_col}),
+               MAX(ABS({slip_col})),
+               AVG({spread_col}),
+               COUNT(*) FILTER (WHERE {slip_col} > %s),
+               COALESCE(SUM({slip_col}) FILTER (WHERE {slip_col} > %s), 0),
+               COALESCE(SUM({slip_col}) FILTER (WHERE {slip_col} > 0), 0)
+        FROM paper_trades
+        WHERE engine_id = %s AND {slip_col} IS NOT NULL
+        GROUP BY grp
+        ORDER BY grp;
+    """
+
+
+def _format_slippage_rows(rows, key_name, key_fn):
+    out = []
+    for r in rows:
+        adverse_total = float(r[9]) if r[9] is not None else 0.0
+        fat_sum = float(r[8]) if r[8] is not None else 0.0
+        out.append({
+            key_name: key_fn(r[0]),
+            "count": r[1],
+            "avg_slippage": round(r[2], 3) if r[2] is not None else None,
+            "median_slippage": round(r[3], 3) if r[3] is not None else None,
+            "p90_slippage": round(r[4], 3) if r[4] is not None else None,
+            "max_abs_slippage": round(r[5], 3) if r[5] is not None else None,
+            "avg_spread": round(r[6], 3) if r[6] is not None else None,
+            "fat_tail_count": r[7],
+            "fat_tail_sum": round(fat_sum, 3),
+            "adverse_sum": round(adverse_total, 3),
+            "fat_tail_share": round(fat_sum / adverse_total * 100, 1) if adverse_total > 0 else 0.0,
+        })
+    return out
+
+
 def get_slippage_stats_by_hour(engine_id="chan_profile_60"):
     """
     按小時(UTC)分組統計真實下單的滑價/價差資料，用來找出「哪個時段特別
@@ -691,63 +740,120 @@ def get_slippage_stats_by_hour(engine_id="chan_profile_60"):
     只統計「有真實下單過」的交易(entry_slippage_points或exit_slippage_points
     不是NULL的紀錄)，純模擬的交易不會有這些值，自然不會被納入統計。
 
-    回傳 {"entry": [{"hour_utc", "count", "avg_slippage", "max_abs_slippage",
-    "avg_spread"}, ...], "exit": [...]}，只有真的有資料的小時才會出現在
-    清單裡，依小時排序。沒有資料庫或查詢失敗時安全回傳空清單，不會讓
-    呼叫端出錯。
-    """
-    if not _enabled:
-        return {"entry": [], "exit": []}
+    每個小時除了平均/最大，還帶中位數、P90、肥尾筆數(>FAT_TAIL_SLIPPAGE_POINTS)
+    和肥尾佔該小時不利滑點的比例——平均會被一筆極端值拉歪，光看平均分不出
+    「這個時段普遍差」和「偶爾炸一筆」，而這兩種要用不同方法處理(修正記錄見README)。
 
+    另外回傳by_day(依UTC日期分組)和fat_tail_events(所有肥尾事件清單，含日期/
+    小時/方向/訊號/出場原因/損益)：肥尾如果全集中在某一天，該擋的是「數據日」
+    不是「時段」；事件清單則是之後回頭對照當天新聞/開盤時點用的原始紀錄。
+
+    回傳 {"entry": [...], "exit": [...], "by_day": {"entry": [...], "exit": [...]},
+    "fat_tail_events": [...], "fat_tail_threshold": 3.0, "summary": {...}}。
+    沒有資料庫或查詢失敗時安全回傳空結構，不會讓呼叫端出錯。
+    """
+    empty = {"entry": [], "exit": [], "by_day": {"entry": [], "exit": []},
+             "fat_tail_events": [], "fat_tail_threshold": FAT_TAIL_SLIPPAGE_POINTS, "summary": {}}
+    if not _enabled:
+        return empty
+
+    ft = FAT_TAIL_SLIPPAGE_POINTS
     try:
         conn = _pool.getconn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT EXTRACT(HOUR FROM entry_time AT TIME ZONE 'UTC')::int AS hour,
-                           COUNT(*), AVG(entry_slippage_points), MAX(ABS(entry_slippage_points)),
-                           AVG(entry_spread_points)
-                    FROM paper_trades
-                    WHERE engine_id = %s AND entry_slippage_points IS NOT NULL
-                    GROUP BY hour
-                    ORDER BY hour;
-                    """,
-                    (engine_id,),
-                )
-                entry_rows = cur.fetchall()
+                hour_expr = lambda col: f"EXTRACT(HOUR FROM {col} AT TIME ZONE 'UTC')::int"
+                day_expr = lambda col: f"({col} AT TIME ZONE 'UTC')::date"
 
+                cur.execute(_slippage_group_sql("entry_time", "entry_slippage_points", "entry_spread_points", hour_expr("entry_time")), (ft, ft, engine_id))
+                entry_hour = cur.fetchall()
+                cur.execute(_slippage_group_sql("exit_time", "exit_slippage_points", "exit_spread_points", hour_expr("exit_time")), (ft, ft, engine_id))
+                exit_hour = cur.fetchall()
+                cur.execute(_slippage_group_sql("entry_time", "entry_slippage_points", "entry_spread_points", day_expr("entry_time")), (ft, ft, engine_id))
+                entry_day = cur.fetchall()
+                cur.execute(_slippage_group_sql("exit_time", "exit_slippage_points", "exit_spread_points", day_expr("exit_time")), (ft, ft, engine_id))
+                exit_day = cur.fetchall()
+
+                # 肥尾事件清單：開倉或平倉任一邊不利滑點超過門檻的交易，各自列一筆
                 cur.execute(
                     """
-                    SELECT EXTRACT(HOUR FROM exit_time AT TIME ZONE 'UTC')::int AS hour,
-                           COUNT(*), AVG(exit_slippage_points), MAX(ABS(exit_slippage_points)),
-                           AVG(exit_spread_points)
+                    SELECT 'entry' AS side, id, direction, entry_time, entry_slippage_points, entry_spread_points,
+                           entry_expected_price, entry_actual_price, chan_reason, exit_reason, pnl_points, entry_book_stale
                     FROM paper_trades
-                    WHERE engine_id = %s AND exit_slippage_points IS NOT NULL
-                    GROUP BY hour
-                    ORDER BY hour;
+                    WHERE engine_id = %s AND entry_slippage_points > %s
+                    UNION ALL
+                    SELECT 'exit' AS side, id, direction, exit_time, exit_slippage_points, exit_spread_points,
+                           exit_expected_price, exit_actual_price, chan_reason, exit_reason, pnl_points, exit_book_stale
+                    FROM paper_trades
+                    WHERE engine_id = %s AND exit_slippage_points > %s
+                    ORDER BY 5 DESC;
                     """,
-                    (engine_id,),
+                    (engine_id, ft, engine_id, ft),
                 )
-                exit_rows = cur.fetchall()
+                event_rows = cur.fetchall()
+
+                # 整體摘要(不分小時)：全部樣本的中位數/P90/肥尾筆數與佔比
+                cur.execute(
+                    """
+                    SELECT side, COUNT(*),
+                           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY slip),
+                           PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY slip),
+                           COUNT(*) FILTER (WHERE slip > %s),
+                           COALESCE(SUM(slip) FILTER (WHERE slip > %s), 0),
+                           COALESCE(SUM(slip) FILTER (WHERE slip > 0), 0)
+                    FROM (
+                        SELECT 'entry' AS side, entry_slippage_points AS slip FROM paper_trades WHERE engine_id = %s AND entry_slippage_points IS NOT NULL
+                        UNION ALL
+                        SELECT 'exit', exit_slippage_points FROM paper_trades WHERE engine_id = %s AND exit_slippage_points IS NOT NULL
+                    ) x
+                    GROUP BY side;
+                    """,
+                    (ft, ft, engine_id, engine_id),
+                )
+                summary_rows = cur.fetchall()
         finally:
             _pool.putconn(conn)
 
-        def _format(rows):
-            return [
-                {
-                    "hour_utc": int(r[0]), "count": r[1],
-                    "avg_slippage": round(r[2], 3) if r[2] is not None else None,
-                    "max_abs_slippage": round(r[3], 3) if r[3] is not None else None,
-                    "avg_spread": round(r[4], 3) if r[4] is not None else None,
-                }
-                for r in rows
-            ]
+        events = []
+        for r in event_rows:
+            ts = r[3]
+            events.append({
+                "side": r[0], "trade_id": r[1], "direction": r[2],
+                "time": ts.isoformat() if ts else None,
+                "date_utc": ts.astimezone(timezone.utc).strftime("%Y-%m-%d") if ts else None,
+                "hour_utc": ts.astimezone(timezone.utc).hour if ts else None,
+                "weekday_utc": ts.astimezone(timezone.utc).strftime("%a") if ts else None,
+                "slippage": round(float(r[4]), 3), "spread": round(float(r[5]), 3) if r[5] is not None else None,
+                "expected_price": r[6], "actual_price": r[7],
+                "chan_reason": r[8], "exit_reason": r[9], "pnl_points": r[10], "book_stale": r[11],
+            })
 
-        return {"entry": _format(entry_rows), "exit": _format(exit_rows)}
+        summary = {}
+        for r in summary_rows:
+            adverse = float(r[6]) if r[6] is not None else 0.0
+            fat_sum = float(r[5]) if r[5] is not None else 0.0
+            summary[r[0]] = {
+                "count": r[1],
+                "median_slippage": round(r[2], 3) if r[2] is not None else None,
+                "p90_slippage": round(r[3], 3) if r[3] is not None else None,
+                "fat_tail_count": r[4],
+                "fat_tail_share": round(fat_sum / adverse * 100, 1) if adverse > 0 else 0.0,
+            }
+
+        return {
+            "entry": _format_slippage_rows(entry_hour, "hour_utc", int),
+            "exit": _format_slippage_rows(exit_hour, "hour_utc", int),
+            "by_day": {
+                "entry": _format_slippage_rows(entry_day, "date_utc", lambda d: d.isoformat()),
+                "exit": _format_slippage_rows(exit_day, "date_utc", lambda d: d.isoformat()),
+            },
+            "fat_tail_events": events,
+            "fat_tail_threshold": ft,
+            "summary": summary,
+        }
     except Exception as e:
         logger.error(f"查詢滑價時段統計失敗: {e}")
-        return {"entry": [], "exit": []}
+        return empty
 
 
 # ---------------------------------------------------------------------------
