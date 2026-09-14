@@ -118,6 +118,24 @@ FIELD_META = {
                 "濾網開關打開時才生效)。數值介於0~100，數字越高代表越震盪，"
                 "61.8是業界常見的預設門檻。",
     },
+    "paper_block_market_closed": {
+        "label": "休市時段不開新倉 (0 = 關閉 / 1 = 開啟)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("PAPER_BLOCK_MARKET_CLOSED", "1")),
+        "help": "開啟後，黃金底層市場休市時(週五17:00 ET收盤到週日18:00 ET開盤、"
+                "以及平日17:00~18:00 ET的CME每日維護時段)不開新倉。這段期間幣安"
+                "永續的指數價幾乎不動、ATR縮到極小，訊號一抖就進出，全是手續費和"
+                "滑點的無效交易。已開倉的部位不受影響，出場規則照常運作。",
+    },
+    "paper_min_atr_points": {
+        "label": "最小ATR門檻 (points，0 = 不限制)",
+        "type": "float", "step": 0.1, "min": 0, "max": 50,
+        "default": float(os.getenv("PAPER_MIN_ATR_POINTS", "0")),
+        "help": "當下ATR低於這個點數時不開新倉——波動太小代表沒有行情可做，"
+                "停損距離也會被ATR倍數壓到零點幾點，隨便抖一下就出場。黃金1分K"
+                "平時ATR大約1~3點，可以先觀察平日與週末的ATR差距再決定門檻。"
+                "已開倉的部位不受影響。",
+    },
     "execution_engine_index": {
         "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
         "type": "int", "step": 1, "min": 0, "max": 4,
@@ -291,6 +309,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_reversal_confirm_count", "paper_use_atr_stops", "paper_atr_sl_multiplier",
     "paper_atr_trigger_multiplier", "paper_atr_trail_multiplier",
     "paper_use_chop_filter", "paper_chop_threshold",
+    "paper_block_market_closed", "paper_min_atr_points",
 }
 
 

@@ -148,3 +148,42 @@ def close_position(position, exit_price, exit_reason, exit_time):
         "exit_reason": exit_reason,
         "pnl_points": pnl_points,
     }
+
+
+# ---------------------------------------------------------------------------
+# 黃金現貨/期貨市場休市判斷(修正記錄見README)
+# ---------------------------------------------------------------------------
+# 幣安XAUUSDT永續是24/7掛牌，但底層黃金市場(倫敦現貨/CME期貨)週末休市，
+# 這段期間永續的指數價幾乎不動(週末兩天只在4353~4358之間磨)，ATR跟著縮到極小，
+# 停損距離變成零點幾點，訊號稍微抖一下就進出，兩天來回十幾筆全是手續費和滑點。
+# 沒行情就沒有edge，所以預設在市場休市時段不開新倉(既有部位照常管理出場)。
+# 時段以紐約時間定義(自動處理夏令/冬令)：
+#   - 週五 17:00 ET 收盤 → 週日 18:00 ET 開盤：整段休市
+#   - 平日 17:00~18:00 ET：CME每日維護休市一小時，流動性最薄、滑點最大的時段之一
+try:
+    from zoneinfo import ZoneInfo
+    _NY_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - 極舊環境沒有zoneinfo時退回UTC近似值
+    _NY_TZ = None
+
+
+def is_gold_market_closed(dt_utc):
+    """
+    dt_utc: 有tzinfo的UTC datetime。回傳(closed: bool, reason: str或None)。
+    """
+    if _NY_TZ is not None:
+        ny = dt_utc.astimezone(_NY_TZ)
+    else:
+        from datetime import timedelta
+        ny = dt_utc + timedelta(hours=-4)  # 近似EDT
+    wd = ny.weekday()  # Mon=0 ... Sun=6
+    hour = ny.hour
+    if wd == 5:
+        return True, "週末休市(週六)"
+    if wd == 4 and hour >= 17:
+        return True, "週末休市(週五17:00 ET收盤後)"
+    if wd == 6 and hour < 18:
+        return True, "週末休市(週日18:00 ET開盤前)"
+    if wd in (0, 1, 2, 3) and hour == 17:
+        return True, "每日維護休市(17:00~18:00 ET)"
+    return False, None

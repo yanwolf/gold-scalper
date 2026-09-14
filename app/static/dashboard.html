@@ -688,6 +688,18 @@
         <label>震盪濾網門檻(濾網開啟時才有效)</label>
         <input type="number" id="backtestChopThreshold" placeholder="留空=沿用正式設定" step="1" min="0" max="100" />
       </div>
+      <div class="settings-field">
+        <label>休市時段不開新倉(週末/CME每日維護)</label>
+        <select id="backtestBlockMarketClosed">
+          <option value="">沿用目前正式設定</option>
+          <option value="1">強制開啟</option>
+          <option value="0">強制關閉</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>最小ATR門檻(points，0=不限制)</label>
+        <input type="number" id="backtestMinAtr" placeholder="留空=沿用正式設定" step="0.1" min="0" />
+      </div>
     </div>
   </div>
 
@@ -1007,6 +1019,8 @@ const els = {
   backtestReversalConfirm: document.getElementById('backtestReversalConfirm'),
   backtestUseChop: document.getElementById('backtestUseChop'),
   backtestChopThreshold: document.getElementById('backtestChopThreshold'),
+  backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
+  backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -2053,6 +2067,8 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     `;
   }
 
+  const sessionHtml = `<div class="cfg-row"><span class="cfg-label">休市不開新倉</span><span class="cfg-value ${s.paper_block_market_closed ? 'on' : ''}">${s.paper_block_market_closed ? '開啟' : '關閉'}</span></div>`
+    + `<div class="cfg-row"><span class="cfg-label">最小ATR門檻</span><span class="cfg-value ${Number(s.paper_min_atr_points) > 0 ? 'on' : ''}">${Number(s.paper_min_atr_points) > 0 ? s.paper_min_atr_points + 'pt' : '不限制'}</span></div>`;
   const chopHtml = s.paper_use_chop_filter
     ? `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value on">開啟(門檻 ${s.paper_chop_threshold})</span></div>`
     : `<div class="cfg-row"><span class="cfg-label">震盪濾網</span><span class="cfg-value off">關閉</span></div>`;
@@ -2083,7 +2099,7 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
       <div class="cfg-title">目前策略設定（${label}）</div>
       ${stopModeHtml}
       <div class="cfg-row"><span class="cfg-label">訊號反轉確認次數</span><span class="cfg-value">${s.paper_reversal_confirm_count}</span></div>
-      ${chopHtml}
+      ${chopHtml}${sessionHtml}
       ${changedAtHtml}
       ${excludedHtml}
       ${circuitBreakerHtml}
@@ -2249,6 +2265,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier',
   'paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
   'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
+  'paper_block_market_closed', 'paper_min_atr_points',
 ];
 
 els.engineParamsToggle.addEventListener('click', () => {
@@ -2369,6 +2386,8 @@ function buildBacktestParamOverrides(){
   addIfPresent('reversal_confirm_count', els.backtestReversalConfirm);
   addIfPresent('use_chop_filter', els.backtestUseChop);
   addIfPresent('chop_threshold', els.backtestChopThreshold);
+  addIfPresent('block_market_closed', els.backtestBlockMarketClosed);
+  addIfPresent('min_atr_points', els.backtestMinAtr);
   return params.toString();
 }
 
@@ -2403,6 +2422,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
         回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根1分K(還原成 ${data.synthetic_trade_count} 筆合成成交)
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
         ／ 停損/移動停損以1分K高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}
+        ${(data.skipped_market_closed || data.skipped_low_atr) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
       <div id="backtestActiveConfig"></div>
@@ -2444,6 +2464,8 @@ els.backtestRunBtn.addEventListener('click', async () => {
       paper_reversal_confirm_count: data.reversal_confirm_count,
       paper_use_chop_filter: data.use_chop_filter ? 1 : 0,
       paper_chop_threshold: data.chop_threshold,
+      paper_block_market_closed: data.block_market_closed ? 1 : 0,
+      paper_min_atr_points: data.min_atr_points,
     };
     renderActiveConfig(document.getElementById('backtestActiveConfig'), backtestActiveSettings, `${data.backtest_days}天回測`);
 
@@ -2483,7 +2505,7 @@ function showSettingsResult(msg, isError){
 const SETTINGS_GROUPS = [
   { title: '停損模式', keys: ['paper_sl_points', 'paper_trail_trigger_points', 'paper_trail_distance_points',
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
-  { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold'] },
+  { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points'] },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },

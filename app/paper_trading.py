@@ -177,7 +177,16 @@ class PaperTradingEngine:
                 and choppiness_index is not None
                 and choppiness_index >= s["paper_chop_threshold"]
             )
-            if not is_choppy:
+            # 休市濾網：底層黃金市場休市時不開新倉(週末、CME每日維護)，見trading_core說明
+            market_closed = False
+            if s.get("paper_block_market_closed", 1):
+                market_closed, _ = trading_core.is_gold_market_closed(datetime.now(timezone.utc))
+            # 最小ATR門檻：波動太小沒行情可做，不開新倉
+            atr_too_low = False
+            min_atr = float(s.get("paper_min_atr_points", 0) or 0)
+            if min_atr > 0 and result.get("atr") is not None and result["atr"] < min_atr:
+                atr_too_low = True
+            if not is_choppy and not market_closed and not atr_too_low:
                 self._open_position(result, current_price, sl_points)
 
     def _open_position(self, signal_result, current_price, sl_points):

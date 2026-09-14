@@ -609,6 +609,8 @@ async def backtest_run(
     atr_trail_multiplier: Optional[float] = None,
     use_chop_filter: Optional[bool] = None,
     chop_threshold: Optional[float] = None,
+    block_market_closed: Optional[bool] = None,
+    min_atr_points: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     target_step_count: Optional[int] = None,
@@ -668,6 +670,8 @@ async def backtest_run(
         atr_trail_multiplier=atr_trail_multiplier,
         use_chop_filter=use_chop_filter,
         chop_threshold=chop_threshold,
+        block_market_closed=block_market_closed,
+        min_atr_points=min_atr_points,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
         target_step_count=target_step_count,
@@ -688,6 +692,8 @@ async def backtest_sweep_start(
     reversal_confirm_count: Optional[int] = None,
     use_chop_filter: Optional[bool] = None,
     chop_threshold: Optional[float] = None,
+    block_market_closed: Optional[bool] = None,
+    min_atr_points: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     symbol: str = "XAUUSDT",
@@ -733,6 +739,10 @@ async def backtest_sweep_start(
         baseline_overrides["paper_use_chop_filter"] = 1 if use_chop_filter else 0
     if chop_threshold is not None:
         baseline_overrides["paper_chop_threshold"] = chop_threshold
+    if block_market_closed is not None:
+        baseline_overrides["paper_block_market_closed"] = 1 if block_market_closed else 0
+    if min_atr_points is not None:
+        baseline_overrides["paper_min_atr_points"] = min_atr_points
 
     job_id = sweep_module.start_sweep(
         days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None,

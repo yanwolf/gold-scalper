@@ -145,6 +145,8 @@ def run_backtest(
     atr_trail_multiplier=None,
     use_chop_filter=None,
     chop_threshold=None,
+    block_market_closed=None,
+    min_atr_points=None,
     strategy_type=None,
     resonance_min_conditions=4,
     spread_cost_points=None,
@@ -215,6 +217,10 @@ def run_backtest(
         use_chop_filter = bool(s["paper_use_chop_filter"])
     if chop_threshold is None:
         chop_threshold = s["paper_chop_threshold"]
+    if block_market_closed is None:
+        block_market_closed = bool(s.get("paper_block_market_closed", 1))
+    if min_atr_points is None:
+        min_atr_points = float(s.get("paper_min_atr_points", 0) or 0)
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
     if spread_cost_points is None:
@@ -274,6 +280,8 @@ def run_backtest(
 
     position = None
     closed_trades = []
+    skipped_market_closed = 0
+    skipped_low_atr = 0
     # 目前生效的停損距離(每個訊號步用當下ATR重算一次，停損步沿用最近一次的值)
     step_trail_trigger_points = trail_trigger_points
     step_trail_distance_points = trail_distance_points
@@ -379,8 +387,16 @@ def run_backtest(
                 and choppiness_index is not None
                 and choppiness_index >= chop_threshold
             )
-            if not is_choppy:
-                entry_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
+            # 休市濾網 / 最小ATR門檻，跟即時模擬單同一套規則(見trading_core與settings說明)
+            step_dt = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc)
+            market_closed = block_market_closed and trading_core.is_gold_market_closed(step_dt)[0]
+            atr_too_low = min_atr_points > 0 and atr is not None and atr < min_atr_points
+            if market_closed:
+                skipped_market_closed += 1
+            if atr_too_low:
+                skipped_low_atr += 1
+            if not is_choppy and not market_closed and not atr_too_low:
+                entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
                     current_price=current_price,
@@ -434,6 +450,10 @@ def run_backtest(
         "atr_trail_multiplier": atr_trail_multiplier,
         "use_chop_filter": use_chop_filter,
         "chop_threshold": chop_threshold,
+        "block_market_closed": block_market_closed,
+        "min_atr_points": min_atr_points,
+        "skipped_market_closed": skipped_market_closed,  # 被休市濾網擋掉的進場訊號數
+        "skipped_low_atr": skipped_low_atr,  # 被最小ATR門檻擋掉的進場訊號數
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,
