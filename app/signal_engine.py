@@ -30,18 +30,21 @@ from app.analysis import (
     compute_trend_filter,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
+from app import smc_structure
 
 CHAN_LOOKBACK_TRADES = 100000  # (回測/舊路徑用)從逐筆成交建K棒時的回看筆數
 CHAN_MAX_CANDLES = 600  # 即時路徑從1分鐘K棒快取取樣時，最多餵給纏論/ATR的K棒數(控制每次tick的計算量)
                               # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
                               # 也沒用，實際能用的資料量是兩者取較小值)
 
-DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" 或 "resonance_fvg"
+DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" / "resonance_fvg" / "smc_structure"
+STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure")
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                                 current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
-                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
+                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
+                                smc_candles=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -83,7 +86,18 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         current_price = trades[-1]["price"] if trades else None
 
     emas = rsi = macd = fvgs = None
-    if strategy_type == "resonance_fvg":
+    if strategy_type == "smc_structure":
+        # SMC結構策略(見smc_structure.py)：直接吃1小時K，不需要纏論/分價量表的判斷，
+        # 但chan/profile/atr/choppiness照樣附上(dashboard顯示、ATR停損模式共用)。
+        # 資料長度不夠(即時路徑的1分K快取只有3天)時，用REST 1小時K歷史補齊。
+        # smc_candles有給(回測：預先切好、只到當下時間點的1小時K)就直接用，絕不去抓REST，
+        # 否則會把「未來」的K棒混進去造成look-ahead；沒給(即時路徑)才補REST歷史。
+        if smc_candles is None:
+            smc_candles = candles
+            if len(smc_candles) < smc_structure.SMC_MIN_CANDLES + 1:
+                smc_candles = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
+        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price)
+    elif strategy_type == "resonance_fvg":
         emas = compute_ema(candles)
         rsi = compute_rsi(candles)
         macd = compute_macd(candles)
@@ -179,6 +193,9 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
             "book_mid": freshness.get("book_mid"),
         }
 
+    if strategy_type == "smc_structure":
+        # SMC結構策略固定用1小時K(不管引擎的interval_seconds怎麼設)，避免誤把它掛在小週期上
+        interval_seconds = smc_structure.SMC_INTERVAL_SECONDS
     candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
     # 趨勢濾網用的大週期K棒：丟掉進行中的最後一根，只用已收盤的，方向才不會在同一根K棒內來回翻
     trend_candles = None

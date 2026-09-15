@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import requests
 
 from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
+from app import smc_structure
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows
 from app import trading_core
 from app import settings as settings_module
@@ -301,6 +302,24 @@ def run_backtest(
             trend_dirs.append(d)
     skipped_trend = 0
 
+    # SMC結構策略(smc_structure.py)：整段回測先把1分K重取樣成1小時K，再用REST抓「回測視窗
+    # 之前」的1小時K當warmup(結構判定至少要250根，30天只有720根，前面一大段會被warmup吃掉)。
+    # 重播時用bisect只切「step_time之前」的K棒餵給訊號函式，跟趨勢濾網一樣不看未來。
+    smc_hourly, smc_close_times = [], []
+    if strategy_type == "smc_structure":
+        minute_candles = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                           "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
+        local_hourly = resample_candles(minute_candles, smc_structure.SMC_INTERVAL_SECONDS)
+        try:
+            hist = smc_structure.fetch_hourly_klines(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"SMC回測warmup 1小時K抓取失敗，只用視窗內資料: {e}")
+            hist = []
+        if local_hourly:
+            hist = [c for c in hist if c["bucket_start"] < local_hourly[0]["bucket_start"]]
+        smc_hourly = smc_structure.merge_hourly_candles(hist, local_hourly)
+        smc_close_times = [c["bucket_start"] + smc_structure.SMC_INTERVAL_SECONDS * 1000 - 1 for c in smc_hourly]
+
     # 1分K高低價序列(給停損步用)：kline欄位 [open_time, o, h, l, c, v, close_time, ...]
     kline_close_times = [int(k[6]) for k in klines]
     kline_highs = [float(k[2]) for k in klines]
@@ -362,6 +381,13 @@ def run_backtest(
 
         current_price = trades_so_far[-1]["price"]
 
+        smc_candles = None
+        if strategy_type == "smc_structure":
+            idx = bisect.bisect_right(smc_close_times, step_time)  # 已收盤的1小時K數
+            smc_candles = smc_hourly[:idx]
+            # 補一根「進行中」的K棒(訊號函式會把最後一根視為未收盤丟掉)
+            smc_candles = smc_candles + [smc_hourly[idx] if idx < len(smc_hourly) else smc_hourly[-1]]
+
         result = compute_signal_from_trades(
             trades_so_far,
             interval_seconds=interval_seconds,
@@ -370,6 +396,7 @@ def run_backtest(
             current_price=current_price,
             strategy_type=strategy_type,
             resonance_min_conditions=resonance_min_conditions,
+            smc_candles=smc_candles,
         )
 
         # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
@@ -383,6 +410,12 @@ def run_backtest(
             step_sl_points = sl_points
             step_trail_trigger_points = trail_trigger_points
             step_trail_distance_points = trail_distance_points
+
+        # SMC結構策略：初始停損優先用結構停損(OB/FVG外緣)，跟paper_trading._tick()同一套規則
+        if strategy_type == "smc_structure":
+            suggested = (result.get("smc") or {}).get("suggested_sl_points")
+            if suggested and suggested > 0:
+                step_sl_points = suggested
 
         # resonance_fvg策略專用：9EMA動態防守出場，current_ema9=None時
         # check_exit()完全不會啟用這個判斷，chan_profile模式維持原有行為不變

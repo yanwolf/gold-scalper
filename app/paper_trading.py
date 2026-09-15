@@ -152,6 +152,14 @@ class PaperTradingEngine:
             trail_trigger_points = s["paper_trail_trigger_points"]
             trail_distance_points = s["paper_trail_distance_points"]
 
+        # SMC結構策略：初始停損優先用「OB/FVG區域外緣」算出來的結構停損距離
+        # (smc_structure.py的suggested_sl_points)，比固定點數/ATR更貼近這套方法的本意；
+        # 算不出來(沒碰到區域)時退回上面的設定值。移動停損仍照設定跑。
+        if self.strategy_type == "smc_structure":
+            suggested = (result.get("smc") or {}).get("suggested_sl_points")
+            if suggested and suggested > 0:
+                sl_points = suggested
+
         with self._lock:
             position = self._position
 
@@ -598,11 +606,20 @@ paper_trading_1m_resonance = PaperTradingEngine(
     resonance_min_conditions=3, execution_index=4,
 )
 
+# 1小時K SMC市場結構策略(新增，實驗性，見smc_structure.py/README)：長線結構引擎，
+# 訊號頻率低(1小時K一個月可能只有幾筆)，純模擬觀察績效，沒有綁真實下單。
+# 停損：初始用結構停損(OB/FVG外緣)，移動停損用這個engine_id的專屬參數
+# (建議在dashboard「此引擎專屬參數」開ATR模式，因為ATR是用1小時K算的，單位比15分K大)。
+paper_trading_1h_smc = PaperTradingEngine(
+    interval_seconds=3600, label="1小時K SMC結構", strategy_type="smc_structure", execution_index=5,
+)
+
 ALL_PAPER_TRADING_ENGINES = {
     paper_trading_1m.engine_id: paper_trading_1m,
     paper_trading_5m.engine_id: paper_trading_5m,
     paper_trading_15m.engine_id: paper_trading_15m,
     paper_trading_1m_resonance.engine_id: paper_trading_1m_resonance,
+    paper_trading_1h_smc.engine_id: paper_trading_1h_smc,
 }
 
 # 依服務角色決定實際載入的引擎(修正記錄見README)：lab全開；live只開LIVE_ENGINE_IDS，

@@ -2301,3 +2301,23 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 **心跳**：lab的health_monitor每輪多打一次 `LIVE_HEALTH_URL`，連續3次失敗才Telegram告警、恢復時再通知；live端自己的內部告警也會透過/health帶回來。
 
 建議上線順序：先開第二個Zeabur服務、`APP_ROLE=live` 但金鑰仍用Demo，把匯入/停止/平倉/對帳流程走一遍，再換正式金鑰。
+
+## SMC市場結構策略 (strategy_type="smc_structure"，1小時K，實驗性)
+
+參考TradingView上「Smart Money Concepts + Cipher B」的看盤法寫成的長線結構引擎，
+程式在 `app/smc_structure.py`，engine_id 是 `smc_structure_3600`，純模擬、沒綁真實下單。
+
+**規則**
+1. swing高低點(左右各5根) → MSS(結構轉換) → 連續2次BOS 才確認趨勢
+2. 供需區：OB(突破前最後一根反向K) + FVG(三根K缺口)，60根K後或被收盤價穿越即失效
+3. 觸發：趨勢方向 + 剛收盤的1小時K碰到同向OB/FVG + WaveTrend在高檔死叉/低檔金叉 + EMA20/50同向排列 → 「訊號」；
+   只差交叉 → 「關注」
+4. 初始停損：OB/FVG外緣再加0.15%(`smc.suggested_sl_points`)；移動停損沿用該引擎的專屬參數(trading_core)
+
+**資料**：結構判定至少要250根1小時K，但1分K快取只有3天(72根)，所以模組自帶REST 1小時K快取
+(`get_hourly_history`，10分鐘重抓一次)，即時路徑把REST歷史+本地最新K棒接起來用；回測用
+「視窗之前」的REST 1小時K當warmup，重播時只切step_time之前的K棒，不看未來。
+
+**改到的檔案**：`app/smc_structure.py`(新增)、`app/signal_engine.py`(策略分支+`smc_candles`參數)、
+`app/paper_trading.py`(註冊引擎、結構停損)、`app/backtest.py`(1小時K預先取樣+warmup)、
+`app/settings.py`(execution_engine_index上限改5)、`app/static/dashboard.html`(三個下拉多一個選項、回測週期多1小時)。

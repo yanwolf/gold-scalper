@@ -160,8 +160,8 @@ FIELD_META = {
                 "但轉折時反應越慢。常見設定3.0。",
     },
     "execution_engine_index": {
-        "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
-        "type": "int", "step": 1, "min": 0, "max": 4,
+        "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振 / 5=1小時K SMC結構)",
+        "type": "int", "step": 1, "min": 0, "max": 5,
         "default": int(os.getenv("EXECUTION_ENGINE_INDEX", "0")),
         "help": "被指定的引擎，開倉/平倉時才會同步在幣安期貨(依BINANCE_USE_TESTNET"
                 "決定測試網或正式環境)送出對應的市價單，其他引擎維持純模擬、不會下單。"
@@ -174,8 +174,8 @@ FIELD_META = {
                 "不然同一個帳戶會發生部位互相抵銷的問題。",
     },
     "execution_engine_index_2": {
-        "label": "真實下單引擎B (0=不綁 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
-        "type": "int", "step": 1, "min": 0, "max": 4,
+        "label": "真實下單引擎B (0=不綁 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振 / 5=1小時K SMC結構)",
+        "type": "int", "step": 1, "min": 0, "max": 5,
         "default": int(os.getenv("EXECUTION_ENGINE_INDEX_2", "0")),
         "help": "第二個真實下單槽位，用途是讓兩個引擎同時做真實下單(例如15分K跟1分K"
                 "同時跑，加快累積滑價統計資料)。跟引擎A設成同一個編號沒有意義(等於"
