@@ -352,6 +352,7 @@ def run_backtest(
 
     position = None
     closed_trades = []
+    smc_funnel = {}  # SMC策略診斷：每個訊號步的stage/理由分佈，看訊號稀疏是卡在哪一關
     skipped_market_closed = 0
     skipped_low_atr = 0
     # 目前生效的停損距離(每個訊號步用當下ATR重算一次，停損步沿用最近一次的值)
@@ -437,6 +438,20 @@ def run_backtest(
 
         # SMC結構策略：初始停損優先用結構停損(OB/FVG外緣)，跟paper_trading._tick()同一套規則
         if strategy_type == "smc_structure":
+            _chan_r, _prof_r = result["chan"]["reason"], result["profile"]["reason"]
+            if result["stage"] == "中性":
+                if "EMA" in _chan_r:
+                    _reason = "趨勢確認但EMA排列不符"
+                elif "不在" in _prof_r:
+                    _reason = "趨勢確認但不在OB/FVG區"
+                else:
+                    _reason = _chan_r.split("，")[0].split("：")[0].split("(")[0]
+            else:
+                _reason = _prof_r.split("，")[0]
+                if "區" in _reason:
+                    _reason = _reason[:_reason.index("區") + 1]
+            _key = f'{result["stage"]}｜{_reason[:20]}'
+            smc_funnel[_key] = smc_funnel.get(_key, 0) + 1
             suggested = (result.get("smc") or {}).get("suggested_sl_points")
             if suggested and suggested > 0:
                 step_sl_points = suggested
@@ -532,6 +547,7 @@ def run_backtest(
         "signal_kline_count": len(signal_step_times),  # 所選週期的K線總數(訊號步的母體)
         "intrabar_stop_checks": intrabar_checks,  # 訊號步之間用細K線高低價檢查停損的次數
         "stop_kline_interval": SMC_LONG_RANGE_STOP_INTERVAL if smc_long_range else "1m",  # 停損步用的K線週期
+        "smc_funnel": smc_funnel or None,  # SMC策略：各訊號步落在哪個階段/理由(診斷訊號稀疏用)
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),
         "sl_points": sl_points,

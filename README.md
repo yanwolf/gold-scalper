@@ -2325,3 +2325,8 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 **長天數回測**：SMC策略選超過30天(90/180/365)時，停損步自動改用15分K(其他策略仍是1分K/30天上限)，
 訊號步每根1小時K都檢查(不取樣)，warmup用視窗之前的1小時K。回測結果多一個 `stop_kline_interval` 欄位標示。
 SMC參數可用環境變數覆寫：`SMC_SWING_N` `SMC_CONFIRM_BOS` `SMC_WT_LEVEL` `SMC_ZONE_MAX_AGE` `SMC_REQUIRE_EMA`。
+
+**訊號稀疏修正**：原本要求「剛收盤那根K碰到OB/FVG」且「同一根K發生WaveTrend交叉」，一年只有三筆。
+改成兩件事在最近 `touch_window`(預設4，環境變數 `SMC_TOUCH_WINDOW`)根K內各自成立即可，交叉後WaveTrend
+不能已經翻回去。回測結果多 `smc_funnel`(dashboard回測範圍那行會顯示)：每個訊號步卡在哪一關的計數，
+用來判斷該放寬哪個條件(EMA排列 / 不在區域 / 等交叉)。

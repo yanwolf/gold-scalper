@@ -47,6 +47,7 @@ DEFAULT_SMC_CFG = {
     "zone_max_age": 60,      # OB/FVG幾根K後失效
     "sl_buffer_pct": 0.0015, # 結構停損放在區域外緣再多0.15%
     "require_ema": True,
+    "touch_window": 4,       # 「碰到區域」跟「WaveTrend交叉」允許發生在最近幾根K內(不必同一根)
 }
 
 # 可用Zeabur環境變數覆寫(不用改程式重部署)：SMC_SWING_N / SMC_CONFIRM_BOS / SMC_WT_LEVEL /
@@ -54,6 +55,7 @@ DEFAULT_SMC_CFG = {
 import os as _os
 for _k, _env, _cast in (("swing_n", "SMC_SWING_N", int), ("confirm_bos", "SMC_CONFIRM_BOS", int),
                         ("wt_level", "SMC_WT_LEVEL", float), ("zone_max_age", "SMC_ZONE_MAX_AGE", int),
+                        ("touch_window", "SMC_TOUCH_WINDOW", int),
                         ("require_ema", "SMC_REQUIRE_EMA", lambda v: v.strip() not in ("0", "false", "False"))):
     _v = _os.getenv(_env)
     if _v:
@@ -353,15 +355,23 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
         if trend == "bullish" and not (c["close"] > ef[i] > es[i]):
             return _neutral(current_price, struct_reason + "；但EMA20/50未呈多頭排列", extra)
 
-    # 價格是否在同方向的OB/FVG區域裡(用剛收盤那根K的高低點判斷「有碰到」)
+    # 價格是否在最近touch_window根K內碰過同方向的OB/FVG區域(區域必須到現在仍有效——
+    # analyze_structure已經把被收盤價穿越的區域清掉了)。原本要求「剛收盤那根K碰到區域」
+    # 且「同一根K發生WaveTrend交叉」，兩件稀有事件被迫同一根K發生，一年只出三筆訊號；
+    # 實際看盤的人也是「回到區域附近、幾根K內看到交叉」就進場，所以放寬成視窗內各自成立。
+    w = max(1, int(cfg["touch_window"]))
     hit = None
     for z in st["zones"]:
         if z["side"] != trend:
             continue
-        if trend == "bearish" and z["bot"] <= c["high"] and c["close"] < z["top"]:
-            hit = z
-        elif trend == "bullish" and z["top"] >= c["low"] and c["close"] > z["bot"]:
-            hit = z
+        for k in range(i, max(i - w, z["index"]) , -1):
+            ck = closed[k]
+            if trend == "bearish" and z["bot"] <= ck["high"] and ck["close"] < z["top"]:
+                hit = z; break
+            if trend == "bullish" and z["top"] >= ck["low"] and ck["close"] > z["bot"]:
+                hit = z; break
+        if hit:
+            break
     if hit is None:
         return {
             "stage": "中性",
@@ -374,14 +384,26 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
 
     zone_reason = f"回測{hit['kind']}區 {hit['bot']:.2f}~{hit['top']:.2f}"
     level = cfg["wt_level"] * 0.6
+
+    def _cross_at(k):
+        if k < 2 or None in (wt1[k], wt2[k], wt1[k - 1], wt2[k - 1], wt1[k - 2]):
+            return False
+        if trend == "bearish":
+            return wt1[k - 1] >= wt2[k - 1] and wt1[k] < wt2[k] and max(wt1[k - 1], wt1[k - 2]) > level
+        return wt1[k - 1] <= wt2[k - 1] and wt1[k] > wt2[k] and min(wt1[k - 1], wt1[k - 2]) < -level
+
+    # 交叉可以發生在視窗內任一根，但交叉之後WaveTrend必須「還沒翻回去」(空單wt1仍在wt2之下)，
+    # 否則算過期訊號
+    crossed = False
+    for k in range(i, max(i - w, 1), -1):
+        if _cross_at(k):
+            still_valid = (wt1[i] < wt2[i]) if trend == "bearish" else (wt1[i] > wt2[i])
+            crossed = still_valid
+            break
     if trend == "bearish":
-        crossed = (wt1[i - 1] >= wt2[i - 1] and wt1[i] < wt2[i]
-                   and max(wt1[i - 1], wt1[i - 2]) > level)
         sl = hit["top"] * (1 + cfg["sl_buffer_pct"])
         sl_points = max(sl - current_price, 0.0) if current_price else None
     else:
-        crossed = (wt1[i - 1] <= wt2[i - 1] and wt1[i] > wt2[i]
-                   and min(wt1[i - 1], wt1[i - 2]) < -level)
         sl = hit["bot"] * (1 - cfg["sl_buffer_pct"])
         sl_points = max(current_price - sl, 0.0) if current_price else None
 

@@ -2793,9 +2793,9 @@ els.backtestRunBtn.addEventListener('click', async () => {
 
     els.backtestResult.innerHTML = `
       <div class="backtest-meta">
-        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根1分K(還原成 ${data.synthetic_trade_count} 筆合成成交)
+        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}(還原成 ${data.synthetic_trade_count} 筆合成成交)
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
-        ／ 停損/移動停損以1分K高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}
+        ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
