@@ -69,6 +69,35 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     """
     strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
 
+    if strategy_type == "smc_structure":
+        # SMC結構策略走獨立的輕量路徑：不算纏論/分價量表(它用不到，而且長天數回測每根
+        # 1小時K都要檢查，纏論會拖垮速度)，ATR/震盪指數改用1小時K算，讓ATR停損模式仍可用。
+        # smc_candles有給(回測：預先切好、只到當下時間點)就直接用，絕不去抓REST(避免look-ahead)；
+        # 沒給(即時路徑)才用本地K棒，不夠長就補REST歷史。
+        if smc_candles is None:
+            if candles is None:
+                candles = build_candles(trades, interval_seconds=smc_structure.SMC_INTERVAL_SECONDS)
+            smc_candles = candles
+            if len(smc_candles) < smc_structure.SMC_MIN_CANDLES + 1:
+                smc_candles = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
+        smc_candles = smc_candles[-smc_structure.SMC_MAX_CANDLES:]
+        if current_price is None:
+            current_price = trades[-1]["price"] if trades else (smc_candles[-1]["close"] if smc_candles else None)
+        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price)
+        result["trend_filter"] = (
+            compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
+            if trend_candles else None
+        )
+        closed = smc_candles[:-1] if len(smc_candles) > 1 else smc_candles
+        result["strategy_type"] = strategy_type
+        result["atr"] = compute_atr(closed)
+        result["choppiness_index"] = compute_choppiness_index(closed)
+        result["emas"] = result["rsi"] = result["macd"] = result["fvgs"] = None
+        result["chan_detail"] = {"interval_seconds": smc_structure.SMC_INTERVAL_SECONDS,
+                                 "source_candle_count": len(smc_candles)}
+        result["profile_detail"] = {"bucket_size": bucket_size, "trade_count": 0, "profile": [], "interpretation": None}
+        return result
+
     # candles有給(即時路徑從1分鐘K棒快取取樣)就直接用，歷史長度不受成交筆數限制；
     # 沒給(回測/舊路徑)才從逐筆成交建(修正記錄見README)
     if candles is None:
@@ -86,18 +115,7 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         current_price = trades[-1]["price"] if trades else None
 
     emas = rsi = macd = fvgs = None
-    if strategy_type == "smc_structure":
-        # SMC結構策略(見smc_structure.py)：直接吃1小時K，不需要纏論/分價量表的判斷，
-        # 但chan/profile/atr/choppiness照樣附上(dashboard顯示、ATR停損模式共用)。
-        # 資料長度不夠(即時路徑的1分K快取只有3天)時，用REST 1小時K歷史補齊。
-        # smc_candles有給(回測：預先切好、只到當下時間點的1小時K)就直接用，絕不去抓REST，
-        # 否則會把「未來」的K棒混進去造成look-ahead；沒給(即時路徑)才補REST歷史。
-        if smc_candles is None:
-            smc_candles = candles
-            if len(smc_candles) < smc_structure.SMC_MIN_CANDLES + 1:
-                smc_candles = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
-        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price)
-    elif strategy_type == "resonance_fvg":
+    if strategy_type == "resonance_fvg":
         emas = compute_ema(candles)
         rsi = compute_rsi(candles)
         macd = compute_macd(candles)

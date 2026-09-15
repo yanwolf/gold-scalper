@@ -2321,3 +2321,7 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 **改到的檔案**：`app/smc_structure.py`(新增)、`app/signal_engine.py`(策略分支+`smc_candles`參數)、
 `app/paper_trading.py`(註冊引擎、結構停損)、`app/backtest.py`(1小時K預先取樣+warmup)、
 `app/settings.py`(execution_engine_index上限改5)、`app/static/dashboard.html`(三個下拉多一個選項、回測週期多1小時)。
+
+**長天數回測**：SMC策略選超過30天(90/180/365)時，停損步自動改用15分K(其他策略仍是1分K/30天上限)，
+訊號步每根1小時K都檢查(不取樣)，warmup用視窗之前的1小時K。回測結果多一個 `stop_kline_interval` 欄位標示。
+SMC參數可用環境變數覆寫：`SMC_SWING_N` `SMC_CONFIRM_BOS` `SMC_WT_LEVEL` `SMC_ZONE_MAX_AGE` `SMC_REQUIRE_EMA`。

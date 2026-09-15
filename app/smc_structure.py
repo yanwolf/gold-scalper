@@ -33,6 +33,7 @@ logger = logging.getLogger("smc_structure")
 
 SMC_INTERVAL_SECONDS = 3600
 SMC_MIN_CANDLES = 250        # 少於這個數量就不判斷(回傳中性)
+SMC_MAX_CANDLES = 600        # 每次判斷最多吃這麼多根(結構狀態只跟最近幾百根有關，zone_max_age=60)，控制回測每步的計算量
 SMC_HISTORY_LIMIT = 1500     # REST單次最多1500根1小時K(約62天)，足夠warmup
 
 DEFAULT_SMC_CFG = {
@@ -47,6 +48,19 @@ DEFAULT_SMC_CFG = {
     "sl_buffer_pct": 0.0015, # 結構停損放在區域外緣再多0.15%
     "require_ema": True,
 }
+
+# 可用Zeabur環境變數覆寫(不用改程式重部署)：SMC_SWING_N / SMC_CONFIRM_BOS / SMC_WT_LEVEL /
+# SMC_ZONE_MAX_AGE / SMC_REQUIRE_EMA(0或1)。訊號太稀疏時優先試 SMC_REQUIRE_EMA=0、SMC_CONFIRM_BOS=1。
+import os as _os
+for _k, _env, _cast in (("swing_n", "SMC_SWING_N", int), ("confirm_bos", "SMC_CONFIRM_BOS", int),
+                        ("wt_level", "SMC_WT_LEVEL", float), ("zone_max_age", "SMC_ZONE_MAX_AGE", int),
+                        ("require_ema", "SMC_REQUIRE_EMA", lambda v: v.strip() not in ("0", "false", "False"))):
+    _v = _os.getenv(_env)
+    if _v:
+        try:
+            DEFAULT_SMC_CFG[_k] = _cast(_v)
+        except (TypeError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------------------

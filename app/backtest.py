@@ -63,12 +63,17 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 # 30天回測就是因為以前沒有這個上限跑不完才加的。
 
 
-def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2):
+SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
+SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
+
+
+def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None):
     """
     分頁抓取Binance期貨歷史K線，回傳由舊到新排序的原始K線資料。
-    公開市場資料，不需要API Key。
+    公開市場資料，不需要API Key。max_days不指定時上限是MAX_BACKTEST_DAYS(1分K的合理上限)，
+    SMC長天數回測會用較粗的K線並傳入較大的max_days。
     """
-    days = min(days, MAX_BACKTEST_DAYS)
+    days = min(days, max_days or MAX_BACKTEST_DAYS)
     # 結束時間對齊到「上一根已收完的整分鐘」，起點也跟著對齊。以前直接用now()，
     # 每次呼叫的視窗起點都差幾秒到幾分鐘，抓回來的K線集合會位移，跟下面的
     # stride取樣疊在一起後，兩次回測檢查到的K線幾乎完全不同(修正記錄見README)。
@@ -239,8 +244,19 @@ def run_backtest(
 
     # klines可由呼叫端預先抓好傳進來(參數掃描用：十幾組回測共用同一份資料，
     # 對照組和每一組實驗才是在完全相同的K線上比較，也省掉重複抓資料的時間)
+    # SMC結構策略的長天數回測(修正記錄見README)：1小時K一個月只有幾筆訊號，30天樣本
+    # 根本不夠評估。超過MAX_BACKTEST_DAYS時，停損步改用15分K(400天=38400根，跟30天1分K
+    # 同量級)，訊號步照樣是每根1小時K收盤；停損精度從1分K降到15分K，對持倉以天計的
+    # 長線策略影響可接受。其他策略維持原本1分K/30天上限不變。
+    smc_long_range = strategy_type == "smc_structure" and days > MAX_BACKTEST_DAYS
+    if smc_long_range:
+        days = min(days, SMC_MAX_BACKTEST_DAYS)
     if klines is None:
-        klines = fetch_historical_klines(symbol=symbol, days=days)
+        if smc_long_range:
+            klines = fetch_historical_klines(symbol=symbol, interval=SMC_LONG_RANGE_STOP_INTERVAL,
+                                             days=days, max_days=SMC_MAX_BACKTEST_DAYS)
+        else:
+            klines = fetch_historical_klines(symbol=symbol, days=days)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}
 
@@ -278,6 +294,10 @@ def run_backtest(
     # 而是「K線序號(收盤時間/週期) mod stride == 0 的那幾根」。這樣不管視窗
     # 起點落在哪裡，被檢查到的永遠是同一批K線(修正記錄見README)。
     step_period_ms = max(interval_ms, kline_ms)
+    if strategy_type == "smc_structure":
+        # WaveTrend交叉只發生在特定那一根K，跳著檢查會直接漏掉訊號，所以每根1小時K都檢查
+        # (400天也只有9600步，訊號計算本身很輕，見smc_structure.SMC_MAX_CANDLES)
+        stride = 1
     if stride > 1:
         step_times = [t for t in signal_step_times if ((t + 1) // step_period_ms) % stride == 0]
     else:
@@ -311,7 +331,11 @@ def run_backtest(
                            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
         local_hourly = resample_candles(minute_candles, smc_structure.SMC_INTERVAL_SECONDS)
         try:
-            hist = smc_structure.fetch_hourly_klines(symbol=symbol)
+            # warmup要落在回測視窗「之前」：抓 days+40 天的1小時K，再過濾掉視窗內的部分
+            raw = fetch_historical_klines(symbol=symbol, interval="1h", days=days + 40,
+                                          max_days=SMC_MAX_BACKTEST_DAYS + 40)
+            hist = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                     "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in raw]
         except Exception as e:
             logger.warning(f"SMC回測warmup 1小時K抓取失敗，只用視窗內資料: {e}")
             hist = []
@@ -506,7 +530,8 @@ def run_backtest(
         "target_step_count": target_step_count,
         "signal_interval_seconds": int(interval_seconds),
         "signal_kline_count": len(signal_step_times),  # 所選週期的K線總數(訊號步的母體)
-        "intrabar_stop_checks": intrabar_checks,  # 訊號步之間用1分K高低價檢查停損的次數
+        "intrabar_stop_checks": intrabar_checks,  # 訊號步之間用細K線高低價檢查停損的次數
+        "stop_kline_interval": SMC_LONG_RANGE_STOP_INTERVAL if smc_long_range else "1m",  # 停損步用的K線週期
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),
         "sl_points": sl_points,
