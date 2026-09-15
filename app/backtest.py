@@ -26,7 +26,7 @@ import requests
 
 from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
 from app import smc_structure
-from app.analysis import resample_candles, compute_supertrend, trend_filter_allows
+from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
@@ -343,6 +343,9 @@ def run_backtest(
             hist = [c for c in hist if c["bucket_start"] < local_hourly[0]["bucket_start"]]
         smc_hourly = smc_structure.merge_hourly_candles(hist, local_hourly)
         smc_close_times = [c["bucket_start"] + smc_structure.SMC_INTERVAL_SECONDS * 1000 - 1 for c in smc_hourly]
+        # 整段只算一次結構快照/EMA/WaveTrend(全部是因果計算，第i根只用<=i的資料)，
+        # 每個訊號步直接查表；原本每步重算一次，365天要跑幾十秒、逼近瀏覽器/閘道逾時
+        smc_pre = smc_structure.precompute(smc_hourly)
 
     # 1分K高低價序列(給停損步用)：kline欄位 [open_time, o, h, l, c, v, close_time, ...]
     kline_close_times = [int(k[6]) for k in klines]
@@ -406,23 +409,26 @@ def run_backtest(
 
         current_price = trades_so_far[-1]["price"]
 
-        smc_candles = None
         if strategy_type == "smc_structure":
             idx = bisect.bisect_right(smc_close_times, step_time)  # 已收盤的1小時K數
-            smc_candles = smc_hourly[:idx]
-            # 補一根「進行中」的K棒(訊號函式會把最後一根視為未收盤丟掉)
-            smc_candles = smc_candles + [smc_hourly[idx] if idx < len(smc_hourly) else smc_hourly[-1]]
-
-        result = compute_signal_from_trades(
-            trades_so_far,
-            interval_seconds=interval_seconds,
-            bucket_size=bucket_size,
-            trade_limit=trade_limit,
-            current_price=current_price,
-            strategy_type=strategy_type,
-            resonance_min_conditions=resonance_min_conditions,
-            smc_candles=smc_candles,
-        )
+            if idx <= 0:
+                continue
+            result = smc_structure.evaluate_at(smc_pre, idx - 1, current_price=current_price)
+            recent = smc_hourly[max(0, idx - 120):idx]
+            result["strategy_type"] = strategy_type
+            result["atr"] = compute_atr(recent)
+            result["choppiness_index"] = compute_choppiness_index(recent)
+            result["emas"] = None
+        else:
+            result = compute_signal_from_trades(
+                trades_so_far,
+                interval_seconds=interval_seconds,
+                bucket_size=bucket_size,
+                trade_limit=trade_limit,
+                current_price=current_price,
+                strategy_type=strategy_type,
+                resonance_min_conditions=resonance_min_conditions,
+            )
 
         # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
         # 而不是整場回測固定用同一個值，才能正確模擬跟即時模擬單一致的行為

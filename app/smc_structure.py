@@ -188,11 +188,12 @@ def _last_opposite_candle(candles, i, side, lookback=12):
     return None
 
 
-def analyze_structure(candles, cfg=None):
+def analyze_structure(candles, cfg=None, snapshots=False):
     """
-    整段K棒掃一遍，回傳目前的結構狀態：
-    {trend, pending, bos_count, events[], zones[], last_hh, last_ll}
-    trend: "bullish"/"bearish"/None；zones是還有效的OB/FVG清單。
+    整段K棒掃一遍(純因果：第i根的狀態只用到<=i的資料)，回傳目前的結構狀態：
+    {trend, pending, bos_count, events[], zones[], last_hh, last_ll, last_break}
+    snapshots=True時改回傳「每一根K收盤時的狀態」清單(回測用：整段算一次，
+    每個訊號步直接查表，不用每步重算，365天回測從幾十秒降到幾秒)。
     """
     cfg = {**DEFAULT_SMC_CFG, **(cfg or {})}
     n = cfg["swing_n"]
@@ -205,9 +206,10 @@ def analyze_structure(candles, cfg=None):
     last_hh = last_ll = None
     events = []
     zones = []
+    last_break = {"bearish": None, "bullish": None}  # 各方向最近一次MSS/BOS的突破價
+    snaps = [] if snapshots else None
 
     for i in range(len(candles)):
-        # 這根K收盤時已經確認的swing
         while swing_ptr < len(swings) and swings[swing_ptr][0] <= i:
             _, kind, price, _ = swings[swing_ptr]
             if kind == "H":
@@ -215,60 +217,66 @@ def analyze_structure(candles, cfg=None):
             else:
                 last_ll = price
             swing_ptr += 1
-        if last_hh is None or last_ll is None:
-            continue
 
-        c = candles[i]
-        broke_dn = c["close"] < last_ll
-        broke_up = c["close"] > last_hh
+        if last_hh is not None and last_ll is not None:
+            c = candles[i]
+            broke_dn = c["close"] < last_ll
+            broke_up = c["close"] > last_hh
 
-        if broke_dn:
-            if trend != "bearish" and pending != "bearish":
-                pending, bos_count = "bearish", 0
-                events.append({"index": i, "time": c["bucket_start"], "type": "MSS", "direction": "bearish", "price": last_ll})
-            else:
-                bos_count += 1
-                events.append({"index": i, "time": c["bucket_start"], "type": "BOS", "direction": "bearish", "price": last_ll})
-                if bos_count >= cfg["confirm_bos"]:
-                    trend = "bearish"
-            ob = _last_opposite_candle(candles, i, "bearish")
-            if ob:
-                zones.append({"kind": "OB", "side": "bearish", "top": ob["high"], "bot": ob["low"], "index": i})
-            last_ll = c["low"]
-        elif broke_up:
-            if trend != "bullish" and pending != "bullish":
-                pending, bos_count = "bullish", 0
-                events.append({"index": i, "time": c["bucket_start"], "type": "MSS", "direction": "bullish", "price": last_hh})
-            else:
-                bos_count += 1
-                events.append({"index": i, "time": c["bucket_start"], "type": "BOS", "direction": "bullish", "price": last_hh})
-                if bos_count >= cfg["confirm_bos"]:
-                    trend = "bullish"
-            ob = _last_opposite_candle(candles, i, "bullish")
-            if ob:
-                zones.append({"kind": "OB", "side": "bullish", "top": ob["high"], "bot": ob["low"], "index": i})
-            last_hh = c["high"]
+            if broke_dn:
+                if trend != "bearish" and pending != "bearish":
+                    pending, bos_count = "bearish", 0
+                    events.append({"index": i, "time": c["bucket_start"], "type": "MSS", "direction": "bearish", "price": last_ll})
+                else:
+                    bos_count += 1
+                    events.append({"index": i, "time": c["bucket_start"], "type": "BOS", "direction": "bearish", "price": last_ll})
+                    if bos_count >= cfg["confirm_bos"]:
+                        trend = "bearish"
+                last_break["bearish"] = last_ll
+                ob = _last_opposite_candle(candles, i, "bearish")
+                if ob:
+                    zones.append({"kind": "OB", "side": "bearish", "top": ob["high"], "bot": ob["low"], "index": i})
+                last_ll = c["low"]
+            elif broke_up:
+                if trend != "bullish" and pending != "bullish":
+                    pending, bos_count = "bullish", 0
+                    events.append({"index": i, "time": c["bucket_start"], "type": "MSS", "direction": "bullish", "price": last_hh})
+                else:
+                    bos_count += 1
+                    events.append({"index": i, "time": c["bucket_start"], "type": "BOS", "direction": "bullish", "price": last_hh})
+                    if bos_count >= cfg["confirm_bos"]:
+                        trend = "bullish"
+                last_break["bullish"] = last_hh
+                ob = _last_opposite_candle(candles, i, "bullish")
+                if ob:
+                    zones.append({"kind": "OB", "side": "bullish", "top": ob["high"], "bot": ob["low"], "index": i})
+                last_hh = c["high"]
 
-        # FVG：三根K的缺口
-        if i >= 2:
-            a, b = candles[i - 2], candles[i]
-            if a["low"] > b["high"]:
-                zones.append({"kind": "FVG", "side": "bearish", "top": a["low"], "bot": b["high"], "index": i})
-            elif a["high"] < b["low"]:
-                zones.append({"kind": "FVG", "side": "bullish", "top": b["low"], "bot": a["high"], "index": i})
+            if i >= 2:
+                a, b = candles[i - 2], candles[i]
+                if a["low"] > b["high"]:
+                    zones.append({"kind": "FVG", "side": "bearish", "top": a["low"], "bot": b["high"], "index": i})
+                elif a["high"] < b["low"]:
+                    zones.append({"kind": "FVG", "side": "bullish", "top": b["low"], "bot": a["high"], "index": i})
 
-        # 清掉過期或被收盤價穿越(失效)的區域
-        keep = []
-        for z in zones:
-            if i - z["index"] > cfg["zone_max_age"]:
-                continue
-            if z["side"] == "bearish" and c["close"] > z["top"]:
-                continue
-            if z["side"] == "bullish" and c["close"] < z["bot"]:
-                continue
-            keep.append(z)
-        zones = keep
+            keep = []
+            for z in zones:
+                if i - z["index"] > cfg["zone_max_age"]:
+                    continue
+                if z["side"] == "bearish" and c["close"] > z["top"]:
+                    continue
+                if z["side"] == "bullish" and c["close"] < z["bot"]:
+                    continue
+                keep.append(z)
+            zones = keep
 
+        if snapshots:
+            snaps.append({"trend": trend, "pending": pending, "bos_count": bos_count,
+                          "zones": list(zones), "last_hh": last_hh, "last_ll": last_ll,
+                          "last_break": dict(last_break)})
+
+    if snapshots:
+        return snaps, events
     return {
         "trend": trend,
         "pending": pending,
@@ -277,6 +285,7 @@ def analyze_structure(candles, cfg=None):
         "zones": zones,
         "last_hh": last_hh,
         "last_ll": last_ll,
+        "last_break": last_break,
     }
 
 
@@ -294,36 +303,49 @@ def _neutral(current_price, reason, extra=None):
     }
 
 
-def generate_signal_smc(candles, current_price=None, cfg=None):
-    """
-    輸入1小時K棒清單(最後一根視為「進行中」、不參與判斷)，回傳標準訊號格式。
-    stage: "訊號"(趨勢確認+價格在OB/FVG區+WaveTrend交叉+EMA排列)、
-           "關注"(趨勢確認且價格已進入區域，但還沒交叉)、"中性"。
-    """
+def precompute(closed, cfg=None):
+    """對一整段「已收盤」K棒算一次結構快照 + EMA + WaveTrend，之後用evaluate_at()逐根查。"""
     cfg = {**DEFAULT_SMC_CFG, **(cfg or {})}
-    closed = candles[:-1] if len(candles) > 1 else []
-    if current_price is None and candles:
-        current_price = candles[-1]["close"]
-    if len(closed) < SMC_MIN_CANDLES:
-        return _neutral(current_price, f"1小時K資料不足({len(closed)}/{SMC_MIN_CANDLES}根)")
-
-    st = analyze_structure(closed, cfg)
+    snaps, events = analyze_structure(closed, cfg, snapshots=True)
     closes = [c["close"] for c in closed]
-    ef = _ema_series(closes, cfg["ema_fast"])
-    es = _ema_series(closes, cfg["ema_slow"])
-    wt1, wt2 = compute_wavetrend(closed, cfg["wt_ch"], cfg["wt_avg"])
-    i = len(closed) - 1
+    return {
+        "cfg": cfg,
+        "candles": closed,
+        "snaps": snaps,
+        "events": events,
+        "ef": _ema_series(closes, cfg["ema_fast"]),
+        "es": _ema_series(closes, cfg["ema_slow"]),
+        "wt": compute_wavetrend(closed, cfg["wt_ch"], cfg["wt_avg"]),
+    }
+
+
+def evaluate_at(pre, i, current_price=None):
+    """
+    在precompute()的結果上評估「第i根已收盤K收盤那一刻」的訊號(只看<=i的資料)。
+    stage: "訊號"(趨勢確認+最近touch_window根內碰過同向OB/FVG+WaveTrend交叉+EMA排列)、
+           "關注"(趨勢確認且碰過區域，等交叉)、"中性"。
+    """
+    cfg = pre["cfg"]
+    closed = pre["candles"]
+    if current_price is None:
+        current_price = closed[i]["close"]
+    if i + 1 < SMC_MIN_CANDLES:
+        return _neutral(current_price, f"1小時K資料不足({i + 1}/{SMC_MIN_CANDLES}根)")
+
+    st = pre["snaps"][i]
+    ef, es = pre["ef"], pre["es"]
+    wt1, wt2 = pre["wt"]
     c = closed[i]
+    trend = st["trend"]
 
     extra = {
         "interval_seconds": SMC_INTERVAL_SECONDS,
-        "candle_count": len(closed),
-        "trend": st["trend"],
+        "candle_count": i + 1,
+        "trend": trend,
         "pending": st["pending"],
         "bos_count": st["bos_count"],
         "last_hh": st["last_hh"],
         "last_ll": st["last_ll"],
-        "events": st["events"],
         "zones": st["zones"],
         "ema_fast": ef[i],
         "ema_slow": es[i],
@@ -332,43 +354,33 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
         "suggested_sl_points": None,
     }
 
-    trend = st["trend"]
     if trend is None:
         return _neutral(current_price, "結構未確認(還沒有MSS+足夠BOS)", extra)
-    if None in (ef[i], es[i], wt1[i], wt2[i], wt1[i - 1], wt2[i - 1], wt1[i - 2]):
+    if None in (ef[i], es[i], wt1[i], wt2[i]):
         return _neutral(current_price, "指標資料不足", extra)
 
-    # 結構面理由
-    ev = [e for e in st["events"] if e["direction"] == trend]
-    last_break = ev[-1]["price"] if ev else None
     if st["pending"] == trend:
         struct_reason = f"結構{'看空' if trend == 'bearish' else '看多'}：MSS後已{st['bos_count']}次BOS"
     else:
-        # 出現了反向MSS但還沒累積到confirm_bos次反向BOS，趨勢暫時維持(對應「反彈沒衝過結構破壞位置」)
         struct_reason = f"結構{'看空' if trend == 'bearish' else '看多'}(已出現反向MSS，尚未確認翻轉)"
+    last_break = st["last_break"].get(trend)
     if last_break:
         struct_reason += f"，最近突破位{last_break:.2f}"
 
-    # EMA濾網
-    # 只看EMA20/50的相對排列，不再要求收盤價也在EMA之下/之上：回測OB/FVG本來就是
-    # 「反彈回到區域」，這時候收盤價幾乎一定在EMA20之上(空單)，原本的條件跟「回測區域」
-    # 互相矛盾，365天回測有2531個訊號步死在這一關(修正記錄見README)。
+    # 只看EMA20/50相對排列(收盤價回測區域時本來就會在EMA20另一側，不能拿收盤價當條件)
     if cfg["require_ema"]:
         if trend == "bearish" and not (ef[i] < es[i]):
             return _neutral(current_price, struct_reason + "；但EMA20/50未呈空頭排列", extra)
         if trend == "bullish" and not (ef[i] > es[i]):
             return _neutral(current_price, struct_reason + "；但EMA20/50未呈多頭排列", extra)
 
-    # 價格是否在最近touch_window根K內碰過同方向的OB/FVG區域(區域必須到現在仍有效——
-    # analyze_structure已經把被收盤價穿越的區域清掉了)。原本要求「剛收盤那根K碰到區域」
-    # 且「同一根K發生WaveTrend交叉」，兩件稀有事件被迫同一根K發生，一年只出三筆訊號；
-    # 實際看盤的人也是「回到區域附近、幾根K內看到交叉」就進場，所以放寬成視窗內各自成立。
+    # 最近touch_window根內碰過同向、且目前仍有效的OB/FVG
     w = max(1, int(cfg["touch_window"]))
     hit = None
     for z in st["zones"]:
         if z["side"] != trend:
             continue
-        for k in range(i, max(i - w, z["index"]) , -1):
+        for k in range(i, max(i - w, z["index"]), -1):
             ck = closed[k]
             if trend == "bearish" and z["bot"] <= ck["high"] and ck["close"] < z["top"]:
                 hit = z; break
@@ -396,13 +408,10 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
             return wt1[k - 1] >= wt2[k - 1] and wt1[k] < wt2[k] and max(wt1[k - 1], wt1[k - 2]) > level
         return wt1[k - 1] <= wt2[k - 1] and wt1[k] > wt2[k] and min(wt1[k - 1], wt1[k - 2]) < -level
 
-    # 交叉可以發生在視窗內任一根，但交叉之後WaveTrend必須「還沒翻回去」(空單wt1仍在wt2之下)，
-    # 否則算過期訊號
     crossed = False
     for k in range(i, max(i - w, 1), -1):
         if _cross_at(k):
-            still_valid = (wt1[i] < wt2[i]) if trend == "bearish" else (wt1[i] > wt2[i])
-            crossed = still_valid
+            crossed = (wt1[i] < wt2[i]) if trend == "bearish" else (wt1[i] > wt2[i])
             break
     if trend == "bearish":
         sl = hit["top"] * (1 + cfg["sl_buffer_pct"])
@@ -433,3 +442,19 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
         "current_price": current_price,
         "smc": extra,
     }
+
+
+def generate_signal_smc(candles, current_price=None, cfg=None):
+    """
+    即時路徑入口：輸入1小時K棒清單(最後一根視為「進行中」、不參與判斷)，回傳標準訊號格式。
+    內部就是precompute()+evaluate_at(最後一根已收盤)，跟回測走同一套函式。
+    """
+    closed = candles[:-1] if len(candles) > 1 else []
+    if current_price is None and candles:
+        current_price = candles[-1]["close"]
+    if len(closed) < SMC_MIN_CANDLES:
+        return _neutral(current_price, f"1小時K資料不足({len(closed)}/{SMC_MIN_CANDLES}根)")
+    pre = precompute(closed, cfg)
+    result = evaluate_at(pre, len(closed) - 1, current_price=current_price)
+    result["smc"]["events"] = pre["events"][-20:]
+    return result

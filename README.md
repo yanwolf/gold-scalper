@@ -2330,3 +2330,7 @@ SMC參數可用環境變數覆寫：`SMC_SWING_N` `SMC_CONFIRM_BOS` `SMC_WT_LEVE
 改成兩件事在最近 `touch_window`(預設4，環境變數 `SMC_TOUCH_WINDOW`)根K內各自成立即可，交叉後WaveTrend
 不能已經翻回去。回測結果多 `smc_funnel`(dashboard回測範圍那行會顯示)：每個訊號步卡在哪一關的計數，
 用來判斷該放寬哪個條件(EMA排列 / 不在區域 / 等交叉)。
+
+**效能修正**：SMC回測原本每個訊號步都重算整段結構，365天約幾十秒，會撞到瀏覽器/閘道逾時(Safari顯示「Load failed」)。
+改成 `smc_structure.precompute()` 整段算一次因果快照(結構/EMA/WaveTrend)，每步用 `evaluate_at()` 查表，
+365天約1～2秒；即時路徑的 `generate_signal_smc()` 內部也是同兩個函式，兩邊邏輯完全一致。
