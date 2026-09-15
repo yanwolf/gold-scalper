@@ -869,12 +869,19 @@ async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, t
     """
     # 主畫面訊號卡永遠附上大週期趨勢方向(用全域設定的週期/倍數)，就算濾網關閉也顯示，
     # 讓使用者先看到「如果開了濾網現在會怎麼判」再決定要不要開
-    s = settings_module.get_settings()
-    return compute_full_signal(
+    # 趨勢濾網的週期/倍數依「這個K線週期對應的纏論引擎」的專屬參數決定(15分K引擎改成4小時，
+    # 主畫面切到15分K時卡片就跟著顯示4小時)，沒有對應引擎或沒覆寫時退回全域設定
+    engine_id = f"chan_profile_{int(interval_seconds)}"
+    s = settings_module.get_settings(engine_id=engine_id)
+    result = compute_full_signal(
         interval_seconds=interval_seconds, bucket_size=bucket_size, trade_limit=trade_limit,
         trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600) or 3600),
         trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0),
     )
+    if result.get("trend_filter") is not None:
+        result["trend_filter"]["filter_mode"] = int(s.get("paper_trend_filter_mode", 0) or 0)
+        result["trend_filter"]["settings_engine_id"] = engine_id
+    return result
 
 
 @app.websocket("/ws/price")
