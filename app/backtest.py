@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import requests
 
 from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
+from app.analysis import resample_candles, compute_supertrend, trend_filter_allows
 from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness
@@ -147,6 +148,9 @@ def run_backtest(
     chop_threshold=None,
     block_market_closed=None,
     min_atr_points=None,
+    trend_filter_mode=None,
+    trend_interval_seconds=None,
+    trend_slow_multiplier=None,
     strategy_type=None,
     resonance_min_conditions=4,
     spread_cost_points=None,
@@ -221,6 +225,12 @@ def run_backtest(
         block_market_closed = bool(s.get("paper_block_market_closed", 1))
     if min_atr_points is None:
         min_atr_points = float(s.get("paper_min_atr_points", 0) or 0)
+    if trend_filter_mode is None:
+        trend_filter_mode = int(s.get("paper_trend_filter_mode", 0) or 0)
+    if trend_interval_seconds is None:
+        trend_interval_seconds = int(s.get("paper_trend_interval_seconds", 3600) or 3600)
+    if trend_slow_multiplier is None:
+        trend_slow_multiplier = float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0)
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
     if spread_cost_points is None:
@@ -271,6 +281,25 @@ def run_backtest(
         step_times = [t for t in signal_step_times if ((t + 1) // step_period_ms) % stride == 0]
     else:
         step_times = signal_step_times
+
+    # 趨勢濾網：整段回測先用1分K重取樣成大週期K棒，算好每根「已收盤」大週期K棒的
+    # 雙SuperTrend方向，重播時用bisect找step_time之前最後一根已收盤的方向(不看未來)
+    trend_close_times, trend_dirs = [], []
+    if trend_filter_mode:
+        minute_candles = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                           "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
+        big = resample_candles(minute_candles, trend_interval_seconds)
+        big = big[:-1] if len(big) > 1 else []  # 丟掉進行中的最後一根
+        fast_st = compute_supertrend(big, period=10, multiplier=1.0)
+        slow_st = compute_supertrend(big, period=10, multiplier=trend_slow_multiplier)
+        offset = len(big) - len(fast_st)
+        for i in range(len(fast_st)):
+            bar = big[offset + i]
+            fdir, sdir = fast_st[i]["direction"], slow_st[i]["direction"]
+            d = "bullish" if (fdir == 1 and sdir == 1) else ("bearish" if (fdir == -1 and sdir == -1) else None)
+            trend_close_times.append(bar["bucket_start"] + trend_interval_seconds * 1000 - 1)
+            trend_dirs.append(d)
+    skipped_trend = 0
 
     # 1分K高低價序列(給停損步用)：kline欄位 [open_time, o, h, l, c, v, close_time, ...]
     kline_close_times = [int(k[6]) for k in klines]
@@ -395,7 +424,14 @@ def run_backtest(
                 skipped_market_closed += 1
             if atr_too_low:
                 skipped_low_atr += 1
-            if not is_choppy and not market_closed and not atr_too_low:
+            trend_ok = True
+            if trend_filter_mode:
+                idx = bisect.bisect_right(trend_close_times, step_time) - 1
+                trend_dir = trend_dirs[idx] if idx >= 0 else None
+                trend_ok, _ = trend_filter_allows(trend_filter_mode, trend_dir, result["direction"])
+                if not trend_ok:
+                    skipped_trend += 1
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok:
                 entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
@@ -454,6 +490,10 @@ def run_backtest(
         "min_atr_points": min_atr_points,
         "skipped_market_closed": skipped_market_closed,  # 被休市濾網擋掉的進場訊號數
         "skipped_low_atr": skipped_low_atr,  # 被最小ATR門檻擋掉的進場訊號數
+        "trend_filter_mode": trend_filter_mode,
+        "trend_interval_seconds": trend_interval_seconds,
+        "trend_slow_multiplier": trend_slow_multiplier,
+        "skipped_trend": skipped_trend,  # 被趨勢濾網擋掉的進場訊號數
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,

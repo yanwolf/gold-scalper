@@ -136,6 +136,29 @@ FIELD_META = {
                 "平時ATR大約1~3點，可以先觀察平日與週末的ATR差距再決定門檻。"
                 "已開倉的部位不受影響。",
     },
+    "paper_trend_filter_mode": {
+        "label": "趨勢濾網 (0 = 關閉 / 1 = 只擋逆勢 / 2 = 嚴格：逆勢和中性都擋)",
+        "type": "int", "step": 1, "min": 0, "max": 2,
+        "default": int(os.getenv("PAPER_TREND_FILTER_MODE", "0")),
+        "help": "用大週期的雙SuperTrend當方向濾網：快線(倍數1.0)和慢線(倍數見下)"
+                "同時翻多=多頭、同時翻空=空頭、不同向=中性。模式1只跳過逆勢訊號"
+                "(多頭趨勢時不做空)，中性照常進場；模式2連中性也不進，只在趨勢明確時交易。"
+                "已開倉的部位不受影響。回測可以直接比較擋掉逆勢單後獲利因子的變化。",
+    },
+    "paper_trend_interval_seconds": {
+        "label": "趨勢濾網K線週期 (秒：900=15分 / 3600=1小時 / 14400=4小時)",
+        "type": "int", "step": 900, "min": 900, "max": 14400,
+        "default": int(os.getenv("PAPER_TREND_INTERVAL_SECONDS", "3600")),
+        "help": "大週期方向用哪個週期算。1分K/5分K引擎建議1小時，15分K引擎可以用4小時。"
+                "即時系統保留約3天的1分K，4小時只有18根可用，剛好夠SuperTrend(10)但偏少。",
+    },
+    "paper_trend_slow_multiplier": {
+        "label": "趨勢濾網慢線ATR倍數",
+        "type": "float", "step": 0.5, "min": 1.5, "max": 6,
+        "default": float(os.getenv("PAPER_TREND_SLOW_MULTIPLIER", "3.0")),
+        "help": "慢線SuperTrend的ATR倍數(快線固定1.0)。倍數越大越不容易翻轉、趨勢判定越保守，"
+                "但轉折時反應越慢。常見設定3.0。",
+    },
     "execution_engine_index": {
         "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
         "type": "int", "step": 1, "min": 0, "max": 4,
@@ -310,6 +333,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_atr_trigger_multiplier", "paper_atr_trail_multiplier",
     "paper_use_chop_filter", "paper_chop_threshold",
     "paper_block_market_closed", "paper_min_atr_points",
+    "paper_trend_filter_mode", "paper_trend_interval_seconds", "paper_trend_slow_multiplier",
 }
 
 

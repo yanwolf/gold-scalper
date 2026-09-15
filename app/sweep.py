@@ -41,6 +41,7 @@ ATR_MODE_PARAM_CANDIDATES = {
 ALWAYS_ACTIVE_PARAM_CANDIDATES = {
     "paper_reversal_confirm_count": [1, 2, 3],
     "paper_min_atr_points": [0.0, 0.8, 1.5, 2.5],
+    "paper_trend_filter_mode": [0, 1, 2],
 }
 
 # 震盪濾網開啟時才有意義的參數：濾網關閉時，改門檻同樣不會有任何效果
@@ -59,6 +60,9 @@ PARAM_LABELS = {
     "paper_chop_threshold": "震盪濾網門檻",
     "paper_min_atr_points": "最小ATR門檻",
     "paper_block_market_closed": "休市時段不開新倉",
+    "paper_trend_filter_mode": "趨勢濾網模式",
+    "paper_trend_interval_seconds": "趨勢濾網週期(秒)",
+    "paper_trend_slow_multiplier": "趨勢濾網慢線倍數",
 }
 
 _jobs = {}
@@ -203,6 +207,9 @@ def _run_sweep(job_id, combos, days, interval_seconds, context=None):
                 chop_threshold=combo["params"]["paper_chop_threshold"],
                 block_market_closed=bool(combo["params"].get("paper_block_market_closed", 1)),
                 min_atr_points=float(combo["params"].get("paper_min_atr_points", 0) or 0),
+                trend_filter_mode=int(combo["params"].get("paper_trend_filter_mode", 0) or 0),
+                trend_interval_seconds=int(combo["params"].get("paper_trend_interval_seconds", 3600) or 3600),
+                trend_slow_multiplier=float(combo["params"].get("paper_trend_slow_multiplier", 3.0) or 3.0),
             )
             summary = {
                 "label": combo["label"],

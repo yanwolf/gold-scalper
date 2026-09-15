@@ -29,6 +29,7 @@ from app import notifier as notifier_module
 from app import execution as execution_module
 from app import risk_guard
 from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact
+from app.analysis import trend_filter_allows
 
 logger = logging.getLogger("paper_trading")
 
@@ -123,12 +124,16 @@ class PaperTradingEngine:
         # 才會套用最新參數(例如新開倉的初始停損、觸發距離)。
         s = settings_module.get_settings(engine_id=self.engine_id)
 
+        trend_mode = int(s.get("paper_trend_filter_mode", 0) or 0)
         result = compute_full_signal(
             interval_seconds=self.interval_seconds,
             strategy_type=self.strategy_type,
             resonance_min_conditions=self.resonance_min_conditions,
             bucket_size=DEFAULT_BUCKET_SIZE,
             trade_limit=DEFAULT_TRADE_LIMIT,
+            # 趨勢濾網開啟時才多算一份大週期K棒的雙SuperTrend
+            trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600)) if trend_mode else None,
+            trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0)),
         )
         current_price = result.get("current_price")
         if current_price is None:
@@ -186,7 +191,12 @@ class PaperTradingEngine:
             min_atr = float(s.get("paper_min_atr_points", 0) or 0)
             if min_atr > 0 and result.get("atr") is not None and result["atr"] < min_atr:
                 atr_too_low = True
-            if not is_choppy and not market_closed and not atr_too_low:
+            # 趨勢濾網：大週期雙SuperTrend方向跟訊號方向比對(見analysis.trend_filter_allows)
+            trend_dir = (result.get("trend_filter") or {}).get("direction")
+            trend_ok, trend_note = trend_filter_allows(trend_mode, trend_dir, result["direction"])
+            if not trend_ok:
+                logger.info(f"{self.label}: {trend_note}")
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok:
                 self._open_position(result, current_price, sl_points)
 
     def _open_position(self, signal_result, current_price, sl_points):

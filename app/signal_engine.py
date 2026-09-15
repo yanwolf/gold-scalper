@@ -27,6 +27,7 @@ from app.binance_client import binance_streamer
 from app.analysis import (
     build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile,
     compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
+    compute_trend_filter,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
 
@@ -39,7 +40,8 @@ DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_prof
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
-                                current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None):
+                                current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
+                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -94,6 +96,11 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     else:
         result = generate_signal(chan_data, poc_info, current_price)
 
+    # 大週期雙SuperTrend方向(給趨勢濾網用)：trend_candles有給才算，沒給就是None
+    result["trend_filter"] = (
+        compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
+        if trend_candles else None
+    )
     result["strategy_type"] = strategy_type
     result["atr"] = atr
     result["choppiness_index"] = choppiness_index
@@ -117,8 +124,12 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     return result
 
 
+TREND_CANDLE_LIMIT = 300  # 給趨勢濾網的大週期K棒數上限(ST period=10只需要幾十根，多留一些讓Wilder平滑穩定)
+
+
 def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
-                         strategy_type="chan_profile", resonance_min_conditions=4):
+                         strategy_type="chan_profile", resonance_min_conditions=4,
+                         trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
@@ -169,6 +180,11 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         }
 
     candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
+    # 趨勢濾網用的大週期K棒：丟掉進行中的最後一根，只用已收盤的，方向才不會在同一根K棒內來回翻
+    trend_candles = None
+    if trend_interval_seconds:
+        tc = binance_streamer.get_recent_candles(interval_seconds=int(trend_interval_seconds), limit=TREND_CANDLE_LIMIT + 1)
+        trend_candles = tc[:-1] if len(tc) > 1 else None
     result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
@@ -178,6 +194,9 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
         candles=candles or None,
+        trend_candles=trend_candles,
+        trend_fast_multiplier=trend_fast_multiplier,
+        trend_slow_multiplier=trend_slow_multiplier,
     )
     result["bid"] = bid
     result["ask"] = ask

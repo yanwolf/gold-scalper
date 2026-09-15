@@ -801,3 +801,94 @@ def analyze_chan(candles):
         "beichi": beichi,
         "latest_zhongshu": zhongshu_list[-1] if zhongshu_list else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# 1c. SuperTrend / 雙ST趨勢濾網 — 給短線引擎當「大週期方向」用(修正記錄見README)
+# ---------------------------------------------------------------------------
+# 使用者觀察到盤整期纏論訊號來回被洗，決定引入趨勢跟隨策略的「方向」當濾網，
+# 不是拿它們當獨立引擎(它們是1h~4h持倉的策略，套上1分K的ATR移動停損會失真)。
+# 雙SuperTrend：快線(小倍數)跟慢線(大倍數)同時翻多才算多頭趨勢、同時翻空才算
+# 空頭趨勢，一快一慢不同向就是中性(趨勢轉換期或盤整)。
+
+def compute_supertrend(candles, period=10, multiplier=3.0):
+    """
+    標準SuperTrend。candles時間遞增，回傳跟candles等長的list，每個元素是
+    {"direction": 1(多)/-1(空), "line": 停損線價位}；資料不足(<period+1)回傳[]。
+    ATR用Wilder平滑(跟大多數圖表軟體一致)，方向翻轉規則：
+      - 多頭中，收盤跌破當前下軌 → 翻空；否則下軌只能往上抬(棘輪)
+      - 空頭中，收盤站上當前上軌 → 翻多；否則上軌只能往下壓
+    """
+    n = len(candles)
+    if n < period + 1:
+        return []
+    trs = [candles[0]["high"] - candles[0]["low"]]
+    for i in range(1, n):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = [None] * n
+    atr[period - 1] = sum(trs[:period]) / period
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + trs[i]) / period
+
+    out = [None] * n
+    upper = lower = None
+    direction = 1
+    for i in range(period - 1, n):
+        hl2 = (candles[i]["high"] + candles[i]["low"]) / 2
+        basic_upper = hl2 + multiplier * atr[i]
+        basic_lower = hl2 - multiplier * atr[i]
+        close = candles[i]["close"]
+        prev_close = candles[i - 1]["close"]
+        if upper is None:
+            upper, lower = basic_upper, basic_lower
+        else:
+            upper = basic_upper if (basic_upper < upper or prev_close > upper) else upper
+            lower = basic_lower if (basic_lower > lower or prev_close < lower) else lower
+        if direction == 1 and close < lower:
+            direction = -1
+        elif direction == -1 and close > upper:
+            direction = 1
+        out[i] = {"direction": direction, "line": lower if direction == 1 else upper}
+    return [x for x in out if x is not None]
+
+
+def compute_trend_filter(trend_candles, period=10, fast_multiplier=1.0, slow_multiplier=3.0):
+    """
+    雙SuperTrend方向判斷。trend_candles是「大週期、已收盤」的K棒(呼叫端負責
+    把進行中的最後一根丟掉，避免同一根K棒內方向來回翻)。
+    回傳 {"direction": "bullish"/"bearish"/None, "fast": ±1或None, "slow": ±1或None,
+          "fast_line", "slow_line", "reason": 文字, "candle_count": n}
+    """
+    fast = compute_supertrend(trend_candles, period=period, multiplier=fast_multiplier)
+    slow = compute_supertrend(trend_candles, period=period, multiplier=slow_multiplier)
+    if not fast or not slow:
+        return {"direction": None, "fast": None, "slow": None, "fast_line": None, "slow_line": None,
+                "reason": f"大週期K棒不足({len(trend_candles)}根)，趨勢濾網未生效", "candle_count": len(trend_candles)}
+    f, sl = fast[-1], slow[-1]
+    if f["direction"] == 1 and sl["direction"] == 1:
+        direction, reason = "bullish", f"雙ST同步偏多(快線 {f['line']:.2f} / 慢線 {sl['line']:.2f} 皆在價格下方)"
+    elif f["direction"] == -1 and sl["direction"] == -1:
+        direction, reason = "bearish", f"雙ST同步偏空(快線 {f['line']:.2f} / 慢線 {sl['line']:.2f} 皆在價格上方)"
+    else:
+        direction = None
+        reason = f"快慢線分歧(快線{'多' if f['direction']==1 else '空'}、慢線{'多' if sl['direction']==1 else '空'})，趨勢轉換期或盤整，視為中性"
+    return {"direction": direction, "fast": f["direction"], "slow": sl["direction"],
+            "fast_line": round(f["line"], 2), "slow_line": round(sl["line"], 2),
+            "reason": reason, "candle_count": len(trend_candles)}
+
+
+def trend_filter_allows(mode, trend_direction, signal_direction):
+    """
+    mode: 0=關閉 / 1=只擋逆勢(中性放行) / 2=嚴格(逆勢和中性都擋)。
+    回傳(allowed: bool, note: str或None)。
+    """
+    if not mode or not signal_direction:
+        return True, None
+    if trend_direction is None:
+        if int(mode) >= 2:
+            return False, "趨勢濾網(嚴格)：大週期方向中性，不開新倉"
+        return True, None
+    if trend_direction != signal_direction:
+        return False, f"趨勢濾網：訊號{'多' if signal_direction=='bullish' else '空'}但大週期偏{'多' if trend_direction=='bullish' else '空'}，逆勢跳過"
+    return True, None

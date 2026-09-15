@@ -611,6 +611,9 @@ async def backtest_run(
     chop_threshold: Optional[float] = None,
     block_market_closed: Optional[bool] = None,
     min_atr_points: Optional[float] = None,
+    trend_filter_mode: Optional[int] = None,
+    trend_interval_seconds: Optional[int] = None,
+    trend_slow_multiplier: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     target_step_count: Optional[int] = None,
@@ -672,6 +675,9 @@ async def backtest_run(
         chop_threshold=chop_threshold,
         block_market_closed=block_market_closed,
         min_atr_points=min_atr_points,
+        trend_filter_mode=trend_filter_mode,
+        trend_interval_seconds=trend_interval_seconds,
+        trend_slow_multiplier=trend_slow_multiplier,
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
         target_step_count=target_step_count,
@@ -694,6 +700,9 @@ async def backtest_sweep_start(
     chop_threshold: Optional[float] = None,
     block_market_closed: Optional[bool] = None,
     min_atr_points: Optional[float] = None,
+    trend_filter_mode: Optional[int] = None,
+    trend_interval_seconds: Optional[int] = None,
+    trend_slow_multiplier: Optional[float] = None,
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     symbol: str = "XAUUSDT",
@@ -743,6 +752,12 @@ async def backtest_sweep_start(
         baseline_overrides["paper_block_market_closed"] = 1 if block_market_closed else 0
     if min_atr_points is not None:
         baseline_overrides["paper_min_atr_points"] = min_atr_points
+    if trend_filter_mode is not None:
+        baseline_overrides["paper_trend_filter_mode"] = trend_filter_mode
+    if trend_interval_seconds is not None:
+        baseline_overrides["paper_trend_interval_seconds"] = trend_interval_seconds
+    if trend_slow_multiplier is not None:
+        baseline_overrides["paper_trend_slow_multiplier"] = trend_slow_multiplier
 
     job_id = sweep_module.start_sweep(
         days=days, interval_seconds=interval_seconds, baseline_overrides=baseline_overrides or None,
@@ -852,7 +867,14 @@ async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, t
     這是未來要接給MT5 EA輪詢的endpoint，也是Telegram通知、模擬單追蹤共用的
     核心邏輯(見 app/signal_engine.py)，三邊都保證用同一份計算結果。
     """
-    return compute_full_signal(interval_seconds=interval_seconds, bucket_size=bucket_size, trade_limit=trade_limit)
+    # 主畫面訊號卡永遠附上大週期趨勢方向(用全域設定的週期/倍數)，就算濾網關閉也顯示，
+    # 讓使用者先看到「如果開了濾網現在會怎麼判」再決定要不要開
+    s = settings_module.get_settings()
+    return compute_full_signal(
+        interval_seconds=interval_seconds, bucket_size=bucket_size, trade_limit=trade_limit,
+        trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600) or 3600),
+        trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0),
+    )
 
 
 @app.websocket("/ws/price")
