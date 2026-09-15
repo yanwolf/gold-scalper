@@ -39,6 +39,8 @@ MAX_TRADE_HISTORY = 100000  # 逐筆成交量比報價更新頻繁，保留更�
 # 記憶體幾乎不佔；粗週期(5分/15分)由它重新取樣。逐筆成交deque仍保留給分價量表用。
 MINUTE_BAR_HISTORY_DAYS = int(os.getenv("MINUTE_BAR_HISTORY_DAYS", "3"))
 MAX_MINUTE_BARS = MINUTE_BAR_HISTORY_DAYS * 24 * 60
+# 要不要把成交寫進public.gold_trades：預設lab寫、live不寫(兩個服務共用同一張表，只能有一個寫入者)
+MARKET_DATA_WRITE = os.getenv("MARKET_DATA_WRITE", "0" if os.getenv("APP_ROLE", "lab").strip().lower() == "live" else "1") == "1"
                             # (從20000提高到100000：5分K/15分K纏論一根K棒平均要吃掉
                             # 5倍於1分K的成交筆數才能湊滿，同樣的筆數上限對5分K來說
                             # 一直偏緊，尤其服務重啟、記憶體歸零重新累積時特別明顯。
@@ -344,6 +346,17 @@ class BinanceGoldStreamer:
                     self._trade_history.extend(seeded)
             # 1分鐘K棒直接在DB端聚合回填(不是從那10萬筆成交建)，才能拿到完整的3天歷史
             bars = db.load_minute_bars(days=MINUTE_BAR_HISTORY_DAYS)
+            # DB回填不夠(新服務、新schema、或lab端剛好斷過)時，改用幣安REST的1分K補齊。
+            # 沒有這一步，新開的live服務要等好幾小時才湊得夠纏論/趨勢濾網需要的K棒
+            # (修正記錄見README)
+            expected = MINUTE_BAR_HISTORY_DAYS * 24 * 60
+            if len(bars) < expected * 0.5:
+                rest_bars = self._fetch_minute_bars_from_rest(MINUTE_BAR_HISTORY_DAYS)
+                if rest_bars:
+                    merged = {b["bucket_start"]: b for b in rest_bars}
+                    merged.update({b["bucket_start"]: b for b in bars})  # DB(含買賣方向)優先
+                    bars = [merged[k] for k in sorted(merged)]
+                    logger.info(f"DB只有{len(bars) - len(rest_bars) if len(bars) > len(rest_bars) else 0}根，改用REST補齊到{len(bars)}根1分鐘K棒")
             if bars:
                 with self._lock:
                     self._minute_bars.clear()
@@ -354,7 +367,7 @@ class BinanceGoldStreamer:
         self._public_conn.start()
         self._market_conn.start()
 
-        if db.is_enabled() and not (self._flush_thread and self._flush_thread.is_alive()):
+        if db.is_enabled() and MARKET_DATA_WRITE and not (self._flush_thread and self._flush_thread.is_alive()):
             self._flush_stop_flag.clear()
             self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
             self._flush_thread.start()
@@ -363,6 +376,23 @@ class BinanceGoldStreamer:
             self._watchdog_stop_flag.clear()
             self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
             self._watchdog_thread.start()
+
+    def _fetch_minute_bars_from_rest(self, days):
+        """用幣安REST抓最近N天的1分K轉成minute bar格式，回傳時間遞增list；失敗回傳[]。"""
+        try:
+            from app.backtest import fetch_historical_klines
+            klines = fetch_historical_klines(symbol=SYMBOL.upper(), days=days)
+        except Exception as e:
+            logger.warning(f"REST回填1分K失敗: {e}")
+            return []
+        out = []
+        for k in klines:
+            try:
+                out.append({"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
 
     def stop(self):
         self._public_conn.stop()

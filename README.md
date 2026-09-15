@@ -2282,7 +2282,10 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 | `APP_NAMESPACE` | `lab` | `live`(同一台Postgres不同schema，所有資料表自動隔離) |
 | `LIVE_ENGINE_IDS` | (不用) | `chan_profile_900`(只載入這些引擎，其他連物件都不建) |
 | `LIVE_HEALTH_URL` | `https://<live服務>/health`(lab監看live心跳) | (不用) |
+| `MARKET_DATA_WRITE` | `1`(預設；把成交寫進共用的public.gold_trades) | `0`(預設；只讀不寫) |
 | 幣安金鑰 | Demo Trading | 正式子帳戶，IP白名單、只開合約交易、關提幣 |
+
+行情資料表 `gold_trades` 固定在 `public` schema、兩個角色共用，只有 lab 寫入；live 啟動時直接讀 lab 累積的歷史回填 1 分 K，DB 不夠時再用幣安 REST 的 1 分 K 補齊(`_fetch_minute_bars_from_rest`)，不用等資料收集。paper_trades / app_settings / settings_audit 等角色專屬資料表才在各自的 `APP_NAMESPACE` schema。
 
 **live角色的行為**：
 - `/backtest/*`、`/execution/test-*`、`/execution/set-leverage`、`POST /settings`、`POST /settings/engine/*` 一律403(middleware `role_gate`)

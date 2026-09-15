@@ -65,8 +65,12 @@ def init_schema():
                 if APP_NAMESPACE:
                     cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{APP_NAMESPACE}"')
                     conn.commit()
+                # 行情資料(gold_trades)固定放public schema、兩個角色共用(修正記錄見README)：
+                # 成交紀錄不分研究/正式，live端重啟時直接讀lab端累積的歷史回填K棒，
+                # 不用從零收集。只有MARKET_DATA_WRITE=1的服務會寫入(預設lab寫、live不寫)，
+                # 避免兩個服務把同一條成交流寫兩次。
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS gold_trades (
+                    CREATE TABLE IF NOT EXISTS public.gold_trades (
                         id BIGSERIAL PRIMARY KEY,
                         trade_time BIGINT NOT NULL,
                         price DOUBLE PRECISION NOT NULL,
@@ -77,7 +81,7 @@ def init_schema():
                 """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_gold_trades_time
-                    ON gold_trades (trade_time);
+                    ON public.gold_trades (trade_time);
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS paper_trades (
@@ -261,7 +265,7 @@ def load_minute_bars(days=3):
                            SUM(qty) AS volume
                     FROM (
                         SELECT id, trade_time, price, qty, (trade_time / 60000) * 60000 AS bucket
-                        FROM gold_trades
+                        FROM public.gold_trades
                         WHERE trade_time >= %s
                     ) t
                     GROUP BY bucket
@@ -301,7 +305,7 @@ def insert_trades(trades):
             with conn.cursor() as cur:
                 execute_values(
                     cur,
-                    "INSERT INTO gold_trades (trade_time, price, qty, is_buyer_maker) VALUES %s",
+                    "INSERT INTO public.gold_trades (trade_time, price, qty, is_buyer_maker) VALUES %s",
                     [(t["time"], t["price"], t["qty"], t.get("is_buyer_maker")) for t in trades],
                 )
             conn.commit()
@@ -330,7 +334,7 @@ def load_recent_trades(limit=100000):
                 cur.execute(
                     """
                     SELECT trade_time, price, qty, is_buyer_maker
-                    FROM gold_trades
+                    FROM public.gold_trades
                     ORDER BY trade_time DESC
                     LIMIT %s;
                     """,

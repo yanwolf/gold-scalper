@@ -167,6 +167,12 @@ class TelegramNotifier:
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
+            # 所有訊息加角色前綴(修正記錄見README)：lab和live共用同一個bot、同一個聊天時，
+            # 一眼就能分辨是研究端還是正式端發的；TELEGRAM_PREFIX可自訂，設成空字串就不加
+            from app.role import APP_ROLE
+            prefix = os.getenv("TELEGRAM_PREFIX", "🔴【正式】" if APP_ROLE == "live" else "🔵【研究】")
+            if prefix:
+                text = f"{prefix} {text}"
             resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
             resp.raise_for_status()
             return True, None
