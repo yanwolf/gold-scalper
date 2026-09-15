@@ -42,7 +42,8 @@ DEFAULT_SMC_CFG = {
     "ema_slow": 50,
     "wt_ch": 10,             # WaveTrend channel length
     "wt_avg": 21,            # WaveTrend average length
-    "wt_level": 53,          # 超買/超賣門檻(交叉前一根要碰到 wt_level*0.6 才算「高檔/低檔」)
+    "wt_level": 40,          # 超買/超賣門檻(交叉前兩根內要碰到 wt_level*0.6=24 才算「高檔/低檔」)；
+                             # 原本53在1小時K黃金上太嚴(2588個在區域內的訊號步只有22個過關)
     "confirm_bos": 2,        # MSS後要幾次BOS才確認趨勢
     "zone_max_age": 60,      # OB/FVG幾根K後失效
     "sl_buffer_pct": 0.0015, # 結構停損放在區域外緣再多0.15%
@@ -349,10 +350,13 @@ def generate_signal_smc(candles, current_price=None, cfg=None):
         struct_reason += f"，最近突破位{last_break:.2f}"
 
     # EMA濾網
+    # 只看EMA20/50的相對排列，不再要求收盤價也在EMA之下/之上：回測OB/FVG本來就是
+    # 「反彈回到區域」，這時候收盤價幾乎一定在EMA20之上(空單)，原本的條件跟「回測區域」
+    # 互相矛盾，365天回測有2531個訊號步死在這一關(修正記錄見README)。
     if cfg["require_ema"]:
-        if trend == "bearish" and not (c["close"] < ef[i] < es[i]):
+        if trend == "bearish" and not (ef[i] < es[i]):
             return _neutral(current_price, struct_reason + "；但EMA20/50未呈空頭排列", extra)
-        if trend == "bullish" and not (c["close"] > ef[i] > es[i]):
+        if trend == "bullish" and not (ef[i] > es[i]):
             return _neutral(current_price, struct_reason + "；但EMA20/50未呈多頭排列", extra)
 
     # 價格是否在最近touch_window根K內碰過同方向的OB/FVG區域(區域必須到現在仍有效——
