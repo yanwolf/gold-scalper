@@ -27,6 +27,19 @@ APP_NAMESPACE = os.getenv("APP_NAMESPACE", "").strip()
 # 沒設定就不監看
 LIVE_HEALTH_URL = os.getenv("LIVE_HEALTH_URL", "").strip()
 
+# lab端dashboard「正式端」分頁要代理到的live服務根網址(例如 https://gold-live.zeabur.app)。
+# 沒設定時從LIVE_HEALTH_URL去掉/health推導；兩個都沒有就不顯示那個分頁。
+LIVE_BASE_URL = os.getenv("LIVE_BASE_URL", "").strip().rstrip("/")
+if not LIVE_BASE_URL and LIVE_HEALTH_URL.endswith("/health"):
+    LIVE_BASE_URL = LIVE_HEALTH_URL[: -len("/health")]
+
+# lab代理到live時允許的路徑前綴(只開正式端監看/控制需要的那幾支)
+LIVE_PROXY_ALLOWED_PREFIXES = (
+    "/app/role", "/health", "/paper-trading/", "/signal/latest",
+    "/control/", "/settings/import", "/settings/audit", "/settings/engine/",
+    "/execution/positions", "/execution/balance", "/execution/open-orders",
+)
+
 # live角色下一律拒絕的路由前綴(研究/實驗用，跟正式執行無關)
 LAB_ONLY_PATH_PREFIXES = (
     "/backtest",
@@ -72,4 +85,5 @@ def describe():
         "namespace": APP_NAMESPACE or "public",
         "live_engine_ids": LIVE_ENGINE_IDS if is_live() else None,
         "live_health_url": LIVE_HEALTH_URL or None,
+        "live_base_url": LIVE_BASE_URL or None,
     }

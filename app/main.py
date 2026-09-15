@@ -118,6 +118,34 @@ def _reconcile_with_exchange_on_startup():
         db.insert_settings_audit("startup_reconcile", detail={"lines": lines})
 
 
+@app.api_route("/live-proxy/{path:path}", methods=["GET", "POST"])
+async def live_proxy(path: str, request: __import__("fastapi").Request):
+    """
+    lab端代理到live端(修正記錄見README)：讓使用者在同一個網頁的「正式端」分頁監看和
+    控制正式服務，不用兩個網址切來切去。只放行LIVE_PROXY_ALLOWED_PREFIXES裡的路徑，
+    密碼跟著body原樣轉過去由live端驗證。
+    """
+    if role_module.is_live() or not role_module.LIVE_BASE_URL:
+        return {"success": False, "error": "這個服務沒有設定 LIVE_BASE_URL(或本身就是live)，無法代理"}
+    target_path = "/" + path
+    if not any(target_path.startswith(pfx) for pfx in role_module.LIVE_PROXY_ALLOWED_PREFIXES):
+        return {"success": False, "error": f"不允許代理的路徑: {target_path}"}
+    import requests as _rq
+    url = role_module.LIVE_BASE_URL + target_path
+    try:
+        if request.method == "GET":
+            resp = _rq.get(url, params=dict(request.query_params), timeout=15)
+        else:
+            body = await request.body()
+            resp = _rq.post(url, data=body, headers={"Content-Type": request.headers.get("content-type", "application/json")}, timeout=30)
+        try:
+            return resp.json()
+        except ValueError:
+            return {"success": False, "error": f"live端回傳非JSON(HTTP {resp.status_code})"}
+    except Exception as e:
+        return {"success": False, "error": f"連不到live端: {e}"}
+
+
 @app.get("/app/role")
 async def app_role():
     """服務角色與控制狀態：dashboard載入時先問這支，決定要顯示哪些分頁/按鈕。"""

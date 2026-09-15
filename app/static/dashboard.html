@@ -429,6 +429,7 @@
 <div class="tab-bar">
   <button class="tab-btn active" data-tab="tabMain">主畫面</button>
   <button class="tab-btn" data-tab="tabTools">回測／掃描</button>
+  <button class="tab-btn" data-tab="tabLive" id="tabLiveBtn" style="display:none;">🔴 正式端</button>
   <button class="tab-btn" data-tab="tabSettings">設定</button>
 </div>
 
@@ -794,6 +795,52 @@
 </div>
 </div>
 
+<div id="tabLive" style="display:none;">
+<div class="panel">
+  <div class="section-title" style="margin-top:0;">🔴 正式端(live)監看與控制</div>
+  <div style="font-size:11.5px; color:var(--muted); margin-bottom:10px; line-height:1.6;">
+    這裡看到的是 <span class="mono" id="liveBaseUrlLabel"></span> 的即時狀態，所有動作都經由本服務代理送到正式端、由正式端驗證密碼並寫審計。
+  </div>
+  <div id="liveRoleLine" style="font-size:12px; margin-bottom:8px;">連線中…</div>
+
+  <div class="control-panel">
+    <div class="title">🛑 控制</div>
+    <div id="liveControlStatus" style="font-size:12px; margin-bottom:8px;"></div>
+    <button id="liveHaltBtn" class="btn-danger">緊急停止</button>
+    <button id="liveResumeBtn" class="btn-secondary">解除停止</button>
+    <button id="liveFlattenBtn" class="btn-danger">強制平倉全部</button>
+  </div>
+
+  <div class="settings-group" style="margin-bottom:12px;">
+    <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:6px 0;">
+      <button id="livePushParamsBtn" class="btn-secondary">📤 把主畫面目前引擎的參數集推送到正式端</button>
+      <button id="liveAuditBtn" class="btn-secondary">📜 正式端審計紀錄</button>
+    </div>
+    <div id="liveParamResult" class="notify-result"></div>
+  </div>
+
+  <div class="section-title">正式端模擬單績效</div>
+  <div style="margin:6px 0 10px;">
+    <select id="livePaperInterval"></select>
+  </div>
+  <div id="livePaperActiveConfig"></div>
+  <div id="livePaperOpenPosition"></div>
+  <div id="livePaperReadiness"></div>
+  <div class="stat-row" style="margin-top:10px;">
+    <div class="stat"><div class="lbl">總筆數</div><div class="val mono" id="livePaperTotal">--</div></div>
+    <div class="stat"><div class="lbl">勝率</div><div class="val mono" id="livePaperWinRate">--</div></div>
+    <div class="stat"><div class="lbl">總損益(points)</div><div class="val mono" id="livePaperTotalPnl">--</div></div>
+    <div class="stat"><div class="lbl">獲利因子</div><div class="val mono" id="livePaperProfitFactor">--</div></div>
+    <div class="stat"><div class="lbl">最大回撤</div><div class="val mono" id="livePaperMaxDrawdown">--</div></div>
+  </div>
+  <div id="livePaperSpreadAdjusted"></div>
+  <div id="livePaperSlippageImpact"></div>
+  <div id="livePaperDrawdownPeriod"></div>
+  <div class="section-title" style="margin-top:16px;">正式端最近成交紀錄</div>
+  <div id="livePaperTradeList" class="bi-list"></div>
+</div>
+</div>
+
 <div id="tabSettings" style="display:none;">
 
 <div class="panel">
@@ -988,7 +1035,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     const targetId = btn.dataset.tab;
-    ['tabMain', 'tabTools', 'tabSettings'].forEach(id => {
+    ['tabMain', 'tabTools', 'tabLive', 'tabSettings'].forEach(id => {
       document.getElementById(id).style.display = (id === targetId) ? '' : 'none';
     });
     // K線圖容器被隱藏過的話寬度會讀到0，切回主畫面時重新校正一次寬度，
@@ -2174,11 +2221,25 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
   `;
 }
 
-function renderPaperTrading(data){
-  renderActiveConfig(document.getElementById('paperActiveConfig'), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
+const PAPER_TARGETS = null; // 用els(主畫面)；正式端分頁傳自己的一組元素進來
+function liveTargets(){
+  const g = id => document.getElementById(id);
+  return {
+    activeConfigId: 'livePaperActiveConfig', drawdownPeriodId: 'livePaperDrawdownPeriod',
+    paperOpenPosition: g('livePaperOpenPosition'), paperReadiness: g('livePaperReadiness'),
+    paperTotal: g('livePaperTotal'), paperWinRate: g('livePaperWinRate'), paperTotalPnl: g('livePaperTotalPnl'),
+    paperProfitFactor: g('livePaperProfitFactor'), paperMaxDrawdown: g('livePaperMaxDrawdown'),
+    paperSpreadAdjusted: g('livePaperSpreadAdjusted'), paperSlippageImpact: g('livePaperSlippageImpact'),
+    paperTradeList: g('livePaperTradeList'),
+  };
+}
+
+function renderPaperTrading(data, t){
+  t = t || Object.assign({ activeConfigId: 'paperActiveConfig', drawdownPeriodId: 'paperDrawdownPeriod' }, els);
+  renderActiveConfig(document.getElementById(t.activeConfigId), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
   const ovCount = Object.keys(data.engine_overrides || {}).length;
   if(ovCount){
-    const title = document.querySelector('#paperActiveConfig .cfg-title');
+    const title = document.querySelector('#' + t.activeConfigId + ' .cfg-title');
     if(title) title.innerHTML += ` <span style="color:var(--gold); font-weight:400; font-size:11px;">(含 ${ovCount} 個此引擎專屬覆寫)</span>`;
   }
 
@@ -2206,7 +2267,7 @@ function renderPaperTrading(data){
       `;
     }
 
-    els.paperOpenPosition.innerHTML = `
+    t.paperOpenPosition.innerHTML = `
       <div class="paper-position-card ${p.direction}">
         <span>
           <span class="dir-label">開倉中 ${dirLabel}</span> @ ${p.entry_price.toFixed(2)}
@@ -2217,23 +2278,23 @@ function renderPaperTrading(data){
       ${livePriceHtml}
     `;
   }else{
-    els.paperOpenPosition.innerHTML = '<div class="paper-position-empty">目前空手，等待下一個訊號</div>';
+    t.paperOpenPosition.innerHTML = '<div class="paper-position-empty">目前空手，等待下一個訊號</div>';
   }
 
-  renderReadinessBanner(els.paperReadiness, data.readiness);
+  renderReadinessBanner(t.paperReadiness, data.readiness);
 
-  els.paperTotal.textContent = data.total_trades ?? '--';
-  els.paperWinRate.textContent = data.total_trades ? `${data.win_rate}%` : '--';
-  els.paperTotalPnl.textContent = data.total_trades != null ? data.total_pnl_points.toFixed(2) : '--';
-  els.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
-  els.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
+  t.paperTotal.textContent = data.total_trades ?? '--';
+  t.paperWinRate.textContent = data.total_trades ? `${data.win_rate}%` : '--';
+  t.paperTotalPnl.textContent = data.total_trades != null ? data.total_pnl_points.toFixed(2) : '--';
+  t.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
+  t.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
 
-  renderSpreadAdjusted(els.paperSpreadAdjusted, data);
-  renderSlippageImpact(els.paperSlippageImpact, data.slippage_impact, data);
+  renderSpreadAdjusted(t.paperSpreadAdjusted, data);
+  renderSlippageImpact(t.paperSlippageImpact, data.slippage_impact, data);
 
-  renderDrawdownPeriod(document.getElementById('paperDrawdownPeriod'), data);
+  renderDrawdownPeriod(document.getElementById(t.drawdownPeriodId), data);
 
-  renderTradeList(els.paperTradeList, data.recent_trades, data.settings_changed_at);
+  renderTradeList(t.paperTradeList, data.recent_trades, data.settings_changed_at);
 }
 
 function renderSlippageImpact(el, si, data){
@@ -2370,6 +2431,112 @@ async function loadAppRole(){
     if(toggle) toggle.style.display = 'none';
   }
   renderControlStatus(APP_ROLE_INFO.manual_halt);
+  if(!isLive && APP_ROLE_INFO.live_base_url){
+    document.getElementById('tabLiveBtn').style.display = '';
+    document.getElementById('liveBaseUrlLabel').textContent = APP_ROLE_INFO.live_base_url;
+    initLiveTab();
+  }
+}
+
+// --- 正式端分頁(經由 /live-proxy 代理) ---
+let LIVE_INFO = null;
+async function liveFetch(path, opts){
+  const res = await fetch('/live-proxy' + path, opts);
+  return res.json();
+}
+function renderLiveControlStatus(halt){
+  const el = document.getElementById('liveControlStatus');
+  if(halt && halt.active){
+    el.innerHTML = `<b style="color:#fca5a5;">🛑 緊急停止中</b>　原因：${halt.reason || '--'}　自 ${halt.at ? new Date(halt.at).toLocaleString('zh-TW',{hour12:false}) : '--'}`;
+  }else{
+    el.innerHTML = '🟢 正常執行(允許真實開倉)';
+  }
+}
+async function refreshLiveRole(){
+  try{
+    LIVE_INFO = await liveFetch('/app/role');
+    if(LIVE_INFO.error){ document.getElementById('liveRoleLine').textContent = LIVE_INFO.error; return; }
+    document.getElementById('liveRoleLine').innerHTML = `角色：<b>${LIVE_INFO.role}</b>　schema：${LIVE_INFO.namespace}　引擎：${(LIVE_INFO.active_engines||[]).join(', ')}`;
+    const sel = document.getElementById('livePaperInterval');
+    const current = sel.value;
+    sel.innerHTML = (LIVE_INFO.active_engines || []).map(e => `<option value="${e}">${e}</option>`).join('');
+    if(current && (LIVE_INFO.active_engines||[]).includes(current)) sel.value = current;
+    renderLiveControlStatus(LIVE_INFO.manual_halt);
+  }catch(err){
+    document.getElementById('liveRoleLine').textContent = `連不到正式端：${err.message}`;
+  }
+}
+async function refreshLivePaper(){
+  const sel = document.getElementById('livePaperInterval');
+  if(!sel.value) return;
+  try{
+    const data = await liveFetch(`/paper-trading/summary?limit=30&engine_id=${sel.value}`);
+    if(data.error){ document.getElementById('livePaperTradeList').innerHTML = `<div class="error">${data.error}</div>`; return; }
+    renderPaperTrading(data, liveTargets());
+  }catch(err){
+    document.getElementById('livePaperTradeList').innerHTML = `<div class="error">載入失敗：${err.message}</div>`;
+  }
+}
+async function liveControl(path, body, confirmText){
+  const pwd = getOrPromptPassword();
+  if(!pwd) return;
+  if(confirmText && !confirm(confirmText)) return;
+  try{
+    const data = await liveFetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd, ...body }) });
+    if(!data.success){ alert(`失敗：${data.error}`); return; }
+    if(data.manual_halt) renderLiveControlStatus(data.manual_halt);
+    if(data.results) alert(Object.entries(data.results).map(([k,v]) => `${k}: ${v.message}`).join('\n'));
+    refreshLivePaper();
+  }catch(err){ alert(`失敗：${err.message}`); }
+}
+let liveTabInitialized = false;
+function initLiveTab(){
+  if(liveTabInitialized) return;
+  liveTabInitialized = true;
+  document.getElementById('livePaperInterval').addEventListener('change', refreshLivePaper);
+  document.getElementById('liveHaltBtn').addEventListener('click', () => {
+    const reason = prompt('停止原因：', '手動停止'); if(reason === null) return;
+    liveControl('/control/halt', { reason }, '確定對「正式端」啟動緊急停止？');
+  });
+  document.getElementById('liveResumeBtn').addEventListener('click', () => liveControl('/control/resume', {}, '確定解除正式端的緊急停止？'));
+  document.getElementById('liveFlattenBtn').addEventListener('click', () => {
+    const reason = prompt('平倉原因：', '手動緊急平倉'); if(reason === null) return;
+    liveControl('/control/flatten', { reason }, '確定強制平倉正式端全部部位？這會真的送出平倉單。');
+  });
+  document.getElementById('livePushParamsBtn').addEventListener('click', async () => {
+    const out = document.getElementById('liveParamResult');
+    const pwd = getOrPromptPassword(); if(!pwd) return;
+    const srcEngine = els.paperInterval.value;
+    const dstEngine = document.getElementById('livePaperInterval').value;
+    if(!dstEngine){ out.textContent = '正式端沒有可用引擎'; out.className = 'notify-result error'; return; }
+    if(!confirm(`把本端 ${srcEngine} 目前生效的參數推送到正式端 ${dstEngine}？`)) return;
+    try{
+      const ps = await (await fetch(`/settings/export?engine_id=${srcEngine}`)).json();
+      if(ps.error){ out.textContent = ps.error; out.className = 'notify-result error'; return; }
+      let data = await liveFetch('/settings/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd, engine_id: dstEngine, param_set: ps }) });
+      if(!data.success && /未平倉部位/.test(data.error || '') && confirm(data.error + '\n\n要強制推送嗎？')){
+        data = await liveFetch('/settings/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pwd, engine_id: dstEngine, param_set: ps, force: true }) });
+      }
+      if(!data.success){ out.textContent = `推送失敗：${data.error}`; out.className = 'notify-result error'; return; }
+      const lines = Object.entries(data.diff || {}).map(([k,v]) => `${k}: ${v.before} → ${v.after}`);
+      out.className = 'notify-result';
+      out.innerHTML = `已推送 <b>${ps.version}</b> 到正式端 ${dstEngine}<br>${lines.length ? lines.join('<br>') : '(沒有任何值改變)'}`;
+      refreshLivePaper();
+    }catch(err){ out.textContent = `推送失敗：${err.message}`; out.className = 'notify-result error'; }
+  });
+  document.getElementById('liveAuditBtn').addEventListener('click', async () => {
+    const out = document.getElementById('liveParamResult');
+    try{
+      const data = await liveFetch('/settings/audit?limit=30');
+      const items = data.items || [];
+      out.className = 'notify-result';
+      out.innerHTML = items.length
+        ? `<div style="font-size:11.5px; line-height:1.6;">${items.map(i => `${new Date(i.created_at).toLocaleString('zh-TW',{hour12:false})}　<b>${i.action}</b>　${i.engine_id || ''}　${i.version || ''}${i.detail && i.detail.diff ? '　' + Object.entries(i.detail.diff).map(([k,v]) => `${k}:${v.before}→${v.after}`).join(', ') : ''}${i.detail && i.detail.reason ? '　' + i.detail.reason : ''}</div>`).join('<br>')}</div>`
+        : '尚無審計紀錄';
+    }catch(err){ out.textContent = `讀取失敗：${err.message}`; out.className = 'notify-result error'; }
+  });
+  refreshLiveRole().then(refreshLivePaper);
+  setInterval(() => { if(document.getElementById('tabLive').style.display !== 'none'){ refreshLiveRole(); refreshLivePaper(); } }, 15000);
 }
 
 async function controlAction(path, body, confirmText){
