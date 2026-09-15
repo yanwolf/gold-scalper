@@ -49,7 +49,29 @@ DEFAULT_SMC_CFG = {
     "sl_buffer_pct": 0.0015, # 結構停損放在區域外緣再多0.15%
     "require_ema": True,
     "touch_window": 4,       # 「碰到區域」跟「WaveTrend交叉」允許發生在最近幾根K內(不必同一根)
+    "exit_mode": 0,          # 0=只用框架的移動停損；1=另外附上結構停利目標(前一個swing點)
+    "min_rr": 1.0,           # exit_mode=1時，目標距離/停損距離低於此值不進場(0=不限制)
 }
+
+SMC_ENGINE_ID = "smc_structure_3600"
+
+
+def cfg_from_settings(s):
+    """從settings.get_settings(engine_id=SMC_ENGINE_ID)的dict取出SMC參數(dashboard可調)。"""
+    out = {}
+    mapping = (("touch_window", "smc_touch_window", int), ("wt_level", "smc_wt_level", float),
+               ("confirm_bos", "smc_confirm_bos", int), ("exit_mode", "smc_exit_mode", int),
+               ("min_rr", "smc_min_rr", float))
+    for k, key, cast in mapping:
+        v = s.get(key)
+        if v is not None:
+            try:
+                out[k] = cast(v)
+            except (TypeError, ValueError):
+                pass
+    if s.get("smc_require_ema") is not None:
+        out["require_ema"] = bool(int(s.get("smc_require_ema")))
+    return out
 
 # 可用Zeabur環境變數覆寫(不用改程式重部署)：SMC_SWING_N / SMC_CONFIRM_BOS / SMC_WT_LEVEL /
 # SMC_ZONE_MAX_AGE / SMC_REQUIRE_EMA(0或1)。訊號太稀疏時優先試 SMC_REQUIRE_EMA=0、SMC_CONFIRM_BOS=1。
@@ -422,6 +444,25 @@ def evaluate_at(pre, i, current_price=None):
 
     extra["hit_zone"] = hit
     extra["suggested_sl_points"] = sl_points
+    # 結構停利目標：趨勢方向的前一個swing點(空單=最近swing低點、多單=最近swing高點)
+    tp_price = st["last_ll"] if trend == "bearish" else st["last_hh"]
+    rr = None
+    if tp_price and current_price and sl_points:
+        dist = (current_price - tp_price) if trend == "bearish" else (tp_price - current_price)
+        rr = dist / sl_points if dist > 0 else 0.0
+    extra["suggested_tp_price"] = tp_price
+    extra["rr"] = rr
+
+    if crossed and int(cfg.get("exit_mode", 0)) == 1 and cfg.get("min_rr", 0) and (rr is None or rr < cfg["min_rr"]):
+        return {
+            "stage": "關注",
+            "direction": trend,
+            "chan": {"bias": trend, "strength": 2, "reason": struct_reason},
+            "profile": {"bias": trend, "strength": 1,
+                        "reason": f"訊號但風報比不足(目標{tp_price:.2f}，RR={rr:.2f})" if rr is not None else "訊號但算不出目標"},
+            "current_price": current_price,
+            "smc": extra,
+        }
 
     if crossed:
         return {

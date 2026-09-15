@@ -44,7 +44,7 @@ STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure")
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                                 current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
                                 trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
-                                smc_candles=None):
+                                smc_candles=None, smc_cfg=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -83,7 +83,11 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         smc_candles = smc_candles[-smc_structure.SMC_MAX_CANDLES:]
         if current_price is None:
             current_price = trades[-1]["price"] if trades else (smc_candles[-1]["close"] if smc_candles else None)
-        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price)
+        if smc_cfg is None:
+            # 即時路徑：SMC參數從dashboard「此引擎專屬參數」讀(settings.py的smc_*欄位)
+            from app import settings as _settings
+            smc_cfg = smc_structure.cfg_from_settings(_settings.get_settings(engine_id=smc_structure.SMC_ENGINE_ID))
+        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price, cfg=smc_cfg)
         result["trend_filter"] = (
             compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
             if trend_candles else None

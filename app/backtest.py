@@ -162,6 +162,12 @@ def run_backtest(
     spread_cost_points=None,
     klines=None,
     target_step_count=None,
+    smc_touch_window=None,
+    smc_wt_level=None,
+    smc_confirm_bos=None,
+    smc_require_ema=None,
+    smc_exit_mode=None,
+    smc_min_rr=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -325,7 +331,7 @@ def run_backtest(
     # SMC結構策略(smc_structure.py)：整段回測先把1分K重取樣成1小時K，再用REST抓「回測視窗
     # 之前」的1小時K當warmup(結構判定至少要250根，30天只有720根，前面一大段會被warmup吃掉)。
     # 重播時用bisect只切「step_time之前」的K棒餵給訊號函式，跟趨勢濾網一樣不看未來。
-    smc_hourly, smc_close_times = [], []
+    smc_hourly, smc_close_times, smc_cfg = [], [], {}
     if strategy_type == "smc_structure":
         minute_candles = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
@@ -345,7 +351,16 @@ def run_backtest(
         smc_close_times = [c["bucket_start"] + smc_structure.SMC_INTERVAL_SECONDS * 1000 - 1 for c in smc_hourly]
         # 整段只算一次結構快照/EMA/WaveTrend(全部是因果計算，第i根只用<=i的資料)，
         # 每個訊號步直接查表；原本每步重算一次，365天要跑幾十秒、逼近瀏覽器/閘道逾時
-        smc_pre = smc_structure.precompute(smc_hourly)
+        # SMC參數：回測面板有填的優先，沒填的沿用smc_structure_3600引擎目前的專屬設定
+        smc_settings = settings_module.get_settings(engine_id=smc_structure.SMC_ENGINE_ID)
+        smc_cfg = smc_structure.cfg_from_settings(smc_settings)
+        for _k, _v in (("touch_window", smc_touch_window), ("wt_level", smc_wt_level), ("confirm_bos", smc_confirm_bos),
+                       ("exit_mode", smc_exit_mode), ("min_rr", smc_min_rr)):
+            if _v is not None:
+                smc_cfg[_k] = _v
+        if smc_require_ema is not None:
+            smc_cfg["require_ema"] = bool(int(smc_require_ema))
+        smc_pre = smc_structure.precompute(smc_hourly, smc_cfg)
 
     # 1分K高低價序列(給停損步用)：kline欄位 [open_time, o, h, l, c, v, close_time, ...]
     kline_close_times = [int(k[6]) for k in klines]
@@ -375,6 +390,14 @@ def run_backtest(
         hi = bisect.bisect_right(kline_close_times, to_time)
         for i in range(lo, hi):
             intrabar_checks += 1
+            tp = position.get("tp_price")
+            if tp and ((position["direction"] == "bullish" and kline_highs[i] >= tp)
+                       or (position["direction"] == "bearish" and kline_lows[i] <= tp)):
+                # 同一根K同時碰到停損和停利時保守假設先碰停損(下面的停損判斷會先跑)，這裡只處理沒碰停損的情況
+                sl_hit = (kline_lows[i] <= position["sl_price"]) if position["direction"] == "bullish" else (kline_highs[i] >= position["sl_price"])
+                if not sl_hit:
+                    exit_iso = datetime.fromtimestamp(kline_close_times[i] / 1000, tz=timezone.utc).isoformat()
+                    return None, trading_core.close_position(position, tp, "觸及結構停利", exit_iso)
             if position["direction"] == "bullish":
                 if kline_lows[i] <= position["sl_price"]:
                     reason = "觸及移動停損" if position["trailing_active"] else "觸及停損"
@@ -452,6 +475,8 @@ def run_backtest(
                     _reason = "趨勢確認但不在OB/FVG區"
                 else:
                     _reason = _chan_r.split("，")[0].split("：")[0].split("(")[0]
+            elif "風報比不足" in _prof_r:
+                _reason = "訊號但風報比不足"
             else:
                 _reason = _prof_r.split("，")[0]
                 if "區" in _reason:
@@ -519,6 +544,10 @@ def run_backtest(
                     chan_reason=result["chan"]["reason"],
                     profile_reason=result["profile"]["reason"],
                 )
+                if strategy_type == "smc_structure" and int(smc_cfg.get("exit_mode", 0)) == 1:
+                    tp = (result.get("smc") or {}).get("suggested_tp_price")
+                    if tp:
+                        position["tp_price"] = float(tp)
 
     stats = compute_stats(closed_trades)
     readiness = assess_readiness(stats)
@@ -553,7 +582,8 @@ def run_backtest(
         "signal_kline_count": len(signal_step_times),  # 所選週期的K線總數(訊號步的母體)
         "intrabar_stop_checks": intrabar_checks,  # 訊號步之間用細K線高低價檢查停損的次數
         "stop_kline_interval": SMC_LONG_RANGE_STOP_INTERVAL if smc_long_range else "1m",  # 停損步用的K線週期
-        "smc_funnel": smc_funnel or None,  # SMC策略：各訊號步落在哪個階段/理由(診斷訊號稀疏用)
+        "smc_funnel": smc_funnel or None,
+        "smc_cfg": smc_cfg if strategy_type == "smc_structure" else None,  # 這次回測實際用的SMC參數  # SMC策略：各訊號步落在哪個階段/理由(診斷訊號稀疏用)
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),
         "sl_points": sl_points,

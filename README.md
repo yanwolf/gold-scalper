@@ -2334,3 +2334,10 @@ SMC參數可用環境變數覆寫：`SMC_SWING_N` `SMC_CONFIRM_BOS` `SMC_WT_LEVE
 **效能修正**：SMC回測原本每個訊號步都重算整段結構，365天約幾十秒，會撞到瀏覽器/閘道逾時(Safari顯示「Load failed」)。
 改成 `smc_structure.precompute()` 整段算一次因果快照(結構/EMA/WaveTrend)，每步用 `evaluate_at()` 查表，
 365天約1～2秒；即時路徑的 `generate_signal_smc()` 內部也是同兩個函式，兩邊邏輯完全一致。
+
+**SMC參數改成dashboard可調**：`settings.py` 新增 `smc_touch_window / smc_wt_level / smc_confirm_bos / smc_require_ema /
+smc_exit_mode / smc_min_rr`(TRADING_RELEVANT_KEYS，可用「此引擎專屬參數」覆寫，只有smc_structure_3600引擎會讀)，
+回測面板也有對應輸入欄位(留空=沿用引擎設定)，環境變數只剩預設值用途。
+`smc_exit_mode=1` 時進場會把目標設在趨勢方向的前一個swing點(position["tp_price"])，即時/回測都會以
+「觸及結構停利」出場；`smc_min_rr` 低於門檻的訊號會退回「關注」並在漏斗顯示「訊號但風報比不足」。
+tp_price目前只存在記憶體，服務重啟後那筆未平倉單退回只用移動停損。

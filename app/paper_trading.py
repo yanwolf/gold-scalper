@@ -164,6 +164,13 @@ class PaperTradingEngine:
             position = self._position
 
         if position:
+            # SMC結構停利：進場時記在position["tp_price"](純記憶體，重啟後這筆單退回只用移動停損)
+            tp = position.get("tp_price")
+            if tp and ((position["direction"] == "bearish" and current_price <= tp)
+                       or (position["direction"] == "bullish" and current_price >= tp)):
+                self._close_position(position, current_price, "觸及結構停利", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
+                position = None
+        if position:
             changed = trading_core.update_trailing_stop(
                 position, current_price, trail_trigger_points, trail_distance_points
             )
@@ -218,6 +225,11 @@ class PaperTradingEngine:
         )
         position["interval_seconds"] = self.interval_seconds
         position["engine_id"] = self.engine_id
+        if self.strategy_type == "smc_structure":
+            smc = signal_result.get("smc") or {}
+            s_ = settings_module.get_settings(engine_id=self.engine_id)
+            if int(s_.get("smc_exit_mode", 0) or 0) == 1 and smc.get("suggested_tp_price"):
+                position["tp_price"] = float(smc["suggested_tp_price"])
         db_id = db.insert_open_paper_trade(position)
         position["id"] = db_id
 

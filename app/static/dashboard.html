@@ -705,6 +705,40 @@
         <input type="number" id="backtestTrailDistance" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
       </div>
 
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">SMC結構策略參數(只在策略選SMC時有效，留空=沿用該引擎專屬設定)</div>
+      <div class="settings-field">
+        <label>碰區域/交叉允許視窗(根1小時K)</label>
+        <input type="number" id="backtestSmcTouchWindow" placeholder="留空=沿用引擎設定(預設4)" step="1" min="1" max="12" />
+      </div>
+      <div class="settings-field">
+        <label>WaveTrend超買超賣門檻</label>
+        <input type="number" id="backtestSmcWtLevel" placeholder="留空=沿用引擎設定(預設40)" step="5" min="10" max="80" />
+      </div>
+      <div class="settings-field">
+        <label>MSS後幾次BOS確認趨勢</label>
+        <input type="number" id="backtestSmcConfirmBos" placeholder="留空=沿用引擎設定(預設2)" step="1" min="1" max="3" />
+      </div>
+      <div class="settings-field">
+        <label>要求EMA20/50同向排列</label>
+        <select id="backtestSmcRequireEma">
+          <option value="">沿用引擎設定</option>
+          <option value="1">要</option>
+          <option value="0">不要</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>出場模式</label>
+        <select id="backtestSmcExitMode">
+          <option value="">沿用引擎設定</option>
+          <option value="0">只用移動停損</option>
+          <option value="1">移動停損 + 結構停利(前一個swing點)</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>結構停利最低風報比(0=不限制)</label>
+        <input type="number" id="backtestSmcMinRr" placeholder="留空=沿用引擎設定(預設1.0)" step="0.5" min="0" max="5" />
+      </div>
+
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">通用參數</div>
       <div class="settings-field">
         <label>訊號反轉確認次數</label>
@@ -1122,6 +1156,12 @@ const els = {
   backtestReversalConfirm: document.getElementById('backtestReversalConfirm'),
   backtestUseChop: document.getElementById('backtestUseChop'),
   backtestChopThreshold: document.getElementById('backtestChopThreshold'),
+  backtestSmcTouchWindow: document.getElementById('backtestSmcTouchWindow'),
+  backtestSmcWtLevel: document.getElementById('backtestSmcWtLevel'),
+  backtestSmcConfirmBos: document.getElementById('backtestSmcConfirmBos'),
+  backtestSmcRequireEma: document.getElementById('backtestSmcRequireEma'),
+  backtestSmcExitMode: document.getElementById('backtestSmcExitMode'),
+  backtestSmcMinRr: document.getElementById('backtestSmcMinRr'),
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
@@ -2637,6 +2677,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
   'paper_block_market_closed', 'paper_min_atr_points',
   'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier',
+  'smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr',
 ];
 
 els.engineParamsToggle.addEventListener('click', () => {
@@ -2762,6 +2803,12 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
+  addIfPresent('smc_touch_window', els.backtestSmcTouchWindow);
+  addIfPresent('smc_wt_level', els.backtestSmcWtLevel);
+  addIfPresent('smc_confirm_bos', els.backtestSmcConfirmBos);
+  addIfPresent('smc_require_ema', els.backtestSmcRequireEma);
+  addIfPresent('smc_exit_mode', els.backtestSmcExitMode);
+  addIfPresent('smc_min_rr', els.backtestSmcMinRr);
   return params.toString();
 }
 
@@ -2795,7 +2842,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
       <div class="backtest-meta">
         回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}(還原成 ${data.synthetic_trade_count} 筆合成成交)
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
-        ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
+        ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_cfg ? ` ／ SMC參數：視窗${data.smc_cfg.touch_window}、WT門檻${data.smc_cfg.wt_level}、BOS${data.smc_cfg.confirm_bos}、EMA${data.smc_cfg.require_ema ? '要' : '不要'}、出場${data.smc_cfg.exit_mode == 1 ? '結構停利' : '移動停損'}${data.smc_cfg.exit_mode == 1 ? '(RR≥' + data.smc_cfg.min_rr + ')' : ''}` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
@@ -2884,6 +2931,7 @@ const SETTINGS_GROUPS = [
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points',
                               'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier'] },
+  { title: 'SMC結構策略(只影響 smc_structure_3600 引擎)', keys: ['smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr'], collapsed: true },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },

@@ -838,6 +838,12 @@ async def backtest_run(
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     target_step_count: Optional[int] = None,
+    smc_touch_window: Optional[int] = None,
+    smc_wt_level: Optional[float] = None,
+    smc_confirm_bos: Optional[int] = None,
+    smc_require_ema: Optional[int] = None,
+    smc_exit_mode: Optional[int] = None,
+    smc_min_rr: Optional[float] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -902,6 +908,12 @@ async def backtest_run(
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
         target_step_count=target_step_count,
+        smc_touch_window=smc_touch_window,
+        smc_wt_level=smc_wt_level,
+        smc_confirm_bos=smc_confirm_bos,
+        smc_require_ema=smc_require_ema,
+        smc_exit_mode=smc_exit_mode,
+        smc_min_rr=smc_min_rr,
     )
 
 
