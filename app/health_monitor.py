@@ -61,6 +61,14 @@ class HealthMonitor:
         for engine_id in PAPER_TRADING_ENGINES:
             self._alert_active[f"paper_trading_stall_{engine_id}"] = False
 
+        # lab端監看live端心跳(修正記錄見README)：LIVE_HEALTH_URL有設定才啟用，
+        # 連續失敗達門檻才告警，避免單次網路抖動誤報
+        self._alert_active["live_heartbeat"] = False
+        self._alert_active["live_internal"] = False
+        self._live_failures = 0
+        self._live_last_ok_at = None
+        self._live_last_error = None
+
         self._last_checked_at = None
 
     def start(self):
@@ -92,6 +100,39 @@ class HealthMonitor:
         for engine_id, engine in PAPER_TRADING_ENGINES.items():
             self._check_paper_trading_heartbeat(now, engine_id, engine)
         self._check_db_write_health()
+        self._check_live_heartbeat(now)
+
+    LIVE_HEARTBEAT_FAILURE_THRESHOLD = 3  # 連續幾次檢查失敗才告警(檢查間隔見_run_forever)
+
+    def _check_live_heartbeat(self, now):
+        from app.role import LIVE_HEALTH_URL, is_live
+        if not LIVE_HEALTH_URL or is_live():
+            return
+        try:
+            import requests
+            resp = requests.get(LIVE_HEALTH_URL, timeout=8)
+            resp.raise_for_status()
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            # /health回傳裡有active_health_alerts的話，live端自己的告警也一併帶上
+            live_alerts = data.get("active_health_alerts") if isinstance(data, dict) else None
+            self._live_failures = 0
+            self._live_last_ok_at = now
+            self._live_last_error = None
+            self._set_alert("live_heartbeat", False, "", "正式端(live)心跳恢復")
+            if live_alerts:
+                self._set_alert("live_internal", True, f"正式端(live)回報內部告警：{live_alerts}", "")
+            else:
+                if self._alert_active["live_internal"]:
+                    self._set_alert("live_internal", False, "", "正式端(live)內部告警已清除")
+        except Exception as e:
+            self._live_failures += 1
+            self._live_last_error = str(e)
+            is_problem = self._live_failures >= self.LIVE_HEARTBEAT_FAILURE_THRESHOLD
+            self._set_alert(
+                "live_heartbeat", is_problem,
+                f"正式端(live)心跳連續 {self._live_failures} 次失敗：{e}\n最後一次成功：{self._live_last_ok_at}",
+                "",
+            )
 
     def _set_alert(self, key, is_problem, problem_message, recovered_message):
         """
@@ -224,6 +265,11 @@ class HealthMonitor:
             "last_checked_at": self._last_checked_at.isoformat() if self._last_checked_at else None,
             "active_alerts": {k: v for k, v in self._alert_active.items() if v},
             "all_checks": self._alert_active,
+            "live_watch": {
+                "failures": self._live_failures,
+                "last_ok_at": self._live_last_ok_at.isoformat() if self._live_last_ok_at else None,
+                "last_error": self._live_last_error,
+            },
         }
 
 

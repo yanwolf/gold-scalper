@@ -33,6 +33,8 @@ from app import sweep as sweep_module
 from app import settings as settings_module
 from app import execution as execution_module
 from app import db
+from app import role as role_module
+from app import risk_guard
 
 logger = logging.getLogger("main")
 
@@ -47,15 +49,206 @@ app.add_middleware(
 )
 
 
+# 服務角色閘門(修正記錄見README)：live角色下，研究/實驗用的路由一律403，
+# 參數也不能直接改(只能走 /settings/import)。用middleware擋在最外層，
+# 不用每個endpoint各自判斷，之後新加的實驗endpoint只要放進role.LAB_ONLY_*就會被擋。
+@app.middleware("http")
+async def role_gate(request, call_next):
+    if role_module.is_path_blocked(request.method, request.url.path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=403, content={
+            "success": False,
+            "error": f"這是正式執行端(APP_ROLE=live)，不提供 {request.method} {request.url.path}；研究/改參數請到 lab 端，參數請用「匯入參數集」更新",
+        })
+    return await call_next(request)
+
+
 @app.on_event("startup")
 async def startup_event():
+    logger.info(f"服務角色: {role_module.describe()}")
     db.init_schema()  # 要在 binance_streamer.start() 之前，回填歷史資料時才讀得到
     streamer.start()
     binance_streamer.start()
     notifier.start()
     for engine in PAPER_TRADING_ENGINES.values():
-        engine.start()  # 1分K跟5分K兩個引擎平行啟動，各自獨立追蹤
+        engine.start()  # 依角色載入的引擎平行啟動，各自獨立追蹤
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
+    if role_module.is_live():
+        # 正式端啟動時跟交易所對帳：DB記得有部位但交易所沒有(或反過來)就立刻告警，
+        # 避免程序重啟後出現沒人管的孤兒單
+        import threading
+        threading.Thread(target=_reconcile_with_exchange_on_startup, daemon=True).start()
+
+
+def _reconcile_with_exchange_on_startup():
+    import time
+    time.sleep(10)  # 等串流跟引擎都熱身完
+    lines = []
+    for engine_id, engine in PAPER_TRADING_ENGINES.items():
+        if not getattr(engine, "execution_index", None):
+            continue
+        try:
+            db_pos = engine.get_position() if hasattr(engine, "get_position") else getattr(engine, "_position", None)
+            ok, info = execution_module.get_position_info(account=engine.execution_account)
+            if not ok:
+                lines.append(f"{engine.label}: 查詢交易所部位失敗 {info}")
+                continue
+            exch_qty = 0.0
+            for row in info if isinstance(info, list) else []:
+                try:
+                    exch_qty += float(row.get("positionAmt", 0))
+                except (TypeError, ValueError):
+                    pass
+            has_db = bool(db_pos and db_pos.get("real_open_executed"))
+            has_exch = abs(exch_qty) > 1e-9
+            if has_db != has_exch:
+                lines.append(
+                    f"{engine.label}: 對帳不一致 — 程式記錄{'有' if has_db else '沒有'}真實部位，"
+                    f"交易所{'有' if has_exch else '沒有'}部位(淨 {exch_qty})，請手動確認"
+                )
+            else:
+                lines.append(f"{engine.label}: 對帳一致({'有部位 淨 ' + str(exch_qty) if has_exch else '空手'})")
+        except Exception as e:
+            lines.append(f"{engine.label}: 對帳時發生錯誤 {e}")
+    if lines:
+        text = "🟡 正式端啟動對帳\n" + "\n".join(lines)
+        logger.info(text)
+        if notifier.is_enabled:
+            notifier.send_raw_message(text)
+        db.insert_settings_audit("startup_reconcile", detail={"lines": lines})
+
+
+@app.get("/app/role")
+async def app_role():
+    """服務角色與控制狀態：dashboard載入時先問這支，決定要顯示哪些分頁/按鈕。"""
+    return {
+        **role_module.describe(),
+        "active_engines": list(PAPER_TRADING_ENGINES.keys()),
+        "manual_halt": risk_guard.get_manual_halt(),
+    }
+
+
+@app.post("/control/halt")
+async def control_halt(payload: dict = Body(...)):
+    """緊急停止：payload {"password", "reason"}。之後所有引擎不再送新的真實開倉單，既有部位照常管理。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    state = risk_guard.set_manual_halt(True, payload.get("reason") or "手動停止")
+    db.insert_settings_audit("manual_halt", detail=state)
+    if notifier.is_enabled:
+        notifier.send_raw_message(f"🛑 手動緊急停止已啟動\n原因：{state['reason']}\n所有引擎暫停新的真實開倉，既有部位照常管理出場")
+    return {"success": True, "manual_halt": state}
+
+
+@app.post("/control/resume")
+async def control_resume(payload: dict = Body(...)):
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    state = risk_guard.set_manual_halt(False)
+    db.insert_settings_audit("manual_resume", detail=state)
+    if notifier.is_enabled:
+        notifier.send_raw_message("🟢 手動緊急停止已解除，恢復真實開倉")
+    return {"success": True, "manual_halt": state}
+
+
+@app.post("/control/flatten")
+async def control_flatten(payload: dict = Body(...)):
+    """
+    強制平倉：payload {"password", "engine_id"(可選，不給=全部載入中的引擎), "reason"}。
+    走引擎正常的出場流程(含真實平倉單、通知、統計)，並順手啟動緊急停止避免馬上又開新倉。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    reason = payload.get("reason") or "手動緊急平倉"
+    targets = [payload["engine_id"]] if payload.get("engine_id") else list(PAPER_TRADING_ENGINES.keys())
+    results = {}
+    for eid in targets:
+        eng = PAPER_TRADING_ENGINES.get(eid)
+        if not eng:
+            results[eid] = {"closed": False, "message": "沒有這個引擎"}
+            continue
+        closed, msg = eng.force_close(reason)
+        results[eid] = {"closed": closed, "message": msg}
+    state = risk_guard.set_manual_halt(True, f"強制平倉後自動停止({reason})")
+    db.insert_settings_audit("manual_flatten", detail={"results": results, "reason": reason})
+    if notifier.is_enabled:
+        notifier.send_raw_message("🛑 手動強制平倉\n" + "\n".join(f"{k}: {v['message']}" for k, v in results.items()) + "\n已同時啟動緊急停止")
+    return {"success": True, "results": results, "manual_halt": state}
+
+
+@app.get("/settings/export")
+async def settings_export(engine_id: str):
+    """
+    匯出參數集(修正記錄見README)：lab端驗證完一組參數後，用這支產生帶版本號的JSON，
+    拿到live端「匯入參數集」貼上。內容是該引擎「實際生效」的所有交易相關參數
+    (全域+專屬覆寫合併後的結果)，匯入端會把它們全部寫成專屬覆寫，讓正式引擎
+    的參數完全釘死、不受對方全域設定影響。
+    """
+    if engine_id not in PAPER_TRADING_ENGINES:
+        return {"error": f"沒有engine_id={engine_id}的引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
+    import hashlib, json
+    from datetime import datetime, timezone
+    effective = settings_module.get_settings(engine_id=engine_id)
+    params = {k: effective[k] for k in sorted(settings_module.TRADING_RELEVANT_KEYS) if k in effective}
+    digest = hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:8]
+    now = datetime.now(timezone.utc)
+    param_set = {
+        "format": "gold-scalper-param-set/1",
+        "version": f"ps-{now.strftime('%Y%m%d-%H%M')}-{digest}",
+        "exported_at": now.isoformat(),
+        "source": role_module.describe(),
+        "engine_id": engine_id,
+        "params": params,
+    }
+    db.insert_settings_audit("export", engine_id=engine_id, version=param_set["version"], detail={"params": params})
+    return param_set
+
+
+@app.post("/settings/import")
+async def settings_import(payload: dict = Body(...)):
+    """
+    匯入參數集：payload {"password", "engine_id"(目標引擎，預設用參數集裡的), "param_set": {...}, "force": bool}。
+    安全規則：
+      - 密碼驗證、格式驗證、每個key必須是TRADING_RELEVANT_KEYS且能通過型別轉換
+      - 目標引擎有未平倉部位時拒絕(force=true才放行)，避免中途改停損邏輯
+      - 寫入方式是「全部寫成專屬覆寫」，之後全域設定怎麼改都不影響這個引擎
+      - 每次匯入寫一筆審計(版本號、前後差異)，並發Telegram
+    lab和live兩端都能用，但這是live端唯一能改參數的入口。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    ps = payload.get("param_set") or {}
+    if ps.get("format") != "gold-scalper-param-set/1" or not isinstance(ps.get("params"), dict):
+        return {"success": False, "error": "參數集格式不正確(需要 format=gold-scalper-param-set/1 和 params)"}
+    engine_id = payload.get("engine_id") or ps.get("engine_id")
+    engine = PAPER_TRADING_ENGINES.get(engine_id)
+    if not engine:
+        return {"success": False, "error": f"沒有engine_id={engine_id}的引擎，可用的有: {list(PAPER_TRADING_ENGINES.keys())}"}
+    bad = [k for k in ps["params"] if k not in settings_module.TRADING_RELEVANT_KEYS]
+    if bad:
+        return {"success": False, "error": f"參數集含有不允許的欄位: {bad}"}
+    pos = getattr(engine, "_position", None)
+    if pos and not payload.get("force"):
+        return {"success": False, "error": "目標引擎目前有未平倉部位，等平倉後再匯入(或帶 force=true 強制)"}
+    before = {k: settings_module.get_settings(engine_id=engine_id).get(k) for k in ps["params"]}
+    applied, cleared = settings_module.update_engine_overrides(engine_id, ps["params"])
+    after = {k: settings_module.get_settings(engine_id=engine_id).get(k) for k in ps["params"]}
+    diff = {k: {"before": before[k], "after": after[k]} for k in ps["params"] if before[k] != after[k]}
+    db.insert_settings_audit("import", engine_id=engine_id, version=ps.get("version"),
+                             detail={"diff": diff, "source": ps.get("source"), "forced": bool(payload.get("force"))})
+    if notifier.is_enabled:
+        lines = [f"{k}: {v['before']} → {v['after']}" for k, v in diff.items()] or ["(沒有任何值改變)"]
+        notifier.send_raw_message(f"📥 參數集已匯入 {engine.label}\n版本：{ps.get('version')}\n" + "\n".join(lines))
+    return {"success": True, "engine_id": engine_id, "version": ps.get("version"), "diff": diff, "applied": applied}
+
+
+@app.get("/settings/audit")
+async def settings_audit(limit: int = 50):
+    return {"items": db.get_settings_audit(limit=limit)}
 
 
 @app.on_event("shutdown")

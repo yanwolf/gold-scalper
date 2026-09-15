@@ -378,6 +378,24 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
+    def force_close(self, reason="手動緊急平倉"):
+        """
+        正式端控制面板用：不等訊號、不等停損，立刻以最新成交價把這個引擎的部位平掉
+        (走跟正常出場同一條_close_position，所以真實下單/通知/統計全部一致)。
+        回傳(closed: bool, message)。
+        """
+        with self._lock:
+            position = self._position
+        if not position:
+            return False, "目前沒有部位"
+        from app.binance_client import binance_streamer
+        trades = binance_streamer.get_recent_trades(limit=1)
+        if not trades:
+            return False, "拿不到最新價格，無法平倉"
+        price = trades[-1]["price"]
+        self._close_position(position, price, reason)
+        return True, f"已以 {price} 平倉({reason})"
+
     def _close_position(self, position, exit_price, exit_reason, bid=None, ask=None, book_stale=None):
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = trading_core.close_position(position, exit_price, exit_reason, exit_time)
@@ -580,11 +598,19 @@ paper_trading_1m_resonance = PaperTradingEngine(
     resonance_min_conditions=3, execution_index=4,
 )
 
-PAPER_TRADING_ENGINES = {
+ALL_PAPER_TRADING_ENGINES = {
     paper_trading_1m.engine_id: paper_trading_1m,
     paper_trading_5m.engine_id: paper_trading_5m,
     paper_trading_15m.engine_id: paper_trading_15m,
     paper_trading_1m_resonance.engine_id: paper_trading_1m_resonance,
+}
+
+# 依服務角色決定實際載入的引擎(修正記錄見README)：lab全開；live只開LIVE_ENGINE_IDS，
+# 其他引擎連物件都不放進這個dict，dashboard/健康監控/風控通通看不到它們
+from app.role import active_engine_ids as _active_engine_ids
+PAPER_TRADING_ENGINES = {
+    eid: eng for eid, eng in ALL_PAPER_TRADING_ENGINES.items()
+    if eid in _active_engine_ids(ALL_PAPER_TRADING_ENGINES.keys())
 }
 
 # 保留舊名稱指向1分K引擎，避免其他還沒更新的地方(例如health_monitor.py)

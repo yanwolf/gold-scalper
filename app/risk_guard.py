@@ -152,6 +152,26 @@ def get_account_daily_pnl_usd(execution_account, quantity):
     return total
 
 
+# ---------------------------------------------------------------------------
+# 手動緊急停止(修正記錄見README)：正式端dashboard的紅色按鈕。啟動後所有引擎
+# 都不再送出新的真實開倉單(模擬單照常記錄)，既有部位的出場單不受影響——
+# 停止「開新倉」而不是停止「管理部位」，才不會把已經在場上的單子晾著。
+# ---------------------------------------------------------------------------
+_manual_halt = {"active": False, "reason": None, "at": None, "by": None}
+
+
+def set_manual_halt(active, reason=None):
+    from datetime import datetime, timezone
+    _manual_halt["active"] = bool(active)
+    _manual_halt["reason"] = reason if active else None
+    _manual_halt["at"] = datetime.now(timezone.utc).isoformat()
+    return dict(_manual_halt)
+
+
+def get_manual_halt():
+    return dict(_manual_halt)
+
+
 def check(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
@@ -173,6 +193,9 @@ def check(engine, quantity, sl_points=None, bid=None, ask=None):
     放大(execution_max_spread_points設定)，比sl_points那組更直接、即時。
     兩者都不提供的話都不會做對應的檢查(向後相容既有呼叫方式)。
     """
+    if _manual_halt["active"]:
+        return False, f"手動緊急停止中({_manual_halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"
+
     s = settings_module.get_settings()
 
     daily_pnl_usd = get_daily_pnl_usd(engine, quantity)

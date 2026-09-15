@@ -50,11 +50,21 @@ def init_schema():
         import psycopg2
         from psycopg2 import pool as pg_pool
 
-        _pool = pg_pool.SimpleConnectionPool(1, 5, database_url)
+        # APP_NAMESPACE有設定時，所有連線的search_path都指到該schema，
+        # 這個服務的所有資料表就自動落在自己的schema裡，跟另一個角色的服務
+        # 共用同一台Postgres也互不干擾(修正記錄見README)
+        from app.role import APP_NAMESPACE
+        pool_kwargs = {}
+        if APP_NAMESPACE:
+            pool_kwargs["options"] = f"-c search_path={APP_NAMESPACE},public"
+        _pool = pg_pool.SimpleConnectionPool(1, 5, database_url, **pool_kwargs)
 
         conn = _pool.getconn()
         try:
             with conn.cursor() as cur:
+                if APP_NAMESPACE:
+                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{APP_NAMESPACE}"')
+                    conn.commit()
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS gold_trades (
                         id BIGSERIAL PRIMARY KEY,
@@ -190,6 +200,16 @@ def init_schema():
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL,
                         updated_at TIMESTAMPTZ DEFAULT now()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS settings_audit (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        action TEXT NOT NULL,
+                        engine_id TEXT,
+                        version TEXT,
+                        detail JSONB
                     );
                 """)
             conn.commit()
@@ -922,3 +942,47 @@ def delete_app_settings(keys):
             _pool.putconn(conn)
     except Exception as e:
         logger.error(f"刪除設定失敗: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 參數集匯入 / 緊急控制 的審計紀錄(修正記錄見README)
+# ---------------------------------------------------------------------------
+
+def insert_settings_audit(action, engine_id=None, version=None, detail=None):
+    if not _enabled:
+        return
+    import json as _json
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO settings_audit (action, engine_id, version, detail) VALUES (%s, %s, %s, %s)",
+                    (action, engine_id, version, _json.dumps(detail or {}, ensure_ascii=False, default=str)),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"寫入審計紀錄失敗: {e}")
+
+
+def get_settings_audit(limit=50):
+    if not _enabled:
+        return []
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, created_at, action, engine_id, version, detail FROM settings_audit ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return [{"id": r[0], "created_at": r[1].isoformat() if r[1] else None, "action": r[2],
+                 "engine_id": r[3], "version": r[4], "detail": r[5]} for r in rows]
+    except Exception as e:
+        logger.error(f"讀取審計紀錄失敗: {e}")
+        return []

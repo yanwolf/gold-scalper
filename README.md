@@ -2269,3 +2269,29 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 **部署後注意**：第一次真實開倉時會嘗試把帳戶切成雙向；若當時帳戶有未平倉
 部位會失敗並通知——把gold帳戶的部位平掉一次(手動測試面板「送出測試平倉單」
 或在幣安APP)，下一次開倉就會自動切過去，之後永久生效。
+
+## 架構：研究端(lab) / 正式端(live) 雙服務
+
+接正式網之後，實驗跟正式執行必須物理隔離：回測/掃描搶GIL會拖慢正式單的tick、
+改一個實驗參數就重啟整個服務、實驗時手滑改到正式引擎的設定。同一份程式碼用
+環境變數切成兩個Zeabur服務：
+
+| 環境變數 | lab(研究端，預設) | live(正式端) |
+|---|---|---|
+| `APP_ROLE` | `lab` | `live` |
+| `APP_NAMESPACE` | `lab` | `live`(同一台Postgres不同schema，所有資料表自動隔離) |
+| `LIVE_ENGINE_IDS` | (不用) | `chan_profile_900`(只載入這些引擎，其他連物件都不建) |
+| `LIVE_HEALTH_URL` | `https://<live服務>/health`(lab監看live心跳) | (不用) |
+| 幣安金鑰 | Demo Trading | 正式子帳戶，IP白名單、只開合約交易、關提幣 |
+
+**live角色的行為**：
+- `/backtest/*`、`/execution/test-*`、`/execution/set-leverage`、`POST /settings`、`POST /settings/engine/*` 一律403(middleware `role_gate`)
+- dashboard 隱藏「回測／掃描」分頁、設定分頁唯讀、主畫面出現紅色控制面板：緊急停止(只擋新開倉，部位照常管理)/解除/強制平倉(走引擎正常出場流程，並自動啟動緊急停止)
+- 啟動10秒後跟交易所對帳(`_reconcile_with_exchange_on_startup`)，程式記錄與交易所部位不一致時發Telegram
+- 參數唯一入口是 `POST /settings/import`：需要密碼、格式與欄位驗證、目標引擎有部位時拒絕(force可強制)、全部寫成該引擎專屬覆寫(之後全域怎麼改都不影響)、寫 `settings_audit` 並發Telegram
+
+**參數流向**：lab驗證完 → 主畫面「匯出參數集」(`GET /settings/export?engine_id=`，含版本號與hash) → 複製JSON → live主畫面「匯入參數集」貼上。`GET /settings/audit` 看歷史。
+
+**心跳**：lab的health_monitor每輪多打一次 `LIVE_HEALTH_URL`，連續3次失敗才Telegram告警、恢復時再通知；live端自己的內部告警也會透過/health帶回來。
+
+建議上線順序：先開第二個Zeabur服務、`APP_ROLE=live` 但金鑰仍用Demo，把匯入/停止/平倉/對帳流程走一遍，再換正式金鑰。
