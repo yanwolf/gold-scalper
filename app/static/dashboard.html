@@ -1350,7 +1350,7 @@ function renderSignal(data){
     const conflict = direction && t.direction && t.direction !== direction ? '　⚠️ 與目前訊號方向相反(趨勢濾網開啟時會跳過這筆)' : '';
     parts.push(`
       <div class="signal-reason ${bias}">
-        <div class="src-label">大週期趨勢(雙SuperTrend)：${label}</div>
+        <div class="src-label">大週期趨勢(${t.interval_seconds ? (t.interval_seconds >= 3600 ? t.interval_seconds/3600 + '小時K' : t.interval_seconds/60 + '分K') : '雙SuperTrend'} 雙ST ${t.fast_multiplier ?? 1}x/${t.slow_multiplier ?? 3}x，${t.candle_count ?? '?'}根已收盤)：${label}</div>
         <div>${t.reason}${conflict}</div>
       </div>
     `);

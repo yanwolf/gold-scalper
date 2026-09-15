@@ -853,7 +853,7 @@ def compute_supertrend(candles, period=10, multiplier=3.0):
     return [x for x in out if x is not None]
 
 
-def compute_trend_filter(trend_candles, period=10, fast_multiplier=1.0, slow_multiplier=3.0):
+def compute_trend_filter(trend_candles, period=10, fast_multiplier=1.0, slow_multiplier=3.0, interval_seconds=None):
     """
     雙SuperTrend方向判斷。trend_candles是「大週期、已收盤」的K棒(呼叫端負責
     把進行中的最後一根丟掉，避免同一根K棒內方向來回翻)。
@@ -862,9 +862,15 @@ def compute_trend_filter(trend_candles, period=10, fast_multiplier=1.0, slow_mul
     """
     fast = compute_supertrend(trend_candles, period=period, multiplier=fast_multiplier)
     slow = compute_supertrend(trend_candles, period=period, multiplier=slow_multiplier)
+    # 週期沒明確傳進來就從K棒間距推(給顯示用)
+    if interval_seconds is None and len(trend_candles) >= 2:
+        interval_seconds = int((trend_candles[-1]["bucket_start"] - trend_candles[-2]["bucket_start"]) / 1000)
+    base = {"interval_seconds": interval_seconds, "period": period,
+            "fast_multiplier": fast_multiplier, "slow_multiplier": slow_multiplier,
+            "candle_count": len(trend_candles)}
     if not fast or not slow:
-        return {"direction": None, "fast": None, "slow": None, "fast_line": None, "slow_line": None,
-                "reason": f"大週期K棒不足({len(trend_candles)}根)，趨勢濾網未生效", "candle_count": len(trend_candles)}
+        return {**base, "direction": None, "fast": None, "slow": None, "fast_line": None, "slow_line": None,
+                "reason": f"大週期K棒不足({len(trend_candles)}根)，趨勢濾網未生效"}
     f, sl = fast[-1], slow[-1]
     if f["direction"] == 1 and sl["direction"] == 1:
         direction, reason = "bullish", f"雙ST同步偏多(快線 {f['line']:.2f} / 慢線 {sl['line']:.2f} 皆在價格下方)"
@@ -873,9 +879,8 @@ def compute_trend_filter(trend_candles, period=10, fast_multiplier=1.0, slow_mul
     else:
         direction = None
         reason = f"快慢線分歧(快線{'多' if f['direction']==1 else '空'}、慢線{'多' if sl['direction']==1 else '空'})，趨勢轉換期或盤整，視為中性"
-    return {"direction": direction, "fast": f["direction"], "slow": sl["direction"],
-            "fast_line": round(f["line"], 2), "slow_line": round(sl["line"], 2),
-            "reason": reason, "candle_count": len(trend_candles)}
+    return {**base, "direction": direction, "fast": f["direction"], "slow": sl["direction"],
+            "fast_line": round(f["line"], 2), "slow_line": round(sl["line"], 2), "reason": reason}
 
 
 def trend_filter_allows(mode, trend_direction, signal_direction):
