@@ -2429,9 +2429,9 @@ function renderPaperTrading(data, t){
     if(!data.execution.enabled){
       titleEl.innerHTML = '模擬單績效（尚未接自動下單）';
     }else if(data.execution.testnet){
-      titleEl.innerHTML = `模擬單績效 <span style="color:var(--gold);">（已接測試網真實下單，${data.execution.quantity} 張）</span>`;
+      titleEl.innerHTML = `模擬單績效 <span style="color:var(--gold);">（已接測試網真實下單，每筆 ${data.execution.quantity} 張）</span>`;
     }else{
-      titleEl.innerHTML = `交易績效 <span style="color:var(--gold);">（🟡 正式環境真實下單中，${data.execution.quantity} 張）</span>`;
+      titleEl.innerHTML = `交易績效 <span style="color:var(--gold);">（🟡 正式環境自動下單，每筆 ${data.execution.quantity} 張）</span>`;
     }
   }
   renderActiveConfig(document.getElementById(t.activeConfigId), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
