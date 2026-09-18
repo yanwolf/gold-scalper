@@ -1820,7 +1820,18 @@ els.executionOpenBtn.addEventListener('click', async () => {
       showExecutionResult(`開倉失敗：${JSON.stringify(data.result || data.error)}${data.warning ? '\n⚠️ ' + data.warning : ''}`, true);
     }
   }catch(err){
-    showExecutionResult(`開倉失敗：${err.message}`, true);
+    // 網路層失敗(Load failed / timeout)不代表單沒成交——請求可能已送到伺服器並成交，
+    // 只是回應沒回來。自動查一次部位讓使用者確認，避免誤以為失敗而重送。
+    showExecutionResult(`開倉請求沒有收到回應(${err.message})。單可能已經送出並成交，正在查詢目前部位…`, true);
+    try{
+      const pwd2 = getOrPromptPassword();
+      const r2 = await fetch(`/execution/position?password=${encodeURIComponent(pwd2)}&account=${els.executionAccount.value}`);
+      const d2 = await r2.json();
+      const pos = (d2.success && Array.isArray(d2.data)) ? d2.data.filter(p => Math.abs(parseFloat(p.positionAmt || 0)) > 0) : [];
+      showExecutionResult(pos.length
+        ? `開倉請求沒有收到回應，但查詢部位顯示「已有部位」：${pos.map(p => `${p.positionSide || ''} ${p.positionAmt} @ ${p.entryPrice}`).join('；')}。請勿重送。`
+        : `開倉請求沒有收到回應，查詢部位顯示目前空手，可以重試。`, pos.length > 0);
+    }catch(_){ }
   }
   els.executionOpenBtn.disabled = false;
 });
@@ -1856,7 +1867,7 @@ els.executionCloseBtn.addEventListener('click', async () => {
       showExecutionResult(`平倉失敗：${JSON.stringify(data.result || data.error)}`, true);
     }
   }catch(err){
-    showExecutionResult(`平倉失敗：${err.message}`, true);
+    showExecutionResult(`平倉請求沒有收到回應(${err.message})。單可能已經送出，請按「查詢目前部位」確認後再決定是否重送。`, true);
   }
   els.executionCloseBtn.disabled = false;
 });

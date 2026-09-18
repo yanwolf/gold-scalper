@@ -691,14 +691,20 @@ async def execution_test_order(payload: dict = Body(...)):
         elif not (bid and ask):
             slippage_note = f"(無法計算執行品質：查不到當下bid/ask，成交價是{actual_fill_price:.2f}，book_ticker查詢結果：{book}，book_ok={book_ok})"
 
-    try:
-        notifier.notify_trade_event(
-            action="open", label="手動測試", direction=direction, price=bid or ask or 0,
-            executed=success, execution_error=None if success else result,
-            account=account, slippage_note=slippage_note,
-        )
-    except Exception as e:
-        logger.error(f"手動測試下單通知發送失敗: {e}")
+    # Telegram改成背景送(修正記錄見README)：手機Safari對這支請求的耐心只有十幾秒，
+    # 下單本身要打3~4次幣安API，再同步等Telegram回應就可能超時，畫面顯示「Load failed」
+    # 但單其實已經成交，使用者會誤以為失敗而重送。
+    import threading as _th
+    def _notify_open():
+        try:
+            notifier.notify_trade_event(
+                action="open", label="手動測試", direction=direction, price=bid or ask or 0,
+                executed=success, execution_error=None if success else result,
+                account=account, slippage_note=slippage_note,
+            )
+        except Exception as e:
+            logger.warning(f"手動測試開倉通知失敗: {e}")
+    _th.Thread(target=_notify_open, daemon=True).start()
 
     return {"success": success, "result": result, "execution_quality": execution_quality,
             "hedge_mode_used": hedge, "warning": mode_warning}
@@ -754,15 +760,18 @@ async def execution_test_close(payload: dict = Body(...)):
         elif not (bid and ask):
             slippage_note = f"(無法計算執行品質：查不到當下bid/ask，成交價是{actual_fill_price:.2f})"
 
-    try:
-        notifier.notify_trade_event(
-            action="close", label="手動測試", direction=direction, price=bid or ask or 0,
-            exit_reason="手動測試平倉", pnl_points=0,
-            executed=success, execution_error=None if success else result,
-            account=account, slippage_note=slippage_note,
-        )
-    except Exception as e:
-        logger.error(f"手動測試平倉通知發送失敗: {e}")
+    import threading as _th
+    def _notify_close():
+        try:
+            notifier.notify_trade_event(
+                action="close", label="手動測試", direction=direction, price=bid or ask or 0,
+                exit_reason="手動測試平倉", pnl_points=0,
+                executed=success, execution_error=None if success else result,
+                account=account, slippage_note=slippage_note,
+            )
+        except Exception as e:
+            logger.warning(f"手動測試平倉通知失敗: {e}")
+    _th.Thread(target=_notify_close, daemon=True).start()
 
     return {"success": success, "result": result, "execution_quality": execution_quality}
 
