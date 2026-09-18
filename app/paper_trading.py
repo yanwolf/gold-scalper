@@ -587,6 +587,12 @@ class PaperTradingEngine:
             "settings_changed_at": settings_changed_at,
             "readiness": readiness,
             "circuit_breaker": circuit_breaker,  # None代表這個引擎沒有接真實下單，不適用風控斷路器
+            # 給dashboard標題用：這個引擎現在有沒有接真實下單、打的是測試網還是正式環境、數量多少
+            "execution": {
+                "enabled": circuit_breaker is not None,
+                "quantity": s.get("execution_quantity"),
+                "testnet": execution_module.status(account=self.execution_account).get("testnet") if circuit_breaker is not None else None,
+            },
             "stats_spread_adjusted": stats_spread_adjusted,
             "readiness_spread_adjusted": readiness_spread_adjusted,
             "assumed_spread_points": spread_points,
