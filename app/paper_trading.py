@@ -250,6 +250,7 @@ class PaperTradingEngine:
         execution_error = None  # 下單失敗時的詳細原因，會一起放進Telegram通知裡
         skip_reason = None  # 風控斷路器擋下這次下單的原因(修正記錄見README)
         slippage_note = None  # 買賣價差+真正執行滑點的說明(修正記錄見README)
+        mode_warning = None  # 持倉模式/槓桿被交易所限制而自動調整時的說明
 
         # 市價買單實際會成交在賣一(ask)、市價賣單會成交在買一(bid)，不是
         # 中間價(current_price)——使用者實測發現，直接拿中間價當基準會把
@@ -316,6 +317,23 @@ class PaperTradingEngine:
                         symbol=self.execution_symbol,
                         account=self.execution_account,
                     )
+                    if not leverage_ok:
+                        # 幣安對新開的子帳戶有槓桿上限(錯誤碼-4421，訊息會寫允許的最大倍數，
+                        # 例如"restricted from using leverage greater than 5x")。槓桿只影響
+                        # 保證金占用、不影響單筆風險，所以碰到這個限制時自動降到允許的上限
+                        # 再下單，不要因為設定寫10x就整筆放棄(修正記錄見README)
+                        import re as _re
+                        code = leverage_result.get("code") if isinstance(leverage_result, dict) else None
+                        msg = str(leverage_result.get("msg", "")) if isinstance(leverage_result, dict) else str(leverage_result)
+                        m = _re.search(r"greater than\s*(\d+)x", msg)
+                        if code == -4421 and m:
+                            capped = int(m.group(1))
+                            leverage_ok, leverage_result = execution_module.set_leverage(
+                                capped, symbol=self.execution_symbol, account=self.execution_account,
+                            )
+                            if leverage_ok:
+                                logger.warning(f"{self.label}: 交易所限制槓桿上限{capped}x，已自動改用{capped}x下單(設定值{s['execution_leverage']}x)")
+                                mode_warning = (mode_warning + "；" if mode_warning else "") + f"交易所限制槓桿上限{capped}x，已自動改用{capped}x"
                     if not leverage_ok:
                         raise RuntimeError(f"槓桿設定失敗，放棄下單: {leverage_result}")
 
@@ -390,11 +408,15 @@ class PaperTradingEngine:
         # 純模擬的部分繼續在dashboard上看就好，不需要即時推播(修正記錄見README)。
         if is_execution_engine:
             try:
+                # 持倉模式/槓桿自動調整的warning一併附在通知裡，讓使用者知道實際用了什麼設定
+                open_note = slippage_note
+                if mode_warning:
+                    open_note = (open_note + "\n" if open_note else "") + f"⚠️ {mode_warning}"
                 notifier_module.notifier.notify_trade_event(
                     action="open", label=self.label,
                     direction=position["direction"], price=current_price,
                     executed=executed, execution_error=execution_error, skip_reason=skip_reason,
-                    account=self.execution_account, slippage_note=slippage_note,
+                    account=self.execution_account, slippage_note=open_note,
                 )
             except Exception as e:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
