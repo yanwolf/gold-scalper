@@ -2214,7 +2214,11 @@ function renderTradeList(el, trades, settingsChangedAt){
     const dirLabel = t.direction === 'bullish' ? '多' : '空';
     const isWin = t.pnl_points > 0;
     const pnlClass = isWin ? 'win' : 'loss';
-    const pnlText = `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}`;
+    // 真實下單過的交易：優先顯示依真實成交價算的USDT，沒有就用點數×張數估算
+    const usdPart = t.real_pnl_usd != null
+      ? ` <span style="font-size:0.85em; opacity:.85;">(${t.real_pnl_usd >= 0 ? '+' : ''}${t.real_pnl_usd.toFixed(2)} U 實)</span>`
+      : (t.real_open_executed ? usdTag(t.pnl_points, t.real_open_quantity || CURRENT_EXEC_QTY) : '');
+    const pnlText = `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}${usdPart}`;
     const exitTime = t.exit_time ? new Date(t.exit_time).toLocaleString('zh-TW') : '';
     const entryMs = t.entry_time ? new Date(t.entry_time).getTime() : null;
 
@@ -2410,8 +2414,15 @@ function liveTargets(){
   };
 }
 
+let CURRENT_EXEC_QTY = null; // 目前面板的真實下單張數(null=純模擬)，給USDT換算用
+function usdTag(points, qty){
+  if(!qty || points == null) return '';
+  const usd = points * qty;
+  return ` <span style="font-size:0.85em; opacity:.85;">(${usd >= 0 ? '+' : ''}${usd.toFixed(2)} U)</span>`;
+}
 function renderPaperTrading(data, t){
   t = t || Object.assign({ activeConfigId: 'paperActiveConfig', drawdownPeriodId: 'paperDrawdownPeriod' }, els);
+  CURRENT_EXEC_QTY = (data.execution && data.execution.enabled && data.execution.quantity) ? Number(data.execution.quantity) : null;
   // 標題依真實下單狀態變化：純模擬 / 已接測試網 / 已接正式環境(紅字)
   const titleEl = document.getElementById(t.activeConfigId === 'paperActiveConfig' ? 'paperPanelTitle' : 'livePaperPanelTitle');
   if(titleEl && data.execution){
@@ -2449,7 +2460,7 @@ function renderPaperTrading(data, t){
       livePriceHtml = `
         <div class="paper-position-live">
           <span>現價 <span class="mono">${lastKnownPrice.toFixed(2)}</span></span>
-          <span class="pnl ${pnlClass}">${pnlSign}${unrealizedPnl.toFixed(2)}</span>
+          <span class="pnl ${pnlClass}">${pnlSign}${unrealizedPnl.toFixed(2)}${usdTag(unrealizedPnl, CURRENT_EXEC_QTY)}</span>
         </div>
       `;
     }
@@ -2472,7 +2483,7 @@ function renderPaperTrading(data, t){
 
   t.paperTotal.textContent = data.total_trades ?? '--';
   t.paperWinRate.textContent = data.total_trades ? `${data.win_rate}%` : '--';
-  t.paperTotalPnl.textContent = data.total_trades != null ? data.total_pnl_points.toFixed(2) : '--';
+  t.paperTotalPnl.innerHTML = data.total_trades != null ? `${data.total_pnl_points.toFixed(2)}${usdTag(data.total_pnl_points, CURRENT_EXEC_QTY)}` : '--';
   t.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');
   t.paperMaxDrawdown.textContent = data.total_trades != null ? data.max_drawdown_points.toFixed(2) : '--';
 

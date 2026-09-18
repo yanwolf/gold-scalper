@@ -70,7 +70,7 @@ class TelegramNotifier:
 
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
                             executed=None, execution_error=None, skip_reason=None, account="gold",
-                            slippage_note=None):
+                            slippage_note=None, quantity=None, real_pnl_usd=None):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -132,7 +132,11 @@ class TelegramNotifier:
                 f"時間：{now_str}\n"
                 f"價格：{price:.2f}\n"
                 f"出場原因：{exit_reason}\n"
-                f"損益：{pnl_sign}{pnl_points:.2f} points\n\n"
+                f"損益：{pnl_sign}{pnl_points:.2f} points"
+                + (f"（{quantity:g} 張 ≈ {'+' if (real_pnl_usd if real_pnl_usd is not None else pnl_points * quantity) >= 0 else ''}"
+                   f"{(real_pnl_usd if real_pnl_usd is not None else pnl_points * quantity):.2f} USDT"
+                   f"{'，依真實成交價' if real_pnl_usd is not None else ''}）" if quantity else "")
+                + "\n\n"
                 f"{execution_note}"
             )
 

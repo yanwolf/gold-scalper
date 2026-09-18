@@ -362,6 +362,7 @@ class PaperTradingEngine:
                                 quality["slippage_points"], quality["spread"],
                                 book_stale=bool(signal_result.get("book_stale")),
                             )
+                            position["entry_actual_price"] = actual_fill_price  # 平倉時算真實USDT損益用
                         else:
                             # 不要靜默略過——明確講出是「成交價拿不到」還是「盤口
                             # bid/ask拿不到」，不然使用者只會看到完全沒有滑價資訊，
@@ -452,6 +453,7 @@ class PaperTradingEngine:
             skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
             logger.info(f"平倉跳過真實下單({self.label}): {skip_close_reason}")
 
+        exit_actual_price = None  # 真實平倉成交價(給USDT損益用)
         if is_execution_engine:
             try:
                 success, result = execution_module.close_position(
@@ -467,6 +469,7 @@ class PaperTradingEngine:
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
                     actual_fill_price = execution_module.extract_fill_price(result)
+                    exit_actual_price = actual_fill_price
                     quality = execution_module.analyze_execution_quality(
                         position["direction"], bid, ask, actual_fill_price, is_close=True,
                     ) if actual_fill_price else None
@@ -504,12 +507,21 @@ class PaperTradingEngine:
 
         if is_execution_engine or skip_close_reason:
             try:
+                # 真實下單引擎的出場通知附上USDT：優先用真實成交價(進出場都有actual_price時)，
+                # 否則用模擬點數×張數估算。XAUUSDT永續1張=1盎司，1點=1 USDT/張。
+                qty = float(s.get("execution_quantity", 0) or 0) if is_execution_engine else None
+                real_pnl_usd = None
+                ea, xa = position.get("entry_actual_price"), exit_actual_price
+                if qty and ea and xa and executed:
+                    real_qty = position.get("real_open_quantity") or qty
+                    real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
                 notifier_module.notifier.notify_trade_event(
                     action="close", label=self.label,
                     direction=position["direction"], price=exit_price,
                     exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
                     executed=executed, execution_error=execution_error, skip_reason=skip_close_reason,
                     account=self.execution_account, slippage_note=slippage_note,
+                    quantity=qty, real_pnl_usd=real_pnl_usd,
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")
@@ -591,6 +603,7 @@ class PaperTradingEngine:
             "execution": {
                 "enabled": circuit_breaker is not None,
                 "quantity": s.get("execution_quantity"),
+                # 1張XAUUSDT永續=1盎司，1點=1 USDT/張，dashboard用點數×張數換算USDT
                 "testnet": execution_module.status(account=self.execution_account).get("testnet") if circuit_breaker is not None else None,
             },
             "stats_spread_adjusted": stats_spread_adjusted,

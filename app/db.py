@@ -534,7 +534,9 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                            exit_reason, pnl_points, chan_reason, profile_reason,
                            entry_slippage_points, entry_spread_points,
                            exit_slippage_points, exit_spread_points,
-                           entry_book_stale, exit_book_stale
+                           entry_book_stale, exit_book_stale,
+                           real_open_executed, real_open_quantity,
+                           entry_actual_price, exit_actual_price
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -557,6 +559,14 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                 "entry_slippage_points": r[9], "entry_spread_points": r[10],
                 "exit_slippage_points": r[11], "exit_spread_points": r[12],
                 "entry_book_stale": r[13], "exit_book_stale": r[14],
+                # 真實下單資訊：dashboard用來換算USDT(只有真的送過單的交易才顯示)
+                "real_open_executed": r[15], "real_open_quantity": r[16],
+                "entry_actual_price": r[17], "exit_actual_price": r[18],
+                # 真實成交價算出的USDT損益(進出場都有真實成交價才有)
+                "real_pnl_usd": (
+                    round(((r[18] - r[17]) if r[0] == "bullish" else (r[17] - r[18])) * (r[16] or 0), 2)
+                    if r[15] and r[17] and r[18] and r[16] else None
+                ),
             }
             for r in rows
         ]
