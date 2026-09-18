@@ -650,8 +650,10 @@ async def execution_test_order(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     account = payload.get("account", "gold")
-    if not execution_module.status(account=account)["testnet"]:
-        return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
+    # 正式環境要多帶confirm_live=true才放行(dashboard會先跳紅字確認框再帶上)：
+    # 接正式金鑰後必須用程式自己的路徑打一張最小單驗證，但不能讓人手滑點到
+    if not execution_module.status(account=account)["testnet"] and not payload.get("confirm_live"):
+        return {"success": False, "error": "目前設定是正式環境(非測試網)，要在正式環境送測試單請在確認框按確定(confirm_live=true)，避免誤觸真實下單"}
 
     direction = payload.get("direction")
     quantity = payload.get("quantity", 1.0)
@@ -713,8 +715,10 @@ async def execution_test_close(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     account = payload.get("account", "gold")
-    if not execution_module.status(account=account)["testnet"]:
-        return {"success": False, "error": "目前設定是正式環境(非測試網)，這支測試用endpoint拒絕執行，避免誤觸真實下單"}
+    # 正式環境要多帶confirm_live=true才放行(dashboard會先跳紅字確認框再帶上)：
+    # 接正式金鑰後必須用程式自己的路徑打一張最小單驗證，但不能讓人手滑點到
+    if not execution_module.status(account=account)["testnet"] and not payload.get("confirm_live"):
+        return {"success": False, "error": "目前設定是正式環境(非測試網)，要在正式環境送測試單請在確認框按確定(confirm_live=true)，避免誤觸真實下單"}
 
     direction = payload.get("direction")
     if direction not in ("bullish", "bearish"):
@@ -838,6 +842,12 @@ async def backtest_run(
     strategy_type: Optional[str] = None,
     resonance_min_conditions: int = 4,
     target_step_count: Optional[int] = None,
+    smc_touch_window: Optional[int] = None,
+    smc_wt_level: Optional[float] = None,
+    smc_confirm_bos: Optional[int] = None,
+    smc_require_ema: Optional[int] = None,
+    smc_exit_mode: Optional[int] = None,
+    smc_min_rr: Optional[float] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -902,6 +912,12 @@ async def backtest_run(
         strategy_type=strategy_type,
         resonance_min_conditions=resonance_min_conditions,
         target_step_count=target_step_count,
+        smc_touch_window=smc_touch_window,
+        smc_wt_level=smc_wt_level,
+        smc_confirm_bos=smc_confirm_bos,
+        smc_require_ema=smc_require_ema,
+        smc_exit_mode=smc_exit_mode,
+        smc_min_rr=smc_min_rr,
     )
 
 

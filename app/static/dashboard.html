@@ -527,6 +527,7 @@
       <option value="chan_profile_300">5分K追蹤(纏論)</option>
       <option value="chan_profile_900" selected>15分K追蹤(纏論)</option>
       <option value="resonance_fvg_60">1分K追蹤(多條件共振，實驗性)</option>
+      <option value="smc_structure_3600">1小時K追蹤(SMC結構，實驗性)</option>
     </select>
   </div>
 
@@ -598,6 +599,7 @@
       <option value="60">1分K</option>
       <option value="300">5分K</option>
       <option value="900" selected>15分K</option>
+      <option value="3600">1小時K(SMC結構策略用)</option>
     </select>
     <select id="backtestDays">
       <option value="1">回測 1 天</option>
@@ -606,6 +608,9 @@
       <option value="7">回測 7 天</option>
       <option value="14">回測 14 天</option>
       <option value="30">回測 30 天</option>
+      <option value="90">回測 90 天(限SMC結構策略)</option>
+      <option value="180">回測 180 天(限SMC結構策略)</option>
+      <option value="365">回測 365 天(限SMC結構策略)</option>
     </select>
     <select id="backtestResolution">
       <option value="1200" selected>標準精細度(約1200步)</option>
@@ -621,6 +626,7 @@
     <select id="backtestStrategy">
       <option value="chan_profile" selected>纏論+分價量表(既有)</option>
       <option value="resonance_fvg">多條件共振+FVG(實驗性)</option>
+      <option value="smc_structure">SMC市場結構+WaveTrend(1小時K，實驗性)</option>
     </select>
     <select id="backtestResonanceThreshold">
       <option value="4" selected>4/4項條件(嚴格AND)</option>
@@ -697,6 +703,40 @@
       <div class="settings-field">
         <label>移動停損跟隨距離 (points)</label>
         <input type="number" id="backtestTrailDistance" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
+      </div>
+
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">SMC結構策略參數(只在策略選SMC時有效，留空=沿用該引擎專屬設定)</div>
+      <div class="settings-field">
+        <label>碰區域/交叉允許視窗(根1小時K)</label>
+        <input type="number" id="backtestSmcTouchWindow" placeholder="留空=沿用引擎設定(預設4)" step="1" min="1" max="12" />
+      </div>
+      <div class="settings-field">
+        <label>WaveTrend超買超賣門檻</label>
+        <input type="number" id="backtestSmcWtLevel" placeholder="留空=沿用引擎設定(預設40)" step="5" min="10" max="80" />
+      </div>
+      <div class="settings-field">
+        <label>MSS後幾次BOS確認趨勢</label>
+        <input type="number" id="backtestSmcConfirmBos" placeholder="留空=沿用引擎設定(預設2)" step="1" min="1" max="3" />
+      </div>
+      <div class="settings-field">
+        <label>要求EMA20/50同向排列</label>
+        <select id="backtestSmcRequireEma">
+          <option value="">沿用引擎設定</option>
+          <option value="1">要</option>
+          <option value="0">不要</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>出場模式</label>
+        <select id="backtestSmcExitMode">
+          <option value="">沿用引擎設定</option>
+          <option value="0">只用移動停損</option>
+          <option value="1">移動停損 + 結構停利(前一個swing點)</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>結構停利最低風報比(0=不限制)</label>
+        <input type="number" id="backtestSmcMinRr" placeholder="留空=沿用引擎設定(預設1.0)" step="0.5" min="0" max="5" />
       </div>
 
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">通用參數</div>
@@ -947,6 +987,7 @@
       <option value="chan_profile_300">5分K(纏論)</option>
       <option value="chan_profile_900" selected>15分K(纏論)</option>
       <option value="resonance_fvg_60">1分K(共振)</option>
+      <option value="smc_structure_3600">1小時K(SMC)</option>
     </select>
     <button id="slippageStatsBtn" class="btn-secondary">查詢</button>
   </div>
@@ -1115,6 +1156,12 @@ const els = {
   backtestReversalConfirm: document.getElementById('backtestReversalConfirm'),
   backtestUseChop: document.getElementById('backtestUseChop'),
   backtestChopThreshold: document.getElementById('backtestChopThreshold'),
+  backtestSmcTouchWindow: document.getElementById('backtestSmcTouchWindow'),
+  backtestSmcWtLevel: document.getElementById('backtestSmcWtLevel'),
+  backtestSmcConfirmBos: document.getElementById('backtestSmcConfirmBos'),
+  backtestSmcRequireEma: document.getElementById('backtestSmcRequireEma'),
+  backtestSmcExitMode: document.getElementById('backtestSmcExitMode'),
+  backtestSmcMinRr: document.getElementById('backtestSmcMinRr'),
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
@@ -1746,7 +1793,11 @@ els.executionIdentityBtn.addEventListener('click', async () => {
 els.executionOpenBtn.addEventListener('click', async () => {
   const pwd = getOrPromptPassword();
   if(!pwd) return;
-  if(APP_ROLE_INFO && APP_ROLE_INFO.role === 'live' && !confirm(`⚠️ 這是正式執行端，會用真錢送出 ${els.executionDirection.value === 'bullish' ? '買進' : '賣出'} ${els.executionQuantity.value} 張 XAU 的市價單。\n\n確定要送出？`)) return;
+  let confirmLive = false;
+  if(APP_ROLE_INFO && APP_ROLE_INFO.role === 'live'){
+    if(!confirm(`⚠️ 這是正式執行端，會用真錢送出 ${els.executionDirection.value === 'bullish' ? '買進' : '賣出'} ${els.executionQuantity.value} 張 XAU 的市價單。\n\n確定要送出？`)) return;
+    confirmLive = true;
+  }
   els.executionOpenBtn.disabled = true;
   showExecutionResult('送出中...', false);
   try{
@@ -1758,6 +1809,7 @@ els.executionOpenBtn.addEventListener('click', async () => {
         direction: els.executionDirection.value,
         quantity: parseFloat(els.executionQuantity.value),
         account: els.executionAccount.value,
+        confirm_live: confirmLive,
       }),
     });
     const data = await res.json();
@@ -1784,14 +1836,18 @@ function formatExecutionQuality(q){
 els.executionCloseBtn.addEventListener('click', async () => {
   const pwd = getOrPromptPassword();
   if(!pwd) return;
-  if(APP_ROLE_INFO && APP_ROLE_INFO.role === 'live' && !confirm('⚠️ 這是正式執行端，會用真錢送出市價平倉單。確定？')) return;
+  let confirmLive = false;
+  if(APP_ROLE_INFO && APP_ROLE_INFO.role === 'live'){
+    if(!confirm('⚠️ 這是正式執行端，會用真錢送出市價平倉單。確定？')) return;
+    confirmLive = true;
+  }
   els.executionCloseBtn.disabled = true;
   showExecutionResult('送出中...', false);
   try{
     const res = await fetch('/execution/test-close', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwd, direction: els.executionDirection.value, account: els.executionAccount.value }),
+      body: JSON.stringify({ password: pwd, direction: els.executionDirection.value, account: els.executionAccount.value, confirm_live: confirmLive }),
     });
     const data = await res.json();
     if(data.success){
@@ -2174,6 +2230,84 @@ function renderTradeList(el, trades, settingsChangedAt){
   el.innerHTML = rows.join('');
 }
 
+// --- 回測參數一鍵套用到模擬引擎 ---
+// 回測結果(data)裡帶的就是這次實際生效的每個參數(留空的欄位已經被後端補成正式設定值)，
+// 所以直接把它們整組寫成目標引擎的專屬覆寫，不用使用者再一個一個抄。
+function backtestResultToEngineValues(data){
+  const values = {
+    paper_use_atr_stops: data.use_atr ? 1 : 0,
+    paper_atr_sl_multiplier: data.atr_sl_multiplier,
+    paper_atr_trigger_multiplier: data.atr_trigger_multiplier,
+    paper_atr_trail_multiplier: data.atr_trail_multiplier,
+    paper_sl_points: data.sl_points,
+    paper_trail_trigger_points: data.trail_trigger_points,
+    paper_trail_distance_points: data.trail_distance_points,
+    paper_reversal_confirm_count: data.reversal_confirm_count,
+    paper_use_chop_filter: data.use_chop_filter ? 1 : 0,
+    paper_chop_threshold: data.chop_threshold,
+    paper_block_market_closed: data.block_market_closed ? 1 : 0,
+    paper_min_atr_points: data.min_atr_points,
+    paper_trend_filter_mode: data.trend_filter_mode,
+    paper_trend_interval_seconds: data.trend_interval_seconds,
+    paper_trend_slow_multiplier: data.trend_slow_multiplier,
+  };
+  if(data.smc_cfg){
+    values.smc_touch_window = data.smc_cfg.touch_window;
+    values.smc_wt_level = data.smc_cfg.wt_level;
+    values.smc_confirm_bos = data.smc_cfg.confirm_bos;
+    values.smc_require_ema = data.smc_cfg.require_ema ? 1 : 0;
+    values.smc_exit_mode = data.smc_cfg.exit_mode;
+    values.smc_min_rr = data.smc_cfg.min_rr;
+  }
+  Object.keys(values).forEach(k => { if(values[k] === undefined || values[k] === null || Number.isNaN(Number(values[k]))) delete values[k]; });
+  return values;
+}
+
+let lastBacktestResult = null;
+function setupBacktestApply(data){
+  lastBacktestResult = data;
+  const sel = document.getElementById('backtestApplyEngine');
+  if(!sel) return;
+  // 引擎清單直接沿用模擬單面板的下拉(同一份engine_id)，預設選「跟這次回測同策略同週期」的引擎
+  sel.innerHTML = Array.from(els.paperInterval.options).map(o => `<option value="${o.value}">${o.textContent}</option>`).join('');
+  const guess = data.strategy_type === 'smc_structure' ? 'smc_structure_3600' : `${data.strategy_type}_${data.signal_interval_seconds}`;
+  if(Array.from(sel.options).some(o => o.value === guess)) sel.value = guess;
+  const out = document.getElementById('backtestApplyResult');
+  if(out){ out.textContent = ''; out.className = 'notify-result'; }
+}
+
+document.addEventListener('click', async (ev) => {
+  if(!ev.target || ev.target.id !== 'backtestApplyBtn') return;
+  const btn = ev.target;
+  const out = document.getElementById('backtestApplyResult');
+  if(!lastBacktestResult){ out.textContent = '先跑一次回測'; return; }
+  const engineId = document.getElementById('backtestApplyEngine').value;
+  const values = backtestResultToEngineValues(lastBacktestResult);
+  const stratMismatch = (lastBacktestResult.strategy_type === 'smc_structure') !== engineId.startsWith('smc_structure');
+  const msg = `要把這組回測參數(${Object.keys(values).length} 個)套用到引擎 ${engineId} 嗎？`
+    + (stratMismatch ? '\n\n注意：回測策略跟目標引擎的策略不同，SMC專屬參數只有SMC引擎會讀。' : '')
+    + '\n該引擎績效統計會重新分界。';
+  if(!confirm(msg)) return;
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  btn.disabled = true;
+  try{
+    const res = await fetch(`/settings/engine/${engineId}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ password: pwd, values }),
+    });
+    const d = await res.json();
+    if(d.success){
+      const a = Object.keys(d.applied).length, c = d.cleared.length;
+      out.textContent = a || c ? `已套用到 ${engineId}：覆寫 ${a} 個、清除 ${c} 個，績效統計已重新分界` : '該引擎已經是這組參數，沒有任何變更';
+      out.className = 'notify-result success';
+      if(els.paperInterval.value === engineId){ await loadEngineParams(); fetchPaperTrading(); }
+    }else{
+      out.textContent = `套用失敗：${d.error}`; out.className = 'notify-result error';
+    }
+  }catch(err){ out.textContent = `套用失敗：${err.message}`; out.className = 'notify-result error'; }
+  btn.disabled = false;
+});
+
 function renderActiveConfig(el, activeSettings, label, settingsChangedAt, excludedOldCount, circuitBreaker){
   if(!el || !activeSettings) { if(el) el.innerHTML = ''; return; }
   const s = activeSettings;
@@ -2223,9 +2357,25 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     `;
   }
 
+  // 回測結果專用：先標明策略/商品，SMC策略再列出出場模式等專屬參數，
+  // 不然兩組SMC回測(移動停損 vs 結構停利)的設定卡長得一模一樣，分不出哪張是哪張
+  let strategyHtml = '';
+  if(s._strategy_type){
+    const stratLabel = {chan_profile:'纏論+分價量表', resonance_fvg:'多條件共振+FVG', smc_structure:'SMC市場結構+WaveTrend(1小時K)'}[s._strategy_type] || s._strategy_type;
+    strategyHtml = `<div class="cfg-row"><span class="cfg-label">策略</span><span class="cfg-value on">${stratLabel}</span></div>`
+      + (s._symbol ? `<div class="cfg-row"><span class="cfg-label">商品</span><span class="cfg-value">${s._symbol}</span></div>` : '');
+    const c = s._smc_cfg;
+    if(c){
+      const exitLabel = Number(c.exit_mode) === 1 ? `移動停損 + 結構停利(RR≥${c.min_rr})` : '只用移動停損';
+      strategyHtml += `<div class="cfg-row"><span class="cfg-label">SMC出場模式</span><span class="cfg-value ${Number(c.exit_mode) === 1 ? 'on' : ''}">${exitLabel}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">SMC訊號條件</span><span class="cfg-value">視窗${c.touch_window}根 / WT門檻${c.wt_level} / BOS${c.confirm_bos}次 / EMA排列${c.require_ema ? '要' : '不要'}</span></div>`;
+    }
+  }
+
   el.innerHTML = `
     <div class="active-config-card">
       <div class="cfg-title">目前策略設定（${label}）</div>
+      ${strategyHtml}
       ${stopModeHtml}
       <div class="cfg-row"><span class="cfg-label">訊號反轉確認次數</span><span class="cfg-value">${s.paper_reversal_confirm_count}</span></div>
       ${chopHtml}${sessionHtml}${trendHtml}
@@ -2645,6 +2795,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
   'paper_block_market_closed', 'paper_min_atr_points',
   'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier',
+  'smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr',
 ];
 
 els.engineParamsToggle.addEventListener('click', () => {
@@ -2770,6 +2921,12 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
+  addIfPresent('smc_touch_window', els.backtestSmcTouchWindow);
+  addIfPresent('smc_wt_level', els.backtestSmcWtLevel);
+  addIfPresent('smc_confirm_bos', els.backtestSmcConfirmBos);
+  addIfPresent('smc_require_ema', els.backtestSmcRequireEma);
+  addIfPresent('smc_exit_mode', els.backtestSmcExitMode);
+  addIfPresent('smc_min_rr', els.backtestSmcMinRr);
   return params.toString();
 }
 
@@ -2801,9 +2958,9 @@ els.backtestRunBtn.addEventListener('click', async () => {
 
     els.backtestResult.innerHTML = `
       <div class="backtest-meta">
-        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根1分K(還原成 ${data.synthetic_trade_count} 筆合成成交)
+        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}(還原成 ${data.synthetic_trade_count} 筆合成成交)
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
-        ／ 停損/移動停損以1分K高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}
+        ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_cfg ? ` ／ SMC參數：視窗${data.smc_cfg.touch_window}、WT門檻${data.smc_cfg.wt_level}、BOS${data.smc_cfg.confirm_bos}、EMA${data.smc_cfg.require_ema ? '要' : '不要'}、出場${data.smc_cfg.exit_mode == 1 ? '結構停利' : '移動停損'}${data.smc_cfg.exit_mode == 1 ? '(RR≥' + data.smc_cfg.min_rr + ')' : ''}` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
@@ -2817,6 +2974,18 @@ els.backtestRunBtn.addEventListener('click', async () => {
         <div class="stat"><div class="lbl">最大回撤</div><div class="val mono">${data.total_trades ? data.max_drawdown_points.toFixed(2) : '--'}</div></div>
       </div>
       <div id="backtestSpreadAdjusted"></div>
+      <div class="settings-group" style="margin-top:12px;">
+        <div style="font-size:12px; color:var(--gold); margin-bottom:6px;">把這組回測參數套用到模擬引擎</div>
+        <div class="controls">
+          <select id="backtestApplyEngine"></select>
+          <button id="backtestApplyBtn" class="btn-primary">一鍵套用到此引擎(專屬覆寫)</button>
+        </div>
+        <div style="font-size:11px; color:var(--muted); margin-top:4px;">
+          會把上面「目前策略設定」卡片顯示的全部參數(停損/濾網，SMC策略再加上SMC專屬參數)寫成該引擎的專屬覆寫，需要設定密碼；
+          該引擎的績效統計會從套用那一刻重新分界。真實下單槽位(execution_*)不會被動到。
+        </div>
+        <div id="backtestApplyResult" class="notify-result"></div>
+      </div>
       <div id="backtestDrawdownPeriod"></div>
       <div class="settings-group" style="margin-top:16px;">
         <button type="button" class="settings-group-header" id="backtestTradesToggle">
@@ -2851,10 +3020,14 @@ els.backtestRunBtn.addEventListener('click', async () => {
       paper_trend_filter_mode: data.trend_filter_mode,
       paper_trend_interval_seconds: data.trend_interval_seconds,
       paper_trend_slow_multiplier: data.trend_slow_multiplier,
+      _strategy_type: data.strategy_type,
+      _symbol: data.symbol,
+      _smc_cfg: data.smc_cfg,
     };
     renderActiveConfig(document.getElementById('backtestActiveConfig'), backtestActiveSettings, `${data.backtest_days}天回測`);
 
     renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
+    setupBacktestApply(data);
     renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades);
     // 回測筆數動輒上百筆，預設收合避免把績效數字擠到看不到，要看細節再展開
     // (修正記錄見README)
@@ -2892,6 +3065,7 @@ const SETTINGS_GROUPS = [
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points',
                               'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier'] },
+  { title: 'SMC結構策略(只影響 smc_structure_3600 引擎)', keys: ['smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr'], collapsed: true },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },

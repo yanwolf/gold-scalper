@@ -159,9 +159,47 @@ FIELD_META = {
         "help": "慢線SuperTrend的ATR倍數(快線固定1.0)。倍數越大越不容易翻轉、趨勢判定越保守，"
                 "但轉折時反應越慢。常見設定3.0。",
     },
+    # ---- SMC結構策略(smc_structure_3600引擎)專用，其他引擎不讀這些欄位 ----
+    "smc_touch_window": {
+        "label": "SMC：碰區域/交叉允許視窗(根1小時K)",
+        "type": "int", "step": 1, "min": 1, "max": 12,
+        "default": int(os.getenv("SMC_TOUCH_WINDOW", "4")),
+        "help": "「價格碰到OB/FVG」和「WaveTrend交叉」允許在最近幾根K內各自發生(不必同一根)。越大訊號越多但越鬆。",
+    },
+    "smc_wt_level": {
+        "label": "SMC：WaveTrend超買超賣門檻",
+        "type": "float", "step": 5, "min": 10, "max": 80,
+        "default": float(os.getenv("SMC_WT_LEVEL", "40")),
+        "help": "交叉前兩根內WaveTrend要碰到 門檻x0.6 才算「高檔死叉/低檔金叉」。越小訊號越多。",
+    },
+    "smc_confirm_bos": {
+        "label": "SMC：MSS後要幾次BOS才確認趨勢",
+        "type": "int", "step": 1, "min": 1, "max": 3,
+        "default": int(os.getenv("SMC_CONFIRM_BOS", "2")),
+        "help": "1=結構轉換後第一次突破就確認趨勢(訊號多、假翻轉多)，2=原分析者的用法。",
+    },
+    "smc_require_ema": {
+        "label": "SMC：要求EMA20/50同向排列 (1=要 / 0=不要)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("SMC_REQUIRE_EMA", "1")),
+        "help": "關掉可以多一批訊號，但少了均線趨勢濾網。",
+    },
+    "smc_exit_mode": {
+        "label": "SMC：出場模式 (0=只用移動停損 / 1=加上結構停利)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("SMC_EXIT_MODE", "0")),
+        "help": "1=進場時把目標設在趨勢方向的前一個swing點(空單=前低、多單=前高)，到了直接出場；"
+                "移動停損仍然同時運作當保護。這才是SMC原本的出場方式，移動停損版容易把利潤吐回去。",
+    },
+    "smc_min_rr": {
+        "label": "SMC：結構停利最低風報比(出場模式1才有效)",
+        "type": "float", "step": 0.5, "min": 0, "max": 5,
+        "default": float(os.getenv("SMC_MIN_RR", "1.0")),
+        "help": "目標距離/停損距離低於這個值就不進場(目標太近不值得)。0=不限制。",
+    },
     "execution_engine_index": {
-        "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
-        "type": "int", "step": 1, "min": 0, "max": 4,
+        "label": "真實下單引擎A (0=全部純模擬 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振 / 5=1小時K SMC結構)",
+        "type": "int", "step": 1, "min": 0, "max": 5,
         "default": int(os.getenv("EXECUTION_ENGINE_INDEX", "0")),
         "help": "被指定的引擎，開倉/平倉時才會同步在幣安期貨(依BINANCE_USE_TESTNET"
                 "決定測試網或正式環境)送出對應的市價單，其他引擎維持純模擬、不會下單。"
@@ -174,8 +212,8 @@ FIELD_META = {
                 "不然同一個帳戶會發生部位互相抵銷的問題。",
     },
     "execution_engine_index_2": {
-        "label": "真實下單引擎B (0=不綁 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振)",
-        "type": "int", "step": 1, "min": 0, "max": 4,
+        "label": "真實下單引擎B (0=不綁 / 1=1分K纏論 / 2=5分K纏論 / 3=15分K纏論 / 4=1分K共振 / 5=1小時K SMC結構)",
+        "type": "int", "step": 1, "min": 0, "max": 5,
         "default": int(os.getenv("EXECUTION_ENGINE_INDEX_2", "0")),
         "help": "第二個真實下單槽位，用途是讓兩個引擎同時做真實下單(例如15分K跟1分K"
                 "同時跑，加快累積滑價統計資料)。跟引擎A設成同一個編號沒有意義(等於"
@@ -334,6 +372,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_use_chop_filter", "paper_chop_threshold",
     "paper_block_market_closed", "paper_min_atr_points",
     "paper_trend_filter_mode", "paper_trend_interval_seconds", "paper_trend_slow_multiplier",
+    "smc_touch_window", "smc_wt_level", "smc_confirm_bos", "smc_require_ema", "smc_exit_mode", "smc_min_rr",
 }
 
 

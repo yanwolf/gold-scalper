@@ -30,18 +30,21 @@ from app.analysis import (
     compute_trend_filter,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
+from app import smc_structure
 
 CHAN_LOOKBACK_TRADES = 100000  # (回測/舊路徑用)從逐筆成交建K棒時的回看筆數
 CHAN_MAX_CANDLES = 600  # 即時路徑從1分鐘K棒快取取樣時，最多餵給纏論/ATR的K棒數(控制每次tick的計算量)
                               # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
                               # 也沒用，實際能用的資料量是兩者取較小值)
 
-DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" 或 "resonance_fvg"
+DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" / "resonance_fvg" / "smc_structure"
+STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure")
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                                 current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
-                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
+                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
+                                smc_candles=None, smc_cfg=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -65,6 +68,39 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     vs 品質」的取捨(修正記錄見README)。
     """
     strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
+
+    if strategy_type == "smc_structure":
+        # SMC結構策略走獨立的輕量路徑：不算纏論/分價量表(它用不到，而且長天數回測每根
+        # 1小時K都要檢查，纏論會拖垮速度)，ATR/震盪指數改用1小時K算，讓ATR停損模式仍可用。
+        # smc_candles有給(回測：預先切好、只到當下時間點)就直接用，絕不去抓REST(避免look-ahead)；
+        # 沒給(即時路徑)才用本地K棒，不夠長就補REST歷史。
+        if smc_candles is None:
+            if candles is None:
+                candles = build_candles(trades, interval_seconds=smc_structure.SMC_INTERVAL_SECONDS)
+            smc_candles = candles
+            if len(smc_candles) < smc_structure.SMC_MIN_CANDLES + 1:
+                smc_candles = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
+        smc_candles = smc_candles[-smc_structure.SMC_MAX_CANDLES:]
+        if current_price is None:
+            current_price = trades[-1]["price"] if trades else (smc_candles[-1]["close"] if smc_candles else None)
+        if smc_cfg is None:
+            # 即時路徑：SMC參數從dashboard「此引擎專屬參數」讀(settings.py的smc_*欄位)
+            from app import settings as _settings
+            smc_cfg = smc_structure.cfg_from_settings(_settings.get_settings(engine_id=smc_structure.SMC_ENGINE_ID))
+        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price, cfg=smc_cfg)
+        result["trend_filter"] = (
+            compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
+            if trend_candles else None
+        )
+        closed = smc_candles[:-1] if len(smc_candles) > 1 else smc_candles
+        result["strategy_type"] = strategy_type
+        result["atr"] = compute_atr(closed)
+        result["choppiness_index"] = compute_choppiness_index(closed)
+        result["emas"] = result["rsi"] = result["macd"] = result["fvgs"] = None
+        result["chan_detail"] = {"interval_seconds": smc_structure.SMC_INTERVAL_SECONDS,
+                                 "source_candle_count": len(smc_candles)}
+        result["profile_detail"] = {"bucket_size": bucket_size, "trade_count": 0, "profile": [], "interpretation": None}
+        return result
 
     # candles有給(即時路徑從1分鐘K棒快取取樣)就直接用，歷史長度不受成交筆數限制；
     # 沒給(回測/舊路徑)才從逐筆成交建(修正記錄見README)
@@ -179,6 +215,9 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
             "book_mid": freshness.get("book_mid"),
         }
 
+    if strategy_type == "smc_structure":
+        # SMC結構策略固定用1小時K(不管引擎的interval_seconds怎麼設)，避免誤把它掛在小週期上
+        interval_seconds = smc_structure.SMC_INTERVAL_SECONDS
     candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
     # 趨勢濾網用的大週期K棒：丟掉進行中的最後一根，只用已收盤的，方向才不會在同一根K棒內來回翻
     trend_candles = None
