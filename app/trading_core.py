@@ -54,7 +54,10 @@ def update_trailing_stop(position, current_price, trail_trigger_points, trail_di
             changed = True
 
         if position["trailing_active"]:
-            new_stop = position["peak_price"] - trail_distance_points
+            # 保本保底：ATR是每步重算的，急拉後ATR變大會把「峰值-1.8xATR」推到進場價
+            # 以下，實單就出現過「觸及移動停損」卻虧損的情況。移動停損一旦啟動，
+            # 最差就是保本出場，停損不得低於進場價(修正記錄見README)
+            new_stop = max(position["peak_price"] - trail_distance_points, position["entry_price"])
             if new_stop > position["sl_price"]:
                 position["sl_price"] = new_stop
                 changed = True
@@ -69,7 +72,7 @@ def update_trailing_stop(position, current_price, trail_trigger_points, trail_di
             changed = True
 
         if position["trailing_active"]:
-            new_stop = position["peak_price"] + trail_distance_points
+            new_stop = min(position["peak_price"] + trail_distance_points, position["entry_price"])  # 空單同樣保本保底
             if new_stop < position["sl_price"]:
                 position["sl_price"] = new_stop
                 changed = True
