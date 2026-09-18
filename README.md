@@ -2289,7 +2289,7 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 行情資料表 `gold_trades` 固定在 `public` schema、兩個角色共用，只有 lab 寫入；live 啟動時直接讀 lab 累積的歷史回填 1 分 K，DB 不夠時再用幣安 REST 的 1 分 K 補齊(`_fetch_minute_bars_from_rest`)，不用等資料收集。paper_trades / app_settings / settings_audit 等角色專屬資料表才在各自的 `APP_NAMESPACE` schema。
 
 **live角色的行為**：
-- `/backtest/*`、`/execution/test-*`、`/execution/set-leverage`、`POST /settings`、`POST /settings/engine/*` 一律403(middleware `role_gate`)
+- `/backtest/*`、`POST /settings`、`POST /settings/engine/*` 一律403(middleware `role_gate`)；`/execution/test-order`、`test-close`、`set-leverage` 保留(接正式金鑰後要用程式自己的路徑打最小單驗證)，dashboard 在 live 角色下多一道「正式環境」確認
 - dashboard 隱藏「回測／掃描」分頁、設定分頁唯讀、主畫面出現紅色控制面板：緊急停止(只擋新開倉，部位照常管理)/解除/強制平倉(走引擎正常出場流程，並自動啟動緊急停止)
 - 啟動10秒後跟交易所對帳(`_reconcile_with_exchange_on_startup`)，程式記錄與交易所部位不一致時發Telegram
 - 參數唯一入口是 `POST /settings/import`：需要密碼、格式與欄位驗證、目標引擎有部位時拒絕(force可強制)、全部寫成該引擎專屬覆寫(之後全域怎麼改都不影響)、寫 `settings_audit` 並發Telegram
@@ -2301,43 +2301,3 @@ LONG側+2各平自己1張；雙向模式訂單不帶reduceOnly；已是雙向時
 **心跳**：lab的health_monitor每輪多打一次 `LIVE_HEALTH_URL`，連續3次失敗才Telegram告警、恢復時再通知；live端自己的內部告警也會透過/health帶回來。
 
 建議上線順序：先開第二個Zeabur服務、`APP_ROLE=live` 但金鑰仍用Demo，把匯入/停止/平倉/對帳流程走一遍，再換正式金鑰。
-
-## SMC市場結構策略 (strategy_type="smc_structure"，1小時K，實驗性)
-
-參考TradingView上「Smart Money Concepts + Cipher B」的看盤法寫成的長線結構引擎，
-程式在 `app/smc_structure.py`，engine_id 是 `smc_structure_3600`，純模擬、沒綁真實下單。
-
-**規則**
-1. swing高低點(左右各5根) → MSS(結構轉換) → 連續2次BOS 才確認趨勢
-2. 供需區：OB(突破前最後一根反向K) + FVG(三根K缺口)，60根K後或被收盤價穿越即失效
-3. 觸發：趨勢方向 + 剛收盤的1小時K碰到同向OB/FVG + WaveTrend在高檔死叉/低檔金叉 + EMA20/50同向排列 → 「訊號」；
-   只差交叉 → 「關注」
-4. 初始停損：OB/FVG外緣再加0.15%(`smc.suggested_sl_points`)；移動停損沿用該引擎的專屬參數(trading_core)
-
-**資料**：結構判定至少要250根1小時K，但1分K快取只有3天(72根)，所以模組自帶REST 1小時K快取
-(`get_hourly_history`，10分鐘重抓一次)，即時路徑把REST歷史+本地最新K棒接起來用；回測用
-「視窗之前」的REST 1小時K當warmup，重播時只切step_time之前的K棒，不看未來。
-
-**改到的檔案**：`app/smc_structure.py`(新增)、`app/signal_engine.py`(策略分支+`smc_candles`參數)、
-`app/paper_trading.py`(註冊引擎、結構停損)、`app/backtest.py`(1小時K預先取樣+warmup)、
-`app/settings.py`(execution_engine_index上限改5)、`app/static/dashboard.html`(三個下拉多一個選項、回測週期多1小時)。
-
-**長天數回測**：SMC策略選超過30天(90/180/365)時，停損步自動改用15分K(其他策略仍是1分K/30天上限)，
-訊號步每根1小時K都檢查(不取樣)，warmup用視窗之前的1小時K。回測結果多一個 `stop_kline_interval` 欄位標示。
-SMC參數可用環境變數覆寫：`SMC_SWING_N` `SMC_CONFIRM_BOS` `SMC_WT_LEVEL` `SMC_ZONE_MAX_AGE` `SMC_REQUIRE_EMA`。
-
-**訊號稀疏修正**：原本要求「剛收盤那根K碰到OB/FVG」且「同一根K發生WaveTrend交叉」，一年只有三筆。
-改成兩件事在最近 `touch_window`(預設4，環境變數 `SMC_TOUCH_WINDOW`)根K內各自成立即可，交叉後WaveTrend
-不能已經翻回去。回測結果多 `smc_funnel`(dashboard回測範圍那行會顯示)：每個訊號步卡在哪一關的計數，
-用來判斷該放寬哪個條件(EMA排列 / 不在區域 / 等交叉)。
-
-**效能修正**：SMC回測原本每個訊號步都重算整段結構，365天約幾十秒，會撞到瀏覽器/閘道逾時(Safari顯示「Load failed」)。
-改成 `smc_structure.precompute()` 整段算一次因果快照(結構/EMA/WaveTrend)，每步用 `evaluate_at()` 查表，
-365天約1～2秒；即時路徑的 `generate_signal_smc()` 內部也是同兩個函式，兩邊邏輯完全一致。
-
-**SMC參數改成dashboard可調**：`settings.py` 新增 `smc_touch_window / smc_wt_level / smc_confirm_bos / smc_require_ema /
-smc_exit_mode / smc_min_rr`(TRADING_RELEVANT_KEYS，可用「此引擎專屬參數」覆寫，只有smc_structure_3600引擎會讀)，
-回測面板也有對應輸入欄位(留空=沿用引擎設定)，環境變數只剩預設值用途。
-`smc_exit_mode=1` 時進場會把目標設在趨勢方向的前一個swing點(position["tp_price"])，即時/回測都會以
-「觸及結構停利」出場；`smc_min_rr` 低於門檻的訊號會退回「關注」並在漏斗顯示「訊號但風報比不足」。
-tp_price目前只存在記憶體，服務重啟後那筆未平倉單退回只用移動停損。

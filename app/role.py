@@ -41,11 +41,12 @@ LIVE_PROXY_ALLOWED_PREFIXES = (
 )
 
 # live角色下一律拒絕的路由前綴(研究/實驗用，跟正式執行無關)
+# 注意：/execution/test-order、test-close、set-leverage 在live也開放——接正式金鑰後
+# 要用程式自己的下單路徑打一張最小單再平掉，驗證金鑰權限/IP白名單/持倉模式/數量精度，
+# 這是上線前必做的檢查，不能只靠幣安網頁手動下單(那不會經過程式的路徑)。
+# 這幾支本來就要密碼，dashboard在live角色下會再多一道「正式環境」確認。
 LAB_ONLY_PATH_PREFIXES = (
     "/backtest",
-    "/execution/test-order",
-    "/execution/test-close",
-    "/execution/set-leverage",
     "/settings/engine/",       # 專屬覆寫的直接修改/重設/清除；live要改請走 /settings/import
 )
 # live角色下拒絕的(方法, 路徑)——全域設定直接修改
