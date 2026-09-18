@@ -796,6 +796,14 @@
   <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
+  <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
+    <select id="backtestLoadSource"></select>
+    <button id="backtestLoadBtn" class="btn-secondary">📥 載入此引擎目前參數到回測</button>
+    <span id="backtestLoadResult" style="font-size:11px; color:var(--muted);"></span>
+  </div>
+  <div style="font-size:11px; color:var(--muted); margin-top:4px;">
+    把該引擎「實際生效」的停損/濾網/SMC參數(全域+專屬覆寫合併後)填進上方回測欄位，並把週期/策略切成一樣；精細度會自動選「最高」讓每根都檢查訊號，這樣才跟即時引擎的行為一致。
+  </div>
 
   <div id="backtestResult" style="margin-top:14px;"></div>
 </div>
@@ -2278,6 +2286,69 @@ function backtestResultToEngineValues(data){
   return values;
 }
 
+// 「載入引擎目前參數到回測」(修正記錄見README)：回測面板預設用環境變數值，跟正式引擎的
+// 專屬覆寫對不上(例如正式端趨勢濾網是嚴格4小時、回測面板卻是關閉)，導致回測跟實盤
+// 完全不可比。這裡直接拿 /settings/export 的「實際生效參數」回填每個欄位。
+// 來源可選本機引擎，或透過live-proxy拿正式端引擎的參數(lab才有這選項)。
+const BT_FIELD_MAP = {
+  paper_use_atr_stops: 'backtestUseAtr', paper_atr_sl_multiplier: 'backtestAtrSlMult',
+  paper_atr_trigger_multiplier: 'backtestAtrTriggerMult', paper_atr_trail_multiplier: 'backtestAtrTrailMult',
+  paper_sl_points: 'backtestSlPoints', paper_trail_trigger_points: 'backtestTrailTrigger',
+  paper_trail_distance_points: 'backtestTrailDistance', paper_reversal_confirm_count: 'backtestReversalConfirm',
+  paper_use_chop_filter: 'backtestUseChop', paper_chop_threshold: 'backtestChopThreshold',
+  paper_block_market_closed: 'backtestBlockMarketClosed', paper_min_atr_points: 'backtestMinAtr',
+  paper_trend_filter_mode: 'backtestTrendMode', paper_trend_interval_seconds: 'backtestTrendInterval',
+  paper_trend_slow_multiplier: 'backtestTrendSlowMult',
+  smc_touch_window: 'backtestSmcTouchWindow', smc_wt_level: 'backtestSmcWtLevel',
+  smc_confirm_bos: 'backtestSmcConfirmBos', smc_require_ema: 'backtestSmcRequireEma',
+  smc_exit_mode: 'backtestSmcExitMode', smc_min_rr: 'backtestSmcMinRr',
+};
+function setupBacktestLoadSource(){
+  const sel = document.getElementById('backtestLoadSource');
+  if(!sel || sel.options.length) return;
+  const local = Array.from(els.paperInterval.options).map(o => `<option value="local:${o.value}">本機 ${o.textContent}</option>`);
+  const live = (window.LIVE_ENGINE_IDS || []).map(id => `<option value="live:${id}">🟡 正式端 ${id}</option>`);
+  sel.innerHTML = live.concat(local).join('');
+}
+document.addEventListener('click', async (ev) => {
+  if(!ev.target || ev.target.id !== 'backtestLoadBtn') return;
+  const out = document.getElementById('backtestLoadResult');
+  const [src, engineId] = document.getElementById('backtestLoadSource').value.split(':');
+  const url = (src === 'live' ? '/live-proxy' : '') + `/settings/export?engine_id=${encodeURIComponent(engineId)}`;
+  out.textContent = '載入中...';
+  try{
+    const res = await fetch(url);
+    const ps = await res.json();
+    if(ps.error) throw new Error(ps.error);
+    const params = ps.params || {};
+    let filled = 0;
+    for(const [key, elId] of Object.entries(BT_FIELD_MAP)){
+      const el = document.getElementById(elId);
+      if(!el || params[key] == null) continue;
+      const v = String(params[key]);
+      if(el.tagName === 'SELECT'){
+        const opt = Array.from(el.options).find(o => o.value === v || Number(o.value) === Number(v));
+        if(opt){ el.value = opt.value; filled++; }
+      }else{ el.value = v; filled++; }
+    }
+    // 週期/策略跟引擎對齊；精細度選最高，避免「每2根才檢查一次訊號」跟即時引擎逐根檢查的差異
+    const m = engineId.match(/^(.*)_(\d+)$/);
+    if(m){
+      const ivOpt = Array.from(els.backtestInterval.options).find(o => o.value === m[2]);
+      if(ivOpt) els.backtestInterval.value = m[2];
+      const stOpt = Array.from(els.backtestStrategy.options).find(o => o.value === m[1]);
+      if(stOpt) els.backtestStrategy.value = m[1];
+    }
+    if(els.backtestResolution){
+      const maxOpt = Array.from(els.backtestResolution.options).reduce((a,b)=>Number(b.value)>Number(a.value)?b:a);
+      els.backtestResolution.value = maxOpt.value;
+    }
+    const body = document.getElementById('backtestParamsBody');
+    if(body && body.style.display === 'none'){ body.style.display = ''; const c = document.getElementById('backtestParamsCaret'); if(c) c.textContent = '▾'; }
+    out.textContent = `已載入 ${filled} 個參數(${ps.version || ''})，精細度已設為最高，按「執行回測」`;
+  }catch(e){ out.textContent = `載入失敗：${e.message}`; }
+});
+
 let lastBacktestResult = null;
 function setupBacktestApply(data){
   lastBacktestResult = data;
@@ -2607,6 +2678,7 @@ async function loadAppRole(){
     const res = await fetch('/app/role');
     APP_ROLE_INFO = await res.json();
   }catch(err){ return; }
+  setupBacktestLoadSource();
   const banner = document.getElementById('roleBanner');
   const isLive = APP_ROLE_INFO.role === 'live';
   banner.className = 'role-banner ' + (isLive ? 'live' : 'lab');
@@ -2659,6 +2731,9 @@ async function refreshLiveRole(){
     const current = sel.value;
     sel.innerHTML = (LIVE_INFO.active_engines || []).map(e => `<option value="${e}">${e}</option>`).join('');
     if(current && (LIVE_INFO.active_engines||[]).includes(current)) sel.value = current;
+    window.LIVE_ENGINE_IDS = LIVE_INFO.active_engines || [];
+    const bsel = document.getElementById('backtestLoadSource');
+    if(bsel){ bsel.innerHTML = ''; setupBacktestLoadSource(); }
     renderLiveControlStatus(LIVE_INFO.manual_halt);
   }catch(err){
     document.getElementById('liveRoleLine').textContent = `連不到正式端：${err.message}`;

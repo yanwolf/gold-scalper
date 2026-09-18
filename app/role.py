@@ -36,7 +36,7 @@ if not LIVE_BASE_URL and LIVE_HEALTH_URL.endswith("/health"):
 # lab代理到live時允許的路徑前綴(只開正式端監看/控制需要的那幾支)
 LIVE_PROXY_ALLOWED_PREFIXES = (
     "/app/role", "/health", "/paper-trading/", "/signal/latest",
-    "/control/", "/settings/import", "/settings/audit", "/settings/engine/",
+    "/control/", "/settings/import", "/settings/export", "/settings/audit", "/settings/engine/",
     "/execution/positions", "/execution/balance", "/execution/open-orders",
 )
 
