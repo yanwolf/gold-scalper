@@ -537,13 +537,21 @@ class PaperTradingEngine:
                 if qty and ea and xa and executed:
                     real_qty = position.get("real_open_quantity") or qty
                     real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
+                # 停損出場時附上「當時的停損位/峰值/出場價與停損位的差」，才分得出是
+                # 停損位本身設在那裡，還是價格跳空穿過停損位(15秒輪詢一次會有落差)
+                stop_note = None
+                if "停損" in (exit_reason or ""):
+                    gap = (position["sl_price"] - exit_price) if position["direction"] == "bullish" else (exit_price - position["sl_price"])
+                    stop_note = (f"停損位 {position['sl_price']:.2f}（峰值 {position['peak_price']:.2f}，"
+                                 f"移動停損{'已' if position.get('trailing_active') else '未'}啟動）"
+                                 f"，出場價穿過停損位 {gap:.2f} 點")
                 notifier_module.notifier.notify_trade_event(
                     action="close", label=self.label,
                     direction=position["direction"], price=exit_price,
                     exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
                     executed=executed, execution_error=execution_error, skip_reason=skip_close_reason,
                     account=self.execution_account, slippage_note=slippage_note,
-                    quantity=qty, real_pnl_usd=real_pnl_usd,
+                    quantity=qty, real_pnl_usd=real_pnl_usd, stop_note=stop_note,
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")
