@@ -172,6 +172,7 @@ class BinanceGoldStreamer:
         self._watchdog_thread = None
         self._watchdog_stop_flag = threading.Event()
         self._flush_stop_flag = threading.Event()
+        self._price_listeners = []  # 給paper_trading.py註冊「每次報價更新都立刻檢查停損」用
 
     @property
     def status(self):
@@ -301,6 +302,17 @@ class BinanceGoldStreamer:
         with self._lock:
             return list(self._trade_history)[-limit:]
 
+    def add_price_listener(self, callback):
+        """
+        註冊一個callback(bid, ask)，每次bookTicker(買一/賣一)更新就會被呼叫一次——
+        這是sub-second頻率，遠比15秒一次的模擬單tick快很多。用途是讓停損檢查不用
+        等到下一次tick才發現價格已經穿過停損位，縮短「價格已觸發但還沒被偵測到」
+        的視窗，減少非策略造成的額外損失(修正記錄見README)。callback裡不能是
+        耗時操作(不能重新算指標)，只能做輕量的價格比較，且必須自己處理例外——
+        這裡呼叫時已經包了try/except，一個callback壞掉不會拖垮報價串流本身。
+        """
+        self._price_listeners.append(callback)
+
     def _handle_book_ticker(self, data):
         tick = {
             "time": data.get("E"),
@@ -312,6 +324,17 @@ class BinanceGoldStreamer:
         with self._lock:
             self._latest_price = tick
             self._tick_history.append(tick)
+        if self._price_listeners:
+            try:
+                bid = float(tick["bid"]) if tick["bid"] is not None else None
+                ask = float(tick["ask"]) if tick["ask"] is not None else None
+            except (TypeError, ValueError):
+                return
+            for cb in self._price_listeners:
+                try:
+                    cb(bid, ask)
+                except Exception as e:
+                    logger.error(f"快速停損檢查callback失敗: {e}")
 
     def _handle_agg_trade(self, data):
         # aggTrade 欄位: p=成交價, q=成交量, T=成交時間(ms), m=是否為賣方主動成交(maker)

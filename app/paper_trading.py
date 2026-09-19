@@ -74,6 +74,7 @@ class PaperTradingEngine:
         self._seeded_from_db = False
         self._last_tick_at = None  # 給health_monitor.py檢查引擎是否還活著用
         self._circuit_breaker_alerted = False  # 避免風控斷路器每次被觸發都重複發送警示
+        self._fast_stop_registered = False
 
     @property
     def last_tick_at(self):
@@ -97,12 +98,65 @@ class PaperTradingEngine:
                 self._position = db.get_open_paper_trade(engine_id=self.engine_id)
             self._seeded_from_db = True
 
+        if not self._fast_stop_registered:
+            # 快速停損監控：掛在幣安bookTicker(買一/賣一)串流上，sub-second更新，
+            # 遠快於15秒一次的模擬單tick。只做「現價有沒有穿過停損位」這件輕量比較，
+            # 不重算指標；找到觸發就直接平倉，把「價格已觸發但還沒偵測到」的視窗從
+            # 最多15秒縮短到接近即時，藉此減少非策略造成的滑價損失(修正記錄見README)。
+            from app.binance_client import binance_streamer
+            binance_streamer.add_price_listener(self._fast_stop_check)
+            self._fast_stop_registered = True
+
         if self._thread and self._thread.is_alive():
             return
         self._stop_flag.clear()
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
         logger.info(f"模擬單追蹤引擎已啟動({self.label}，{self.strategy_type}策略，移動停損模式)")
+
+    def _try_claim_close(self, position):
+        """
+        原子性地「認領」關掉這筆倉位的權利：只有self._position現在確實還是傳入的
+        這個物件時才成功、並立刻清空self._position，回傳True。用來避免快速停損
+        監控(每次報價都可能觸發)跟正常15秒tick同時判斷「該出場了」，對同一筆倉位
+        重複呼叫_close_position、送出兩次真實平倉單(修正記錄見README)。
+        """
+        with self._lock:
+            if self._position is not position:
+                return False
+            self._position = None
+            return True
+
+    def _fast_stop_check(self, bid, ask):
+        """
+        掛在binance_streamer報價串流上的快速停損檢查(見start()裡的說明)。只判斷
+        「現價有沒有穿過停損位」，不判斷訊號反轉/9EMA動態防守/結構停利等需要重算
+        指標的出場條件，那些仍交給正常的15秒tick處理。
+        """
+        position = self._position  # 讀取不需要鎖：dict物件參照，最壞情況只是比對到一瞬間前的狀態
+        if not position:
+            return
+        direction = position["direction"]
+        sl_price = position.get("sl_price")
+        if sl_price is None:
+            return
+        if direction == "bullish":
+            price = bid  # 多單出場是賣出，用買一(bid)判斷跟成交
+            if price is None or price > sl_price:
+                return
+        else:
+            price = ask  # 空單出場是買回，用賣一(ask)判斷跟成交
+            if price is None or price < sl_price:
+                return
+        if not self._try_claim_close(position):
+            return
+        reason = "觸及移動停損" if position.get("trailing_active") else "觸及停損"
+        logger.info(f"快速停損觸發({self.label}): 現價{price:.2f} 穿過停損位{sl_price:.2f}")
+        # 平倉牽涉真實下單/資料庫寫入/Telegram，不能佔用bookTicker串流的處理thread
+        # (那個thread要一直空著去接下一筆報價)，丟到背景thread執行(修正記錄見README)
+        threading.Thread(
+            target=self._close_position, args=(position, price, reason), kwargs={"bid": bid, "ask": ask}, daemon=True,
+        ).start()
 
     def stop(self):
         self._stop_flag.set()
@@ -168,7 +222,8 @@ class PaperTradingEngine:
             tp = position.get("tp_price")
             if tp and ((position["direction"] == "bearish" and current_price <= tp)
                        or (position["direction"] == "bullish" and current_price >= tp)):
-                self._close_position(position, current_price, "觸及結構停利", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
+                if self._try_claim_close(position):
+                    self._close_position(position, current_price, "觸及結構停利", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
                 position = None
         if position:
             changed = trading_core.update_trailing_stop(
@@ -184,7 +239,10 @@ class PaperTradingEngine:
                 reversal_confirm_count=s["paper_reversal_confirm_count"],
             )
             if exit_reason:
-                self._close_position(position, current_price, exit_reason, bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
+                # 這裡才第一次呼叫claim：如果快速停損監控已經在這之前搶先關掉這筆倉位，
+                # _try_claim_close會失敗，這裡就不會重複平倉(修正記錄見README)
+                if self._try_claim_close(position):
+                    self._close_position(position, current_price, exit_reason, bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
                 position = None
 
         if position is None and result["stage"] == "訊號" and result["direction"]:
@@ -436,6 +494,8 @@ class PaperTradingEngine:
         if not trades:
             return False, "拿不到最新價格，無法平倉"
         price = trades[-1]["price"]
+        if not self._try_claim_close(position):
+            return False, "這筆部位剛好被快速停損監控同時關閉，未重複下單"
         self._close_position(position, price, reason)
         return True, f"已以 {price} 平倉({reason})"
 
