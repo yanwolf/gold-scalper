@@ -2227,6 +2227,12 @@ function renderTradeList(el, trades, settingsChangedAt){
       ? ` <span style="font-size:0.85em; opacity:.85;">(${t.real_pnl_usd >= 0 ? '+' : ''}${t.real_pnl_usd.toFixed(2)} U 實)</span>`
       : (t.real_open_executed ? usdTag(t.pnl_points, t.real_open_quantity || CURRENT_EXEC_QTY) : '');
     const pnlText = `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}${usdPart}`;
+    // 停損出場：附上出場當下的停損位跟峰值，出場價離停損位很遠=價格跳空、停損位低於進場價=保本沒生效
+    let stopInfo = '';
+    if((t.exit_reason || '').includes('停損') && t.sl_price != null){
+      const gap = t.direction === 'bullish' ? (t.sl_price - t.exit_price) : (t.exit_price - t.sl_price);
+      stopInfo = `<div style="font-size:10px; color:var(--muted); margin-top:2px;">停損位 ${t.sl_price.toFixed(2)}${t.peak_price != null ? ` · 峰值 ${t.peak_price.toFixed(2)}` : ''} · 移動停損${t.trailing_active ? '已' : '未'}啟動 · 出場價穿過停損位 ${gap.toFixed(2)} 點</div>`;
+    }
     const exitTime = t.exit_time ? new Date(t.exit_time).toLocaleString('zh-TW') : '';
     const entryMs = t.entry_time ? new Date(t.entry_time).getTime() : null;
 
@@ -2244,7 +2250,7 @@ function renderTradeList(el, trades, settingsChangedAt){
       ${dividerHtml}
       <div class="paper-trade-row ${isOld ? 'is-old-settings' : ''}">
         <span class="dir ${t.direction}">${dirLabel}</span>
-        <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）</span>
+        <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）${stopInfo}</span>
         <span class="pnl ${pnlClass}">${pnlText}</span>
       </div>
     `;
