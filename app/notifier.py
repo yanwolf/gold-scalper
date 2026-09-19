@@ -115,9 +115,17 @@ class TelegramNotifier:
         else:
             execution_note = "（目前僅模擬單，未接自動下單）"
 
+        # 標題依「這筆有沒有真的成交」決定：真實成交的叫「正式單/測試網單」，其他情況
+        # (下單失敗、被風控擋、純模擬)才叫「模擬單」，避免正式單通知還掛著模擬單字樣
+        if executed is True:
+            from app import execution as execution_module
+            order_kind = "黃金測試網單" if execution_module.use_testnet(account) else "黃金正式單"
+        else:
+            order_kind = "黃金模擬單"
+
         if action == "open":
             text = (
-                f"🟢 黃金模擬單【{label}】進場\n"
+                f"🟢 {order_kind}【{label}】進場\n"
                 f"方向：{direction_label}\n"
                 f"時間：{now_str}\n"
                 f"價格：{price:.2f}\n\n"
@@ -127,7 +135,7 @@ class TelegramNotifier:
             pnl_sign = "+" if (pnl_points or 0) >= 0 else ""
             pnl_emoji = "🟢" if (pnl_points or 0) >= 0 else "🔴"
             text = (
-                f"{pnl_emoji} 黃金模擬單【{label}】出場\n"
+                f"{pnl_emoji} {order_kind}【{label}】出場\n"
                 f"方向：{direction_label}\n"
                 f"時間：{now_str}\n"
                 f"價格：{price:.2f}\n"
