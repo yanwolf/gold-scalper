@@ -111,6 +111,14 @@ def _reconcile_with_exchange_on_startup():
         except Exception as e:
             lines.append(f"{engine.label}: 對帳時發生錯誤 {e}")
     if lines:
+        # 對帳訊息順便帶帳戶餘額，手機上一眼看到真錢還剩多少(修正記錄見README)
+        try:
+            from app import execution as _exec
+            bal_line = _exec.usdt_balance_line()
+            if bal_line:
+                lines.append(bal_line)
+        except Exception:
+            pass
         text = "🟡 正式端啟動對帳\n" + "\n".join(lines)
         logger.info(text)
         if notifier.is_enabled:

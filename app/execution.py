@@ -539,6 +539,28 @@ def get_account_balance(account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v2/balance", account=account)
 
 
+def usdt_balance_line(account=DEFAULT_ACCOUNT):
+    """
+    回傳一行「帳戶餘額」文字給Telegram用(出場通知/啟動對帳)，例如
+    「帳戶餘額：999.34 USDT(未實現 +0.28)」。查不到就回None、不影響主流程。
+    """
+    try:
+        ok, result = get_account_balance(account=account)
+        if not ok or not isinstance(result, list):
+            return None
+        for row in result:
+            if row.get("asset") == "USDT":
+                bal = float(row.get("balance", 0) or 0)
+                upnl = float(row.get("crossUnPnl", 0) or 0)
+                text = f"帳戶餘額：{bal:.2f} USDT"
+                if abs(upnl) >= 0.005:
+                    text += f"(未實現 {'+' if upnl >= 0 else ''}{upnl:.2f})"
+                return text
+    except Exception:
+        return None
+    return None
+
+
 def get_position_info(symbol=None, account=DEFAULT_ACCOUNT):
     symbol = _resolve_symbol(symbol)
     return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, account=account)

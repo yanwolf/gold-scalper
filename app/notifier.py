@@ -107,6 +107,11 @@ class TelegramNotifier:
             execution_note = f"（已同步在幣安{env_label}下單，帳戶：{account}）"
             if slippage_note:
                 execution_note += f"\n{slippage_note}"
+            if action == "close":
+                # 真實平倉後附上帳戶餘額，這才是扣掉手續費/滑點的淨值(修正記錄見README)
+                bal_line = execution_module.usdt_balance_line(account)
+                if bal_line:
+                    execution_note += f"\n💰 {bal_line}"
         elif executed is False:
             error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
             execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"
