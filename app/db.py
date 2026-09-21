@@ -213,6 +213,15 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS real_open_baseline DOUBLE PRECISION;
                 """)
+                # 開倉單號與成交明細的起始界線(第8條r34)：存進資料庫，服務重啟後出場價才查得到
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS real_open_order_id BIGINT;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS fill_boundary_id BIGINT;
+                """)
                 cur.execute("""
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS backstop_used_legacy BOOLEAN;
@@ -457,6 +466,23 @@ def update_paper_trade_stop(trade_id, sl_price, peak_price, trailing_active):
         logger.error(f"更新移動停損失敗: {e}")
 
 
+def update_paper_trade_fills(trade_id, order_id, boundary_id):
+    """記下開倉單號與成交明細的起始界線(第8條r34)。trade_id是None時跳過。"""
+    if not _enabled or trade_id is None:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE paper_trades SET real_open_order_id = %s, fill_boundary_id = %s WHERE id = %s;",
+                            (order_id, boundary_id, trade_id))
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"記錄成交明細界線失敗: {e}")
+
+
 def update_paper_trade_baseline(trade_id, baseline):
     """記下送單前這一側原有的數量(基準，第3條r16)。trade_id是None時跳過。"""
     if not _enabled or trade_id is None:
@@ -551,7 +577,8 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                            chan_reason, profile_reason, interval_seconds, engine_id,
                            real_open_executed, real_open_quantity,
-                           backstop_algo_id, backstop_used_legacy, real_open_baseline
+                           backstop_algo_id, backstop_used_legacy, real_open_baseline,
+                           real_open_order_id, fill_boundary_id
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -573,6 +600,7 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             # 服務重啟後要能認回這張backstop停損單(平倉時才知道要撤哪張)(修正記錄見README)
             "backstop_algo_id": row[13], "backstop_used_legacy": row[14],
             "real_open_baseline": row[15] or 0.0,
+            "real_open_order_id": row[16], "fill_boundary_id": row[17],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")

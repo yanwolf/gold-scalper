@@ -39,10 +39,19 @@ def _all_tests():
     return out
 
 
+CRASHED = set()
+
+
 def _run(name):
+    """跑一項；測試程式本身拋錯(不是斷言失敗、也不是被測程式拋的)另外記下(用法第5點r34)。"""
     cls, meth = name.split(".")
-    return unittest.TextTestRunner(stream=open("/dev/null", "w")).run(
-        unittest.TestSuite([getattr(T, cls)(meth)])).wasSuccessful()
+    res = unittest.TestResult()
+    unittest.TestSuite([getattr(T, cls)(meth)]).run(res)
+    for _, tb in res.errors:
+        frames = [l for l in tb.splitlines() if 'File "' in l]
+        if frames and "tests/test_lessons.py" in frames[-1]:
+            CRASHED.add(name)
+    return res.wasSuccessful()
 
 
 def run_mutated():
@@ -116,6 +125,8 @@ def main():
     mutated = run_mutated()
     normal_pass = {n: _run(n) for n in {c for _, c, _ in EXEMPT.values()}}
     problems, unrelated = check(EXEMPT, mutated, normal_pass)
+    # 突變下測試本身崩掉：後面的斷言沒被檢查、失敗訊息看不出是哪個前提不成立(用法第5點r34)
+    problems += [f"突變下測試本身崩掉：{n}(索引前先確認有東西)" for n in sorted(CRASHED)]
     failed = [n for n, (p, _) in mutated.items() if not p]
     print(f"全部 {len(mutated)} 項：突變下明確失敗 {len(failed)} 項、無關(未呼叫被突變查詢) {len(unrelated)} 項、"
           f"經驗證的豁免 {len(EXEMPT)} 項")

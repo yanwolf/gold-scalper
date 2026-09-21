@@ -36,6 +36,14 @@ def apply(changes):
         if n != count:
             sys.exit(f"apply中止(一個檔都沒寫)：第{i + 1}處 {path} 預期命中{count}次，實際{n}次：{old[:80]!r}")
         texts[path] = texts[path].replace(old, new)
+    # 寫入前先把每個.py檔在記憶體裡編譯一次：全部命中不代表改完是合法程式(兩行黏在一起、
+    # 字串串接少了+)，以前要等寫進去之後py_compile才抓到。語法錯就一個檔都不寫
+    for path, text in texts.items():
+        if path.endswith(".py"):
+            try:
+                compile(text, path, "exec")
+            except SyntaxError as e:
+                sys.exit(f"apply中止(一個檔都沒寫)：改完的 {path} 有語法錯誤(第{e.lineno}行)：{e.msg}")
     for path, text in texts.items():
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
@@ -68,7 +76,12 @@ def selftest():
     with open(a, "w", encoding="utf-8") as f:
         f.write("    def f():\n        return 1\n    x = 2\n")
     r4 = exact(a, "def f():", 2) == "    def f():\n        return 1\n"
-    return {"第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4}
+    p = os.path.join(d, "c.py")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("x = (1\n     + 2)\n")
+    r5 = aborted([(p, "     + 2)\n", "     2)\n")]) and open(p, encoding="utf-8").read() == "x = (1\n     + 2)\n"
+    return {"第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4,
+            "改完有語法錯誤時一個檔都不寫": r5}
 
 
 def exact(path, first_line_contains, n_lines):

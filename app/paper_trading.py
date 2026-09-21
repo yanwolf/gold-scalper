@@ -406,6 +406,12 @@ class PaperTradingEngine:
         # 每一步各自try(第8條r19)：前一步出錯不能讓這個部位的停損守衛跳過
         if pos.get("real_open_pending_until"):
             self._run_step("開倉確認", self._resolve_open_pending, pos)
+        elif pos.get("real_open_executed") is None and \
+                self._is_execution_engine(settings_module.get_settings(engine_id=self.engine_id)):
+            # 結果不明、而且沒有確認期限(服務重啟後記憶體裡的期限不見了、或修正前的舊部位)：
+            # 以前這裡什麼都不做——不確認、不掛停損、不比對數量，永遠卡著也沒有訊息(第8條r33)。
+            # 缺期限當成已經逾時：逐幣確認，有就認領、沒有就判定未成交
+            self._run_step("開倉確認", self._resolve_open_pending, pos)
         if pos.get("pending_close"):
             # 平倉單沒確認成交：每輪直接重試(第8條r13)，不等下一根K棒再觸發出場。
             # 等待期間交易所停損照常保留並對齊。
@@ -452,6 +458,30 @@ class PaperTradingEngine:
         pos.pop("backstop_price", None)
         return "replaced:" + str(self._sync_backstop(pos))
 
+    def _record_fill_boundary(self, position, latest=False):
+        """
+        開倉成交後、認領當下，記下成交明細的起始界線(第8條r34)並存進資料庫：之後的平倉成交只看這個id之後的。
+        以前是平倉時才去最近100筆裡找開倉那筆——持倉期間成交一多就找不到，重啟後也沒有。
+          - 一般開倉：開倉那張單最後一筆成交的id；那張單的成交還沒出現時，用當下最後一筆的id
+            (開倉成交是同方向，不會被當成平倉，所以界線早一點沒關係)
+          - 認領(latest=True)：當下最後一筆的id——開倉單號不知道，認領之前的都不算
+        查不到就不記，之後平倉時記未知(不會退成0，第8條r34)。不能丟例外：這是成交之後的步驟。
+        """
+        try:
+            ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
+            if not ok or not isinstance(trades, list) or not trades:
+                return
+            ids = [int(t["id"]) for t in trades if isinstance(t.get("id"), (int, float)) or str(t.get("id", "")).isdigit()]
+            oid = position.get("real_open_order_id")
+            own = [int(t["id"]) for t in trades if not latest and oid is not None and str(t.get("orderId")) == str(oid)]
+            boundary = max(own) if own else (max(ids) if ids else None)
+            if boundary is None:
+                return
+            position["fill_boundary_id"] = boundary
+            db.update_paper_trade_fills(position.get("id"), position.get("real_open_order_id"), boundary)
+        except Exception as e:
+            logger.error(f"記錄成交明細界線失敗({self.label})，平倉時出場價會記未知: {e}")
+
     def _closing_fills(self, position, want_qty):
         """
         從成交明細挑出這筆部位的平倉成交(第8條r30/r31)，回傳(status, 均價, 數量, 最後採用的id, 說明)：
@@ -467,6 +497,12 @@ class PaperTradingEngine:
         if not ok or not isinstance(trades, list):
             return "unknown", None, 0.0, None, f"成交明細查不到：{trades}"
         boundary = position.get("fill_boundary_id")
+        if boundary is not None and not isinstance(boundary, int):
+            # 缺值不能退成0(第8條r34)：界線是0時，這個幣歷史上所有平倉成交都會被算成這筆的出場——不是未知，是算錯
+            if isinstance(boundary, float) and boundary.is_integer():
+                boundary = int(boundary)
+            else:
+                return "unknown", None, 0.0, None, f"界線不是數字({boundary!r})"
         if boundary is None:
             oid = position.get("real_open_order_id")
             opens = [int(t["id"]) for t in trades if oid is not None and str(t.get("orderId")) == str(oid)]
@@ -514,14 +550,19 @@ class PaperTradingEngine:
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
                 f"數量：{claimed}(取自交易所)　均價：{entry if base <= 1e-9 else '與既有部位合併，無法單獨取得'}"
             )
+            self._record_fill_boundary(position, latest=True)
             # 認領回來的部位一定還沒掛停損，當場掛(第3條r13)；交易所那一列就是證據，不重查(第2條r22)
             return "claimed:" + str(self._sync_backstop(position, known_qty=claimed))
-        elif time.time() > (position.get("real_open_pending_until") or 0):
+        elif not isinstance(position.get("real_open_pending_until"), (int, float)) or \
+                time.time() > position["real_open_pending_until"]:
+            had_deadline = isinstance(position.get("real_open_pending_until"), (int, float))
             position["real_open_executed"] = False
             position.pop("real_open_pending_until", None)
             db.update_paper_trade_real_open(position.get("id"), False, None)
             self._backstop_alert(
-                f"ℹ️ {self.label} 送單結果不明的開倉，{OPEN_PENDING_SECONDS}秒內交易所都沒有對應部位，判定未成交\n"
+                (f"ℹ️ {self.label} 送單結果不明的開倉，{OPEN_PENDING_SECONDS}秒內交易所都沒有對應部位，判定未成交\n"
+                 if had_deadline else
+                 f"ℹ️ {self.label} 送單結果不明、而且沒有確認期限(例如服務重啟)的部位，交易所這一側沒有，判定未成交\n") +
                 f"此筆之後只記帳面，出場不送真實平倉單"
             )
             return "expired"
@@ -591,6 +632,7 @@ class PaperTradingEngine:
                 pnl = ((px - entry_ref) if position["direction"] == "bullish" else (entry_ref - px)) * fq
                 position["partial_realized_usd"] = (position.get("partial_realized_usd") or 0.0) + pnl
                 position["fill_boundary_id"] = last_id
+                db.update_paper_trade_fills(position.get("id"), position.get("real_open_order_id"), last_id)
                 partial_txt = f"這部分依成交明細 {fq}@{px}，損益 {pnl:+.2f} U"
             else:
                 position["partial_pnl_unknown"] = True
@@ -992,6 +1034,8 @@ class PaperTradingEngine:
                     position["real_open_quantity"] = quantity if success else None
                     # 開倉單號：之後查成交明細時，界線從這張單的最後一筆成交id開始(第8條r30/r31)
                     position["real_open_order_id"] = result.get("orderId") if (success and isinstance(result, dict)) else None
+                    if success:
+                        self._record_fill_boundary(position)
                     db.update_paper_trade_real_open(position.get("id"), bool(success), quantity if success else None)
                     if claim_entry:
                         position["entry_actual_price"] = claim_entry
