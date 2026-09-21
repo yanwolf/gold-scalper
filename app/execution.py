@@ -688,6 +688,18 @@ def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)
 
 
+# 「結果不明」的送單回應(BINANCE_LESSONS.md第3條，r12)：網路逾時、連線中斷(回傳字串)、
+# 幣安的未知錯誤/逾時碼。這些情況單可能其實已經成交，不能當成送單失敗。
+# 只有交易所明確拒絕(4xx帶其他錯誤碼)才是確定沒成交。
+AMBIGUOUS_CODES = (-1000, -1001, -1006, -1007)
+
+
+def is_ambiguous_result(result):
+    if not isinstance(result, dict):
+        return True
+    return result.get("code") in AMBIGUOUS_CODES or "code" not in result
+
+
 MODE_MISMATCH_CODES = (-4061, -1106)
 
 
