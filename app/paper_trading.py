@@ -26,6 +26,7 @@ from app import db
 from app import trading_core
 from app import settings as settings_module
 from app import notifier as notifier_module
+from app import alert_cadence
 from app import execution as execution_module
 from app import risk_guard
 from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact
@@ -75,6 +76,7 @@ class PaperTradingEngine:
         self._last_tick_at = None  # 給health_monitor.py檢查引擎是否還活著用
         self._circuit_breaker_alerted = False  # 避免風控斷路器每次被觸發都重複發送警示
         self._fast_stop_registered = False
+        self._orphan_cancels = []  # 平倉後撤不掉的殘留條件單(第13條)，每輪tick重試
 
     @property
     def last_tick_at(self):
@@ -164,13 +166,19 @@ class PaperTradingEngine:
                     if self._try_claim_close(position):
                         self._close_position(position, desired, "觸及移動停損" if position.get("trailing_active") else "觸及停損")
                     return
-                if not position.get("backstop_failing"):
-                    position["backstop_failing"] = True
+                # 失敗照節奏定期提醒直到恢復(第8條「告警節奏」，r6)：第1、5、30次，之後每120次。
+                # 沒有backstop且補掛失敗(第2條)也走這裡，同一個節奏。
+                n = position.get("backstop_fail_count", 0) + 1
+                position["backstop_fail_count"] = n
+                if alert_cadence.should_alert(n):
                     self._backstop_alert(
-                        f"⚠️ {self.label} 交易所backstop停損單掛不上(想要的停損價 {desired})，"
-                        f"每輪會自動重試直到成功；程式內停損仍正常運作。原因：{new_id}"
+                        f"⚠️ {self.label} 交易所停損單{'搬移' if position.get('backstop_algo_id') else '掛單'}失敗(第 {n} 次)\n"
+                        f"幣別：{symbol}\n想要的停損價：{desired}\n"
+                        f"目前交易所停損價：{self._current_backstop_text(position)}\n"
+                        f"錯誤：{new_id}\n"
+                        f"每輪自動重試直到成功；程式內停損仍正常運作"
                     )
-                logger.warning(f"backstop掛單失敗({self.label})，下一輪重試: {new_id}")
+                logger.warning(f"backstop掛單失敗({self.label}, 第{n}次)，下一輪重試: {new_id}")
                 return
 
             old_id, old_legacy = position.get("backstop_algo_id"), position.get("backstop_used_legacy", False)
@@ -186,11 +194,66 @@ class PaperTradingEngine:
                     # 帶quantity的reduceOnly單部位歸零後不會自動消失(第13條)，記下來平倉時再撤
                     position.setdefault("backstop_stale_ids", []).append((old_id, old_legacy))
                     logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_id})，平倉時再撤一次")
-            if position.pop("backstop_failing", False):
-                self._backstop_alert(f"✅ {self.label} backstop停損單已補掛成功(停損價 {desired})")
+            failed = position.pop("backstop_fail_count", 0)
+            if failed:
+                self._backstop_alert(
+                    f"✅ {self.label} 交易所停損單已補上(失敗 {failed} 次後恢復)\n"
+                    f"幣別：{symbol}\n目前交易所停損價：{desired}"
+                )
             logger.info(f"backstop已對齊({self.label}): algoId={new_id}, 停損價{desired}")
         except Exception as e:
             logger.error(f"同步backstop停損單發生例外({self.label}): {e}")
+
+    def _current_backstop_text(self, position):
+        if not position.get("backstop_algo_id"):
+            return "未掛(交易所端沒有停損)"
+        if position.get("backstop_price") is None:
+            return f"已掛(algoId={position['backstop_algo_id']}，服務重啟後價位未知)"
+        return f"{position['backstop_price']}"
+
+    def _queue_orphan_cancel(self, algo_id, used_legacy, symbol, error):
+        """
+        平倉後撤不掉的單(第13條殘留單)：放進引擎層級的待撤清單，之後每輪tick重試，
+        照第8條的告警節奏提醒直到撤掉。部位已經不在了，所以不能掛在position上。
+        (只存記憶體；服務重啟後由preflight的「孤兒條件單」自檢兜底)
+        """
+        for item in self._orphan_cancels:
+            if item["algo_id"] == algo_id:
+                return
+        self._orphan_cancels.append({
+            "algo_id": algo_id, "used_legacy": used_legacy, "symbol": symbol,
+            "fail_count": 0, "last_error": error,
+        })
+        self._retry_orphan_cancels(first_error=error)
+
+    def _retry_orphan_cancels(self, first_error=None):
+        remaining = []
+        for item in self._orphan_cancels:
+            if first_error is not None and item["fail_count"] == 0:
+                ok, result = False, first_error  # 剛才平倉時已經撤過一次，算第1次失敗
+            else:
+                ok, result, _ = execution_module.cancel_algo_stop(
+                    item["algo_id"], symbol=item["symbol"], account=self.execution_account,
+                    used_legacy=item["used_legacy"],
+                )
+            if ok:
+                if item["fail_count"]:
+                    self._backstop_alert(
+                        f"✅ {self.label} 殘留停損單已撤掉(失敗 {item['fail_count']} 次後恢復)\n"
+                        f"幣別：{item['symbol']}\nalgoId：{item['algo_id']}"
+                    )
+                continue
+            item["fail_count"] += 1
+            item["last_error"] = result
+            if alert_cadence.should_alert(item["fail_count"]):
+                self._backstop_alert(
+                    f"⚠️ {self.label} 平倉後殘留的停損單撤不掉(第 {item['fail_count']} 次)\n"
+                    f"幣別：{item['symbol']}\nalgoId：{item['algo_id']}\n"
+                    f"想要的停損價：無(部位已平，這張單應該撤掉)\n目前交易所停損：仍掛著\n"
+                    f"錯誤：{result}\n每輪自動重試；也可以到幣安手動撤單"
+                )
+            remaining.append(item)
+        self._orphan_cancels = remaining
 
     def _backstop_alert(self, text):
         try:
@@ -208,19 +271,14 @@ class PaperTradingEngine:
         先觸發把部位平掉了)，呼叫端要用這個線索決定要不要再送一次真實平倉單。
         """
         symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
-        # 先清掉移動時沒撤成功的舊backstop(第13條：reduceOnly+quantity單不會自動消失)
+        # 先清掉移動時沒撤成功的舊backstop(第13條：reduceOnly+quantity單不會自動消失)，
+        # 還是撤不掉就進待撤清單，每輪重試、照節奏提醒
         for stale_id, stale_legacy in position.pop("backstop_stale_ids", []) or []:
             ok, res, _ = execution_module.cancel_algo_stop(
                 stale_id, symbol=symbol, account=self.execution_account, used_legacy=stale_legacy,
             )
             if not ok:
-                logger.error(f"舊backstop仍撤不掉({self.label}, algoId={stale_id}): {res}，請手動確認")
-                try:
-                    notifier_module.notifier.send_raw_message(
-                        f"⚠️ {self.label} 平倉後有一張舊的backstop停損單撤不掉(algoId={stale_id})，請到幣安手動撤單"
-                    )
-                except Exception:
-                    pass
+                self._queue_orphan_cancel(stale_id, stale_legacy, symbol, res)
         algo_id = position.get("backstop_algo_id")
         if not algo_id:
             return False
@@ -229,13 +287,8 @@ class PaperTradingEngine:
             used_legacy=position.get("backstop_used_legacy", False),
         )
         if not ok:
-            logger.error(f"撤銷backstop停損單失敗({self.label}, algoId={algo_id}): {result}，可能留下孤兒掛單，請手動確認")
-            try:
-                notifier_module.notifier.send_raw_message(
-                    f"⚠️ {self.label} 平倉時backstop停損單撤不掉(algoId={algo_id})，請到幣安手動撤單，以免留下孤兒掛單"
-                )
-            except Exception:
-                pass
+            logger.error(f"撤銷backstop停損單失敗({self.label}, algoId={algo_id}): {result}，進待撤清單每輪重試")
+            self._queue_orphan_cancel(algo_id, position.get("backstop_used_legacy", False), symbol, result)
             return False
         if already_gone:
             logger.warning(f"backstop停損單已經不在({self.label}, algoId={algo_id})，可能已經自動觸發把部位平掉了")
@@ -298,6 +351,8 @@ class PaperTradingEngine:
 
     def _tick(self):
         self._last_tick_at = datetime.now(timezone.utc)
+        if self._orphan_cancels:
+            self._retry_orphan_cancels()
 
         # 風控參數即時從settings.py讀取(而不是啟動時就固定的常數)，
         # 這樣使用者在dashboard調整過設定後，下一次tick馬上就會用新的參數，

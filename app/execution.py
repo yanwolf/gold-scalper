@@ -698,8 +698,12 @@ def _resend_on_mode_mismatch(method, path, params, side, is_closing, result, acc
         return None
     mode_ok, hedge_now = get_position_mode(account=account)
     if not mode_ok:
-        return None
-    logger.warning(f"持倉模式不符({result.get('code')})，交易所目前是{'雙向' if hedge_now else '單向'}，換參數重送一次")
+        # 重新偵測本身失敗(逾時、限流)：被-4061/-1106拒絕已經證明原本的假設是錯的，
+        # 直接反轉(原本帶positionSide=以為雙向→改成單向，反之亦然)，不要放棄重送
+        # (BINANCE_LESSONS.md第7條，r5)
+        hedge_now = "positionSide" not in params
+        logger.warning(f"持倉模式重新偵測失敗({hedge_now})，改用反轉後的假設重送")
+    logger.warning(f"持倉模式不符({result.get('code')})，改用{'雙向' if hedge_now else '單向'}參數重送一次")
     return _signed_request(method, path, _convert_mode_params(params, side, is_closing, hedge_now), account=account)
 
 
