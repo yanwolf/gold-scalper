@@ -103,6 +103,11 @@ def _reconcile_with_exchange_on_startup():
             # 依「方向」對帳，不是加總淨部位(BINANCE_LESSONS.md第7條)：雙向模式下
             # 多0.1+空0.1淨額是0會誤判空手；我的多單已停損、帳上剩別的空單時，
             # 只看有沒有部位會誤判成自己還在場。
+            sym = execution_module._resolve_symbol(getattr(engine, "execution_symbol", None))
+            if not isinstance(info, list) or not any(r.get("symbol") == sym for r in info):
+                # 帶symbol查詢卻沒有這個幣的列＝查詢異常(第2條r17/r18)，不能當成「空手」
+                lines.append(f"{engine.label}: 查不到部位資料(回傳空清單)，這次無法對帳，請手動確認")
+                continue
             long_qty = short_qty = 0.0
             for row in info if isinstance(info, list) else []:
                 try:

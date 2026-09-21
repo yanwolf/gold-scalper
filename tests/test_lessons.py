@@ -1,6 +1,12 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r16 第1、2、3、7、8、14條的每一個檢查項目。執行：python -m unittest tests.test_lessons -v
+涵蓋 r7→r19 第1、2、3、7、8、14條的每一個檢查項目。
+
+斷言分類(用法第5點r19)：
+  正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
+  否定句斷言(「沒送單」「帳上紀錄還在」「停損沒被撤」)——程式什麼都沒做也成立，
+  所以每一個都要有「前提」斷言：證明走到被測那一步所需的每個動作真的發生了(測錯方式8、12)。
+  斷言看「這一步之後新發生的事」(只算這一步建立的mock/清單)，不看被測前就存在的最終狀態(測錯方式13)。執行：python -m unittest tests.test_lessons -v
 
 每個測試名稱前綴對應清單段落：
   t7a 反轉依被拒的單   t7b 送單前偵測失敗   t7c 記住/清掉假設
@@ -26,6 +32,8 @@ def _engine():
     eng.alerts = []
     eng._backstop_alert = lambda t: eng.alerts.append(t)
     eng._orphan_cancels = []
+    eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
+    eng._qty_check_tick = 0
     return eng
 
 
@@ -97,7 +105,9 @@ class Lesson7(unittest.TestCase):
 class Lesson8(unittest.TestCase):
     def setUp(self):
         self.p = [mock.patch.object(ex, "round_price", lambda p, *a, **k: p),
-                  mock.patch.object(ex, "current_hedge_mode", return_value=False)]
+                  mock.patch.object(ex, "current_hedge_mode", return_value=False),
+                  # r19起掛停損前會先確認部位還在：模擬交易所上有自己的0.1張
+                  mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1)))]
         for x in self.p:
             x.start()
 
@@ -279,8 +289,9 @@ class Lesson3(ExecHarness):
         self.assertIsNot(pos.get("real_open_executed"), False, "結果不明不能直接記成沒開倉")
         self.assertTrue(pos.get("real_open_pending_until"))
         eng = self.eng
-        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))):
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))) as gp:
             eng._resolve_open_pending(pos)                       # 期限內：這一輪沒看到也不能清
+        self.assertTrue(gp.called, "前提：這一輪真的查了")
         self.assertTrue(pos.get("real_open_pending_until"))
         pos["real_open_pending_until"] = 1.0                     # 期限已過(用非0的過去時間，測錯方式5)
         with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))):
@@ -316,10 +327,12 @@ class Lesson8Close(ExecHarness):
 
     def test_t8a_rejected_close_keeps_record_backstop_and_marks_pending(self):
         pos = self._pos()
-        with mock.patch.object(ex, "close_position", return_value=(False, {"code": -2019, "msg": "Margin is insufficient."})), \
-             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))), \
+        with mock.patch.object(ex, "close_position", return_value=(False, {"code": -2019, "msg": "Margin is insufficient."})) as cp, \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))) as gp, \
              mock.patch.object(self.eng, "_cancel_backstop") as cb:
             self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單真的送出、被拒")
+        self.assertTrue(gp.called, "前提：被拒後真的去查了部位")
         self.assertEqual(self.dbclose, [], "平倉沒確認前不能把帳上紀錄結掉")
         self.assertFalse(cb.called, "平倉沒確認前不能撤交易所停損")
         self.assertIs(self.eng._position, pos)
@@ -338,10 +351,11 @@ class Lesson8Close(ExecHarness):
 
     def test_t8a_verify_query_failure_is_treated_as_not_closed(self):
         pos = self._pos()
-        with mock.patch.object(ex, "close_position", return_value=(False, "Read timed out")), \
+        with mock.patch.object(ex, "close_position", return_value=(False, "Read timed out")) as cp, \
              mock.patch.object(ex, "get_position_info", return_value=(False, "Read timed out")) as gp, \
              mock.patch.object(self.eng, "_cancel_backstop") as cb:
             self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單真的送出")
         self.assertTrue(gp.called, "前提：真的去查了部位")
         self.assertEqual(self.dbclose, [])
         self.assertFalse(cb.called)
@@ -399,7 +413,10 @@ class Lesson16(ExecHarness):
         calls = []
         def fake(method, path, params=None, account=None, return_status=False):
             calls.append(path)
-            r = algo_resp if path == "/fapi/v1/openAlgoOrders" else legacy_resp
+            if path == "/fapi/v2/positionRisk":
+                r = (True, _rows(0.1), 200)  # 補掛前的部位確認(r19)：自己的部位還在
+            else:
+                r = algo_resp if path == "/fapi/v1/openAlgoOrders" else legacy_resp
             return r if return_status else r[:2]
         with mock.patch.object(ex, "_signed_request", side_effect=fake), \
              mock.patch.object(ex, "place_algo_stop", return_value=(True, "NEW", False)) as pl:
@@ -418,7 +435,8 @@ class Lesson16(ExecHarness):
 
     def test_t1a_guard_query_failure_does_not_count(self):
         pos = self._real_pos()
-        _, pl = self._guard(pos, (False, {"code": -1001}, 500), (False, {"code": -1001}, 500), 5)
+        calls, pl = self._guard(pos, (False, {"code": -1001}, 500), (False, {"code": -1001}, 500), 5)
+        self.assertEqual(calls.count("/fapi/v1/openAlgoOrders"), 5, "前提：5輪都真的查了")
         self.assertEqual(pl.call_count, 0, "查詢失敗不能當成停損不見(第2條)")
 
     def test_t1b_algo_404_falls_back_to_legacy_query_instead_of_skipping(self):
@@ -437,7 +455,8 @@ class Lesson16(ExecHarness):
         pos["backstop_missing"] = 2
         closed = []
         def fake(method, path, params=None, account=None, return_status=False):
-            return (True, [], 200) if return_status else (True, [])
+            r = (True, _rows(0.1), 200) if path == "/fapi/v2/positionRisk" else (True, [], 200)
+            return r if return_status else r[:2]
         with mock.patch.object(ex, "_signed_request", side_effect=fake), \
              mock.patch.object(ex, "place_algo_stop", return_value=(False, {"code": -2021, "msg": "Order would immediately trigger."}, False)), \
              mock.patch.object(self.eng, "_close_position", side_effect=lambda p, px, r, **k: closed.append(r)):
@@ -447,10 +466,11 @@ class Lesson16(ExecHarness):
     # 2a：帶symbol查詢回200＋空清單，不能判成「沒有部位」
     def test_t2a_empty_list_is_not_no_position(self):
         pos = self._real_pos()
-        with mock.patch.object(ex, "close_position", return_value=(False, "Read timed out")), \
+        with mock.patch.object(ex, "close_position", return_value=(False, "Read timed out")) as cp, \
              mock.patch.object(ex, "get_position_info", return_value=(True, [])) as gp, \
              mock.patch.object(self.eng, "_cancel_backstop") as cb:
             self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單真的送出")
         self.assertTrue(gp.called)
         self.assertEqual(self.dbclose, [], "空清單不能當成已平倉")
         self.assertFalse(cb.called)
@@ -479,9 +499,12 @@ class Lesson16(ExecHarness):
     # 3b：基準跟著部位走完——數量比對、平倉確認、平倉數量都要扣
     def test_t3b_quantity_check_deducts_baseline(self):
         pos = self._real_pos(real_open_baseline=0.3)
-        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.4))):
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.4))) as gp, \
+             mock.patch.object(pt.db, "update_paper_trade_real_open") as upd:
             self.eng._check_exchange_quantity(pos)
-        self.assertEqual(pos["real_open_quantity"], 0.1, "0.4−基準0.3＝0.1，沒有減少")
+        self.assertTrue(gp.called, "前提：真的比對了(測錯方式13：數量0.1是測試前就有的狀態，不能只看它)")
+        self.assertFalse(upd.called, "0.4−基準0.3＝0.1，沒有減少，不能更新帳上數量")
+        self.assertEqual(pos["real_open_quantity"], 0.1)
         self.assertFalse(any("減少" in a for a in self.eng.alerts), self.eng.alerts)
         with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.35))):
             self.eng._check_exchange_quantity(pos)
@@ -527,6 +550,120 @@ class Lesson16(ExecHarness):
         self.assertIs(pos.get("real_open_executed"), True, "前提：同一輪完成認領")
         self.assertEqual(pos.get("backstop_algo_id"), "C1", "認領後當場掛停損")
         self.assertFalse(cp.called, "剛認領的部位同一輪不能被判成已平倉")
+
+
+# ------------------------------------------------------------------ r17 → r19
+class Lesson19(ExecHarness):
+    def _real_pos(self, **kw):
+        p = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, backstop_algo_id=None,
+                 backstop_price=None, backstop_used_legacy=False, real_open_baseline=0.3)
+        p.update(kw)
+        self.eng._position = p
+        return p
+
+    # 2b：任何掛停損之前都要確認自己的部位還在(扣基準)
+    def test_t2b_no_backstop_when_own_position_gone(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.3))) as gp, \
+             mock.patch.object(ex, "place_algo_stop", return_value=(True, "X", False)) as pl:
+            self.eng._sync_backstop(pos)
+        self.assertTrue(gp.called, "前提：掛單前真的查了部位")
+        self.assertEqual(pl.call_count, 0, "交易所只剩基準(別人的)0.3，不能掛孤兒reduce-only單")
+
+    def test_t2b_query_failure_skips_round_without_counting_failure(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "get_position_info", return_value=(False, "Read timed out")) as gp, \
+             mock.patch.object(ex, "place_algo_stop") as pl:
+            self.eng._sync_backstop(pos)
+        self.assertTrue(gp.called, "前提：真的查了")
+        self.assertEqual(pl.call_count, 0)
+        self.assertEqual(self.eng.alerts, [], "查不到是這輪不動，不是掛單失敗")
+
+    def test_t2b_quantity_is_min_of_exchange_minus_baseline_and_recorded(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.35))), \
+             mock.patch.object(ex, "place_algo_stop", return_value=(True, "X", False)) as pl:
+            self.eng._sync_backstop(pos)
+        self.assertEqual(pl.call_args[0][1], 0.05)
+
+    def test_t2b_moving_stop_also_confirms_position(self):
+        """搬移停損也是掛一張新的reduce-only單，跟補掛一樣要先確認(r20)。"""
+        pos = self._real_pos(backstop_algo_id="OLD", backstop_price=4370.0)
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.3))) as gp, \
+             mock.patch.object(ex, "place_algo_stop") as pl:
+            self.eng._sync_backstop(pos)
+        self.assertTrue(gp.called, "前提：搬移前真的查了部位")
+        self.assertEqual(pl.call_count, 0)
+
+    # 8a/8b：每一步各自try；出錯的步驟排在最前面(測錯方式11)
+    def test_t8b_first_step_raises_later_steps_still_run(self):
+        pos = self._real_pos(real_open_pending_until=time.time() + 100)
+        self.eng._qty_check_tick = QTY - 1
+        with mock.patch.object(self.eng, "_resolve_open_pending", side_effect=RuntimeError("inj-resolve")), \
+             mock.patch.object(self.eng, "_check_exchange_quantity") as q, \
+             mock.patch.object(self.eng, "_check_backstop_present") as g:
+            self.eng._housekeeping(pos)
+        self.assertTrue(q.called, "第一步出錯，數量比對仍要跑")
+        self.assertTrue(g.called, "第一步出錯，停損守衛仍要跑")
+        self.assertTrue(any("第 1 次" in a and "inj-resolve" in a for a in self.eng.alerts), self.eng.alerts)
+
+    def test_t8a_housekeeping_error_does_not_stop_exit_judgement(self):
+        """維護出錯不能讓整輪tick中止——後面的出場判斷(程式內停損)照樣要跑。"""
+        class Reached(Exception):
+            pass
+        self._real_pos(real_open_executed=True)
+        with mock.patch.object(self.eng, "_housekeeping", side_effect=RuntimeError("inj-hk")), \
+             mock.patch.object(pt.settings_module, "get_settings", side_effect=Reached()):
+            with self.assertRaises(Reached, msg="維護出錯後，流程要繼續走到下一步(讀設定、出場判斷)"):
+                self.eng._tick()
+
+    def test_t8a_orphan_retry_error_does_not_stop_tick(self):
+        class Reached(Exception):
+            pass
+        self.eng._orphan_cancels = [{"algo_id": "Z", "used_legacy": False, "symbol": "XAUUSDT", "fail_count": 1, "last_error": ""}]
+        self._real_pos()
+        with mock.patch.object(self.eng, "_retry_orphan_cancels", side_effect=RuntimeError("inj-orphan")), \
+             mock.patch.object(self.eng, "_housekeeping") as hk, \
+             mock.patch.object(pt.settings_module, "get_settings", side_effect=Reached()):
+            with self.assertRaises(Reached):
+                self.eng._tick()
+        self.assertTrue(hk.called)
+
+    # 8c：出錯次數照節奏、恢復要通知、部位結束時清掉
+    def test_t8c_step_error_recovers_and_is_cleared_at_position_end(self):
+        pos = self._real_pos()
+        self.eng._qty_check_tick = QTY - 1
+        with mock.patch.object(self.eng, "_check_exchange_quantity", side_effect=RuntimeError("inj-qty")), \
+             mock.patch.object(self.eng, "_check_backstop_present"):
+            self.eng._housekeeping(pos)
+        self.eng._qty_check_tick = QTY - 1
+        with mock.patch.object(self.eng, "_check_exchange_quantity"), mock.patch.object(self.eng, "_check_backstop_present"):
+            self.eng._housekeeping(pos)
+        self.assertTrue(any("恢復" in a for a in self.eng.alerts[1:]), self.eng.alerts)
+        self.eng._qty_check_tick = QTY - 1
+        with mock.patch.object(self.eng, "_check_exchange_quantity", side_effect=RuntimeError("inj-qty2")), \
+             mock.patch.object(self.eng, "_check_backstop_present"):
+            self.eng._housekeeping(pos)
+        before = len(self.eng.alerts)
+        with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4380"})), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(self.eng._step_errors, {}, "部位結束，出錯次數要清掉(同幣下一筆不能接著數)")
+        self.assertTrue(any("結束" in a for a in self.eng.alerts[before:]), self.eng.alerts[before:])
+
+    # 2a：啟動對帳遇空清單，不能回報成「一致(空手)」
+    def test_t2a_reconcile_empty_list_reports_unknown(self):
+        import app.main as m
+        class E:
+            label = "15分K"; execution_index = 3; execution_account = "gold"; _position = None
+        got = []
+        with mock.patch.dict(m.PAPER_TRADING_ENGINES, {"x": E()}, clear=True), mock.patch("time.sleep"), \
+             mock.patch.object(ex, "get_position_info", return_value=(True, [])) as gp, \
+             mock.patch.object(ex, "usdt_balance_line", return_value=None), \
+             mock.patch.object(m.logger, "info", side_effect=got.append), mock.patch.object(m.db, "insert_settings_audit"):
+            m._reconcile_with_exchange_on_startup()
+        self.assertTrue(gp.called)
+        self.assertIn("查不到", got[-1].splitlines()[1])
 
 
 class Lesson14(unittest.TestCase):

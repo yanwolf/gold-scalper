@@ -1716,7 +1716,7 @@ els.executionPositionBtn.addEventListener('click', async () => {
           `方向：${parseFloat(p.positionAmt) > 0 ? '多單' : '空單'} ${Math.abs(p.positionAmt)}張\n` +
           `進場均價：${p.entryPrice}\n` +
           `目前標記價：${p.markPrice}\n` +
-          `未實現損益：${p.unRealizedProfit}\n` +
+          `未實現損益：${p.unRealizedProfit}（交易所整列，含送單前既有部位）\n` +
           `槓桿：${p.leverage}x\n` +
           `⚠️ 強平價格：${p.liquidationPrice}(幣安依實際維持保證金分級算出的精確數字)`
         ).join('\n\n---\n\n');
