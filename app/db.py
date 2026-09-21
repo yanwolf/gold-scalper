@@ -207,6 +207,12 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS backstop_algo_id TEXT;
                 """)
+                # 送單前這一側原有的數量(基準，第3條r14/r16)：整個部位生命週期都要扣，
+                # 所以要存進資料庫，服務重啟後才不會變成0、把別人的部位算成自己的
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS real_open_baseline DOUBLE PRECISION;
+                """)
                 cur.execute("""
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS backstop_used_legacy BOOLEAN;
@@ -451,6 +457,22 @@ def update_paper_trade_stop(trade_id, sl_price, peak_price, trailing_active):
         logger.error(f"更新移動停損失敗: {e}")
 
 
+def update_paper_trade_baseline(trade_id, baseline):
+    """記下送單前這一側原有的數量(基準，第3條r16)。trade_id是None時跳過。"""
+    if not _enabled or trade_id is None:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE paper_trades SET real_open_baseline = %s WHERE id = %s;", (baseline, trade_id))
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"記錄基準數量失敗: {e}")
+
+
 def update_paper_trade_backstop(trade_id, backstop_algo_id, backstop_used_legacy):
     """
     記下這筆倉位的交易所backstop停損單algoId，平倉時才知道要撤哪一張
@@ -529,7 +551,7 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                            chan_reason, profile_reason, interval_seconds, engine_id,
                            real_open_executed, real_open_quantity,
-                           backstop_algo_id, backstop_used_legacy
+                           backstop_algo_id, backstop_used_legacy, real_open_baseline
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -550,6 +572,7 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             "real_open_executed": row[11], "real_open_quantity": row[12],
             # 服務重啟後要能認回這張backstop停損單(平倉時才知道要撤哪張)(修正記錄見README)
             "backstop_algo_id": row[13], "backstop_used_legacy": row[14],
+            "real_open_baseline": row[15] or 0.0,
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")

@@ -293,6 +293,10 @@ class PaperTradingEngine:
         sym = execution_module._resolve_symbol(self.execution_symbol)
         want_long = direction == "bullish"
         qty, entry, mark = 0.0, None, None
+        if not any(r.get("symbol") == sym for r in rows):
+            # 帶symbol查詢時交易所一定會回這個幣的列(單向1列、雙向2列，數量0也會回)。
+            # 回200＋空清單是維護或閘門異常，不能當成「沒有部位」(第2條r15)
+            return False, 0.0, None, None
         for r in rows:
             if r.get("symbol") != sym:
                 continue
@@ -308,6 +312,68 @@ class PaperTradingEngine:
                 entry = float(r.get("entryPrice") or 0) or entry
                 mark = float(r.get("markPrice") or 0) or mark
         return True, qty, entry, mark
+
+    def _own_qty(self, position):
+        """交易所這一側扣掉基準後，屬於這筆單的數量：(ok, 數量)。第3條r16：基準要跟著部位走完。"""
+        ok, qty, _, _ = self._side_qty(position["direction"])
+        if not ok:
+            return False, 0.0
+        return True, max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))
+
+    def _housekeeping(self, pos):
+        """
+        每輪tick開頭的維護，順序有意義(第3條r15「認領要在判斷還在場之前」)：
+          1. pending開倉確認(認領)
+          2. 待平倉就只做重試
+          3. 每4輪：比對交易所數量(判斷部位還在不在)，還在才檢查停損還在不在
+        """
+        if pos.get("real_open_pending_until"):
+            self._resolve_open_pending(pos)
+        if pos.get("pending_close"):
+            # 平倉單沒確認成交：每輪直接重試(第8條r13)，不等下一根K棒再觸發出場。
+            # 等待期間交易所停損照常保留並對齊。
+            self._sync_backstop(pos)
+            self._retry_pending_close()
+            return
+        self._qty_check_tick = (self._qty_check_tick + 1) % QTY_CHECK_EVERY_TICKS
+        if self._qty_check_tick == 0 and pos.get("real_open_executed"):
+            self._check_exchange_quantity(pos)
+            if self._position is pos and not pos.get("_closing"):
+                self._check_backstop_present(pos)
+
+    def _check_backstop_present(self, pos):
+        """
+        停損守衛(第2條、第1條r15/r16)：交易所停損單還在嗎？App手動撤掉、或其他原因消失時，
+        原本程式完全不會發現。
+          - 查詢失敗 → 這輪不動(查不到≠不見了)
+          - 連續3輪確認不在 → 清掉紀錄，交給_sync_backstop當場補掛
+            (補掛遇-2021價格已穿過停損 → 直接出場，第8條r16)
+        """
+        algo_id = pos.get("backstop_algo_id")
+        if not algo_id or not pos.get("real_open_executed"):
+            return
+        ok, present = execution_module.find_open_stop(
+            algo_id, used_legacy=pos.get("backstop_used_legacy", False),
+            symbol=self.execution_symbol, account=self.execution_account,
+        )
+        if not ok:
+            return
+        if present:
+            pos.pop("backstop_missing", None)
+            return
+        n = pos.get("backstop_missing", 0) + 1
+        pos["backstop_missing"] = n
+        if n < 3:
+            return
+        pos.pop("backstop_missing", None)
+        logger.warning(f"交易所停損單連續3輪查不到({self.label}, id={algo_id})，重新掛單")
+        self._backstop_alert(
+            f"⚠️ {self.label} 交易所停損單不見了(連續3輪查不到，id={algo_id})，立刻重新掛單\n"
+            f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n想要的停損價：{pos.get('sl_price')}"
+        )
+        pos.pop("backstop_algo_id", None)
+        pos.pop("backstop_price", None)
+        self._sync_backstop(pos)
 
     def _resolve_open_pending(self, position):
         """
@@ -388,6 +454,7 @@ class PaperTradingEngine:
         ok, qty, _, mark = self._side_qty(position["direction"])
         if not ok:
             return
+        qty = max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))  # 扣基準(第3條r16)
         recorded = position.get("real_open_quantity") or 0.0
         if qty <= 1e-9:
             n = position.get("gone_checks", 0) + 1
@@ -519,17 +586,9 @@ class PaperTradingEngine:
             self._retry_orphan_cancels()
         pos = self._position
         if pos:
-            if pos.get("real_open_pending_until"):
-                self._resolve_open_pending(pos)
+            self._housekeeping(pos)
             if pos.get("pending_close"):
-                # 平倉單沒確認成交：每輪直接重試(第8條r13)，不等下一根K棒再觸發出場。
-                # 等待期間交易所停損照常保留並對齊。
-                self._sync_backstop(pos)
-                self._retry_pending_close()
                 return
-            self._qty_check_tick = (self._qty_check_tick + 1) % QTY_CHECK_EVERY_TICKS
-            if self._qty_check_tick == 0 and pos.get("real_open_executed"):
-                self._check_exchange_quantity(pos)
 
         # 風控參數即時從settings.py讀取(而不是啟動時就固定的常數)，
         # 這樣使用者在dashboard調整過設定後，下一次tick馬上就會用新的參數，
@@ -762,13 +821,18 @@ class PaperTradingEngine:
                     filled = False
                     # 送單前記下這一側原有的數量，回應不明時才分得出哪些是這張單成交的(第3條)
                     baseline_ok, baseline, _, _ = self._side_qty(position["direction"])
-                    success, result = execution_module.open_position(
-                        direction=position["direction"],
-                        quantity=quantity,
-                        symbol=self.execution_symbol,
-                        account=self.execution_account,
-                        hedge=hedge,
-                    )
+                    if not baseline_ok:
+                        # 基準查不到不能當成0繼續送(第3條r16)：之後認領、平倉都會把別人的部位算成
+                        # 自己的。這次不送真實單、記錄原因，下一個訊號再說
+                        success, result = False, {"code": "NO_BASELINE", "msg": "送單前查不到交易所這一側的部位(基準)，這次不送真實單"}
+                    else:
+                        success, result = execution_module.open_position(
+                            direction=position["direction"],
+                            quantity=quantity,
+                            symbol=self.execution_symbol,
+                            account=self.execution_account,
+                            hedge=hedge,
+                        )
                     # 回應逾時/5xx：結果不明，單可能已經成交(第3條r12)。先查交易所：
                     # 看到了就認領(數量、均價取交易所那一列)；還沒看到就保留pending 180秒
                     ambiguous_pending = False
@@ -793,13 +857,17 @@ class PaperTradingEngine:
                     db.update_paper_trade_real_open(position.get("id"), bool(success), quantity if success else None)
                     if claim_entry:
                         position["entry_actual_price"] = claim_entry
+                    if success:
+                        position["real_open_baseline"] = baseline
+                        db.update_paper_trade_baseline(position.get("id"), baseline)
                     if ambiguous_pending:
                         # 不能記成「沒開倉」：記成不明(None)＋期限，每輪確認
                         position["real_open_executed"] = None
                         position["real_open_quantity"] = quantity
                         position["real_open_pending_until"] = time.time() + OPEN_PENDING_SECONDS
-                        position["real_open_baseline"] = baseline if baseline_ok else 0.0
+                        position["real_open_baseline"] = baseline
                         db.update_paper_trade_real_open(position.get("id"), None, quantity)
+                        db.update_paper_trade_baseline(position.get("id"), baseline)
                     if success:
                         # 真實開倉成功才掛backstop停損單：交易所端的最後防線，服務掛掉/
                         # 斷線時至少不會裸奔(修正記錄見README)。掛不上不影響這筆交易繼續
@@ -949,6 +1017,7 @@ class PaperTradingEngine:
                     symbol=self.execution_symbol,
                     account=self.execution_account,
                     quantity=position.get("real_open_quantity"),
+                    baseline=position.get("real_open_baseline", 0.0) or 0.0,
                     hedge=execution_module.current_hedge_mode(
                         account=self.execution_account, default=bool(s.get("execution_hedge_mode", 1))
                     ),
@@ -1000,7 +1069,7 @@ class PaperTradingEngine:
 
         # ---- 平倉單送出後一定要看結果(第8條r12/r13) ----
         if is_execution_engine and not executed:
-            ok_q, ex_qty, _, _ = self._side_qty(position["direction"])
+            ok_q, ex_qty = self._own_qty(position)
             recorded = position.get("real_open_quantity") or 0.0
             if ok_q and 1e-9 < ex_qty < recorded - 1e-9:
                 # 數量不符被拒(帳上比交易所多)：改用交易所實際數量重送一次
@@ -1008,6 +1077,7 @@ class PaperTradingEngine:
                     ok_r, res_r = execution_module.close_position(
                         direction=position["direction"], symbol=self.execution_symbol,
                         account=self.execution_account, quantity=round(ex_qty, 6),
+                        baseline=position.get("real_open_baseline", 0.0) or 0.0,
                         hedge=execution_module.current_hedge_mode(account=self.execution_account),
                     )
                 except Exception as e:
@@ -1018,7 +1088,7 @@ class PaperTradingEngine:
                     position["real_open_quantity"] = round(ex_qty, 6)
                 else:
                     execution_error = res_r
-                    ok_q, ex_qty, _, _ = self._side_qty(position["direction"])
+                    ok_q, ex_qty = self._own_qty(position)
             if not executed:
                 if ok_q and ex_qty <= 1e-9:
                     # 這一側已經沒有部位：回應逾時但其實成交，或被交易所停損觸發

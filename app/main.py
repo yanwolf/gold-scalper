@@ -117,7 +117,8 @@ def _reconcile_with_exchange_on_startup():
             has_db = bool(db_pos and db_pos.get("real_open_executed"))
             if has_db:
                 my_side_long = db_pos.get("direction") == "bullish"
-                my_qty = long_qty if my_side_long else short_qty
+                # 扣掉送單前就有的部位(基準，第3條r16)，剩下的才是自己的
+                my_qty = max(0.0, (long_qty if my_side_long else short_qty) - float(db_pos.get("real_open_baseline") or 0))
                 other_qty = short_qty if my_side_long else long_qty
                 if my_qty > 1e-9:
                     lines.append(f"{engine.label}: 對帳一致(有{'多' if my_side_long else '空'}單 {my_qty})")

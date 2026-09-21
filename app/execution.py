@@ -934,6 +934,28 @@ def get_open_algo_orders(symbol=None, account=DEFAULT_ACCOUNT):
     return success, data
 
 
+def find_open_stop(algo_id, used_legacy=False, symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    停損守衛用：這張停損單現在還掛在交易所上嗎？回傳(ok, present)。
+    ok=False代表查不到(失敗)，呼叫端不能當成「不見了」(第2條)。
+    第1條r15/r16：Algo查詢回404時不能每輪都「查詢失敗、跳過」——那樣舊端點的停損
+    不見了也永遠沒人補。404要跟掛單一樣進入退回：改查舊端點的掛單，以它的結果判斷。
+    這是每次查詢當下決定的，不存任何旗標，所以服務重啟後也一樣。
+    """
+    sym = _resolve_symbol(symbol)
+    if not used_legacy:
+        ok, data, status = _signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": sym}, account=account, return_status=True)
+        if ok:
+            rows = data.get("orders", data.get("rows", [])) if isinstance(data, dict) else (data or [])
+            return True, any(str(o.get("algoId")) == str(algo_id) for o in rows)
+        if status != 404:
+            return False, None
+    ok, data = _signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym}, account=account)
+    if not ok or not isinstance(data, list):
+        return False, None
+    return True, any(str(o.get("orderId")) == str(algo_id) or str(o.get("algoId")) == str(algo_id) for o in data)
+
+
 def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT, hedge=False):
     """
     依訊號方向在指定帳戶開倉，quantity是直接指定的下單數量(張數)。
@@ -954,7 +976,7 @@ def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT, hed
     return place_market_order(side, quantity, symbol=symbol, account=account, position_side=position_side)
 
 
-def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=None, hedge=False):
+def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=None, hedge=False, baseline=0.0):
     """
     平掉指定帳戶「屬於這筆單」的部位(修正記錄見README)。
 
@@ -995,10 +1017,12 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=Non
             if p["symbol"] == target_symbol and p.get("positionSide") == want_side:
                 position_amt = float(p["positionAmt"])
                 break
-        if position_amt == 0:
-            return False, f"雙向模式下{want_side}側目前沒有未平倉部位可以平"
+        # 扣掉送單前就有的部位(基準，第3條r14/r16)：剩下的才是自己的；沒有就不送(第7條r15)
+        own = abs(position_amt) - float(baseline or 0)
+        if own <= 1e-9:
+            return False, f"雙向模式下{want_side}側扣掉基準({baseline})後沒有自己的部位可以平"
         side = "SELL" if is_long else "BUY"
-        close_qty = abs(position_amt) if quantity is None else min(abs(position_amt), float(quantity))
+        close_qty = round(own if quantity is None else min(own, float(quantity)), 6)
         return place_market_order(side, close_qty, symbol=symbol, account=account, position_side=want_side)
 
     position_amt = 0.0
@@ -1016,6 +1040,9 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=Non
             f"({'多' if is_long else '空'})不一致，拒絕平倉以免平掉別的引擎的部位"
         )
 
+    own = abs(position_amt) - float(baseline or 0)
+    if own <= 1e-9:
+        return False, f"扣掉基準({baseline})後沒有自己的部位可以平，不送單以免平到別人的部位"
     side = "SELL" if position_amt > 0 else "BUY"
-    close_qty = abs(position_amt) if quantity is None else min(abs(position_amt), float(quantity))
+    close_qty = round(own if quantity is None else min(own, float(quantity)), 6)
     return place_market_order(side, close_qty, symbol=symbol, reduce_only=True, account=account)

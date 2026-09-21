@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-21r14"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-09-21r17"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -111,6 +111,18 @@ def check(account=None, symbol=None):
         if not ok_o or not ok_p:
             add("孤兒條件單", "warn", "查詢失敗，無法判斷(查不到≠沒有，第2條)")
         else:
+            if not positions and orders:
+                # 全量表回空清單不一定是「沒有」(第2條r15)：逐幣再查一次，查不到就不下結論
+                positions = []
+                for sym in {o.get("symbol") for o in orders if o.get("symbol")}:
+                    ok_s, rows = execution_module.get_position_info(sym, account=account)
+                    if not ok_s or not rows:
+                        positions = None
+                        break
+                    positions.extend(rows)
+            if positions is None:
+                add("孤兒條件單", "warn", "全量部位表回空清單、逐幣查詢也失敗，無法判斷")
+                return out
             held = {(p.get("symbol"), p.get("positionSide", "BOTH")) for p in positions
                     if abs(float(p.get("positionAmt", 0) or 0)) > 0}
             held_symbols = {sym for sym, _ in held}
