@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-21"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-09-21r2"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -102,7 +102,29 @@ def check(account=None, symbol=None):
     except Exception as e:
         add("槓桿上限", "warn", e)
 
-    # 7. 速率限制：positionRisk 權重高，打太兇會被限流（見 BINANCE_LESSONS.md 第6條）
+    # 7. 孤兒條件單(BINANCE_LESSONS.md第13條)：交易所上還掛著、但沒有對應部位的條件單。
+    #    本專案唯一會掛的條件單是backstop，程式平倉時會撤；這裡是最後一道檢查。
+    #    不帶symbol查全部掛單權重高(第6條)，所以只在自檢時查、而且/preflight有冷卻。
+    try:
+        ok_o, orders = execution_module.get_open_algo_orders(account=account)
+        ok_p, positions = _signed_positions(account)
+        if not ok_o or not ok_p:
+            add("孤兒條件單", "warn", "查詢失敗，無法判斷(查不到≠沒有，第2條)")
+        else:
+            held = {(p.get("symbol"), p.get("positionSide", "BOTH")) for p in positions
+                    if abs(float(p.get("positionAmt", 0) or 0)) > 0}
+            held_symbols = {sym for sym, _ in held}
+            orphans = []
+            for o in orders or []:
+                sym, side = o.get("symbol"), o.get("positionSide", "BOTH")
+                if sym not in held_symbols or (side != "BOTH" and (sym, side) not in held):
+                    orphans.append(f"{sym} {o.get('side')} algoId={o.get('algoId')}")
+            add("孤兒條件單", "ok" if not orphans else "fail",
+                "無" if not orphans else f"{len(orphans)} 張沒有對應部位：" + "；".join(orphans[:5]))
+    except Exception as e:
+        add("孤兒條件單", "warn", e)
+
+    # 8. 速率限制：positionRisk 權重高，打太兇會被限流（見 BINANCE_LESSONS.md 第6條）
     try:
         t0 = time.time()
         ok, _ = execution_module.get_position_info(symbol, account=account)
@@ -113,12 +135,38 @@ def check(account=None, symbol=None):
     return out
 
 
+def _signed_positions(account):
+    """查帳戶全部持倉(不帶symbol)，給孤兒條件單比對用。回傳(success, list)。"""
+    return execution_module._signed_request("GET", "/fapi/v2/positionRisk", {}, account=account)
+
+
 def check_all():
     """對「目前有在用」的每個帳戶各跑一次check()，回傳{account: [結果...]}。"""
     return {account: check(account=account) for account in accounts_to_check()}
 
 
-def run_and_report(send=True):
+# 手動重跑的冷卻(BINANCE_LESSONS.md第6條延伸)：/preflight不需要登入，而且會打
+# positionRisk、全帳戶掛單這類高權重查詢，不能讓它被反覆觸發到被限流
+COOLDOWN_SECONDS = 60
+_last_result = None
+_last_run_at = 0.0
+
+
+def run_and_report(send=True, force=False):
+    """
+    force=False時，冷卻時間內直接回傳上一次的結果(標記cached)，不重打交易所。
+    開機那一次用force=True。
+    """
+    global _last_result, _last_run_at
+    now = time.time()
+    if not force and _last_result is not None and now - _last_run_at < COOLDOWN_SECONDS:
+        return {**_last_result, "cached": True, "next_run_in_seconds": int(COOLDOWN_SECONDS - (now - _last_run_at))}
+    _last_run_at = now
+    _last_result = _run_and_report(send)
+    return _last_result
+
+
+def _run_and_report(send=True):
     """
     開機跑一次、網頁也能手動重跑。有異常(非ok)就發Telegram列出來，
     全部正常只發一行簡短確認(或send=False時完全不發，只回傳結果給API用)。

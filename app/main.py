@@ -77,7 +77,7 @@ async def startup_event():
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
     # 開機跑一次交易所相容性自檢(BINANCE_LESSONS.md)，異常發Telegram，
     # 不要等到真的下單才發現API又改了。丟背景thread避免拖慢啟動。
-    threading.Thread(target=lambda: preflight_module.run_and_report(send=True), daemon=True).start()
+    threading.Thread(target=lambda: preflight_module.run_and_report(send=True, force=True), daemon=True).start()
     if role_module.is_live():
         # 正式端啟動時跟交易所對帳：DB記得有部位但交易所沒有(或反過來)就立刻告警，
         # 避免程序重啟後出現沒人管的孤兒單

@@ -154,8 +154,12 @@ class PaperTradingEngine:
             if not quantity:
                 return
             stop_price = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
+            # 用交易所「實際」的持倉模式，不是設定值(BINANCE_LESSONS.md第7條雙向模式)：
+            # 開倉時resolve_position_mode可能已經退回帳戶現有模式，設定值不一定等於實際
             s = settings_module.get_settings(engine_id=self.engine_id)
-            hedge = bool(s.get("execution_hedge_mode", 1))
+            hedge = execution_module.current_hedge_mode(
+                account=self.execution_account, default=bool(s.get("execution_hedge_mode", 1))
+            )
             position_side = ("LONG" if position["direction"] == "bullish" else "SHORT") if hedge else None
             ok, new_algo_id, used_legacy = execution_module.place_algo_stop(
                 position["direction"], quantity, stop_price,
@@ -167,10 +171,17 @@ class PaperTradingEngine:
             # 新的掛上去了，才撤舊的——這中間就算撤舊失敗，帳戶上頂多同時有兩張
             # reduceOnly停損單(其中一張會先觸發、另一張因為沒部位可平而自然失效)，
             # 不會出現「舊的撤了、新的還沒掛上」的裸倉空窗
-            execution_module.cancel_algo_stop(
+            cancel_ok, _, _ = execution_module.cancel_algo_stop(
                 old_algo_id, symbol=symbol, account=self.execution_account,
                 used_legacy=position.get("backstop_used_legacy", False),
             )
+            if not cancel_ok:
+                # 舊單撤不掉：帶quantity的reduceOnly單在部位歸零後「不會」自動消失
+                # (BINANCE_LESSONS.md第13條)，記下來，平倉時一起撤，不然會變孤兒單
+                position.setdefault("backstop_stale_ids", []).append(
+                    (old_algo_id, position.get("backstop_used_legacy", False))
+                )
+                logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_algo_id})，平倉時再撤一次")
             position["backstop_algo_id"] = new_algo_id
             position["backstop_used_legacy"] = used_legacy
             db.update_paper_trade_backstop(position.get("id"), new_algo_id, used_legacy)
@@ -186,16 +197,35 @@ class PaperTradingEngine:
         回傳already_triggered：True代表這張backstop單已經不在了(可能是它自己
         先觸發把部位平掉了)，呼叫端要用這個線索決定要不要再送一次真實平倉單。
         """
+        symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
+        # 先清掉移動時沒撤成功的舊backstop(第13條：reduceOnly+quantity單不會自動消失)
+        for stale_id, stale_legacy in position.pop("backstop_stale_ids", []) or []:
+            ok, res, _ = execution_module.cancel_algo_stop(
+                stale_id, symbol=symbol, account=self.execution_account, used_legacy=stale_legacy,
+            )
+            if not ok:
+                logger.error(f"舊backstop仍撤不掉({self.label}, algoId={stale_id}): {res}，請手動確認")
+                try:
+                    notifier_module.notifier.send_raw_message(
+                        f"⚠️ {self.label} 平倉後有一張舊的backstop停損單撤不掉(algoId={stale_id})，請到幣安手動撤單"
+                    )
+                except Exception:
+                    pass
         algo_id = position.get("backstop_algo_id")
         if not algo_id:
             return False
-        symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
         ok, result, already_gone = execution_module.cancel_algo_stop(
             algo_id, symbol=symbol, account=self.execution_account,
             used_legacy=position.get("backstop_used_legacy", False),
         )
         if not ok:
             logger.error(f"撤銷backstop停損單失敗({self.label}, algoId={algo_id}): {result}，可能留下孤兒掛單，請手動確認")
+            try:
+                notifier_module.notifier.send_raw_message(
+                    f"⚠️ {self.label} 平倉時backstop停損單撤不掉(algoId={algo_id})，請到幣安手動撤單，以免留下孤兒掛單"
+                )
+            except Exception:
+                pass
             return False
         if already_gone:
             logger.warning(f"backstop停損單已經不在({self.label}, algoId={algo_id})，可能已經自動觸發把部位平掉了")

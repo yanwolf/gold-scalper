@@ -828,6 +828,18 @@ def get_algo_stop_status(algo_id, symbol=None, account=DEFAULT_ACCOUNT, used_leg
     return _signed_request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id}, account=account)
 
 
+def get_open_algo_orders(symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    查目前掛著的Algo條件單(GET /fapi/v1/openAlgoOrders)。symbol=None時查整個帳戶，
+    權重高(BINANCE_LESSONS.md第6條)，只在自檢時用。回傳(success, list_or_error)。
+    """
+    params = {"symbol": _resolve_symbol(symbol)} if symbol else {}
+    success, data = _signed_request("GET", "/fapi/v1/openAlgoOrders", params, account=account)
+    if success and isinstance(data, dict):
+        data = data.get("orders", data.get("rows", []))
+    return success, data
+
+
 def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT, hedge=False):
     """
     依訊號方向在指定帳戶開倉，quantity是直接指定的下單數量(張數)。
