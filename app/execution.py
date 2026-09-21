@@ -502,11 +502,24 @@ def set_position_mode(hedge, account=DEFAULT_ACCOUNT):
     return success, result
 
 
+# 最後一次「確認過」的持倉模式(BINANCE_LESSONS.md第7條，r10)。這不是拿來省查詢的快取——
+# 每次送單還是即時偵測；只在偵測失敗(逾時、限流)時當退路：有舊值用舊值，從沒偵測
+# 成功過就假設單向。只有兩種情況會寫入：偵測成功、或反轉假設後重送成功；重送也失敗
+# 就清掉，不留沒驗證過的值給下一張單用。
+_last_known_hedge = {}
+
+
+def _mode_fallback(account):
+    return _last_known_hedge.get(account, False)
+
+
 def get_position_mode(account=DEFAULT_ACCOUNT):
     """查詢帳戶目前是不是雙向持倉。回傳(success, bool或錯誤)。"""
     success, result = _signed_request("GET", "/fapi/v1/positionSide/dual", account=account)
     if success and isinstance(result, dict):
-        return True, bool(result.get("dualSidePosition"))
+        hedge = bool(result.get("dualSidePosition"))
+        _last_known_hedge[account] = hedge
+        return True, hedge
     return False, result
 
 
@@ -594,7 +607,9 @@ def resolve_position_mode(hedge_wanted, account=DEFAULT_ACCOUNT):
     if ok:
         return bool(hedge_wanted), None
     mode_ok, current = get_position_mode(account=account)
-    effective = bool(current) if mode_ok else bool(hedge_wanted)
+    # 偵測失敗不能假設「設定想要的模式」(r10第7條)：有舊值用舊值，沒有就假設單向；
+    # 假設錯了會被-4061拒絕，再依被拒的單反轉重送
+    effective = bool(current) if mode_ok else _mode_fallback(account)
     hint = result.get("hint", "") if isinstance(result, dict) else ""
     warning = (
         f"持倉模式無法切換成{'雙向' if hedge_wanted else '單向'}({result}{'，' + hint if hint else ''})，"
@@ -603,10 +618,15 @@ def resolve_position_mode(hedge_wanted, account=DEFAULT_ACCOUNT):
     return effective, warning
 
 
-def current_hedge_mode(account=DEFAULT_ACCOUNT, default=True):
-    """平倉時用：直接問交易所目前是不是雙向，避免用設定值猜錯而平不掉。"""
+def current_hedge_mode(account=DEFAULT_ACCOUNT, default=None):
+    """
+    直接問交易所目前是不是雙向。偵測失敗時(r10第7條)：有舊值用舊值，從沒偵測成功過
+    就假設單向。default參數保留只為了相容舊呼叫，不再使用——以前偵測失敗就回傳
+    呼叫端給的default(設定值，預設雙向)，單向帳戶平倉時會去找LONG側、找不到部位，
+    平倉單根本沒送出去。
+    """
     ok, current = get_position_mode(account=account)
-    return bool(current) if ok else bool(default)
+    return bool(current) if ok else _mode_fallback(account)
 
 
 def set_margin_type(margin_type, symbol=None, account=DEFAULT_ACCOUNT):
@@ -704,7 +724,13 @@ def _resend_on_mode_mismatch(method, path, params, side, is_closing, result, acc
         hedge_now = "positionSide" not in params
         logger.warning(f"持倉模式重新偵測失敗({hedge_now})，改用反轉後的假設重送")
     logger.warning(f"持倉模式不符({result.get('code')})，改用{'雙向' if hedge_now else '單向'}參數重送一次")
-    return _signed_request(method, path, _convert_mode_params(params, side, is_closing, hedge_now), account=account)
+    resend = _signed_request(method, path, _convert_mode_params(params, side, is_closing, hedge_now), account=account)
+    # r10：重送成功才記住那個假設；重送也失敗就清掉。反轉的依據是被拒的單本身，不是記住的值(r8)
+    if resend[0]:
+        _last_known_hedge[account] = hedge_now
+    else:
+        _last_known_hedge.pop(account, None)
+    return resend
 
 
 def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT, position_side=None):
@@ -942,6 +968,13 @@ def close_position(direction, symbol=None, account=DEFAULT_ACCOUNT, quantity=Non
 
     target_symbol = _resolve_symbol(symbol)
     is_long = direction == "bullish"
+    # positionRisk的列本身就說明了帳戶模式：單向只有BOTH列，雙向是LONG/SHORT兩列。
+    # 以它為準，不管呼叫端傳進來的hedge是不是猜錯的(r10第7條：偵測失敗時平倉單不能沒送出去)
+    sides = {p.get("positionSide", "BOTH") for p in position_data or [] if p.get("symbol") == target_symbol}
+    if "BOTH" in sides:
+        hedge = False
+    elif sides & {"LONG", "SHORT"}:
+        hedge = True
 
     if hedge:
         want_side = "LONG" if is_long else "SHORT"

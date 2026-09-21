@@ -166,19 +166,7 @@ class PaperTradingEngine:
                     if self._try_claim_close(position):
                         self._close_position(position, desired, "觸及移動停損" if position.get("trailing_active") else "觸及停損")
                     return
-                # 失敗照節奏定期提醒直到恢復(第8條「告警節奏」，r6)：第1、5、30次，之後每120次。
-                # 沒有backstop且補掛失敗(第2條)也走這裡，同一個節奏。
-                n = position.get("backstop_fail_count", 0) + 1
-                position["backstop_fail_count"] = n
-                if alert_cadence.should_alert(n):
-                    self._backstop_alert(
-                        f"⚠️ {self.label} 交易所停損單{'搬移' if position.get('backstop_algo_id') else '掛單'}失敗(第 {n} 次)\n"
-                        f"幣別：{symbol}\n想要的停損價：{desired}\n"
-                        f"目前交易所停損價：{self._current_backstop_text(position)}\n"
-                        f"錯誤：{new_id}\n"
-                        f"每輪自動重試直到成功；程式內停損仍正常運作"
-                    )
-                logger.warning(f"backstop掛單失敗({self.label}, 第{n}次)，下一輪重試: {new_id}")
+                self._backstop_failed(position, symbol, desired, new_id)
                 return
 
             old_id, old_legacy = position.get("backstop_algo_id"), position.get("backstop_used_legacy", False)
@@ -187,13 +175,14 @@ class PaperTradingEngine:
             position["backstop_price"] = desired
             db.update_paper_trade_backstop(position.get("id"), new_id, used_legacy)
             if old_id:
-                cancel_ok, _, _ = execution_module.cancel_algo_stop(
+                cancel_ok, cancel_res, _ = execution_module.cancel_algo_stop(
                     old_id, symbol=symbol, account=self.execution_account, used_legacy=old_legacy,
                 )
                 if not cancel_ok:
-                    # 帶quantity的reduceOnly單部位歸零後不會自動消失(第13條)，記下來平倉時再撤
-                    position.setdefault("backstop_stale_ids", []).append((old_id, old_legacy))
-                    logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_id})，平倉時再撤一次")
+                    # 帶quantity的reduceOnly單部位歸零後不會自動消失(第13條)。撤不掉的當下就是
+                    # 失敗發生點：就在這裡進待撤清單(計數1、告警)，之後每輪重試，不等平倉(r10第8條)
+                    self._queue_orphan_cancel(old_id, old_legacy, symbol, cancel_res)
+                    logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_id})，已進待撤清單")
             failed = position.pop("backstop_fail_count", 0)
             if failed:
                 self._backstop_alert(
@@ -202,7 +191,28 @@ class PaperTradingEngine:
                 )
             logger.info(f"backstop已對齊({self.label}): algoId={new_id}, 停損價{desired}")
         except Exception as e:
+            # 例外也是一次失敗，要計數、照節奏告警(r10第8條：失敗不能發生在計數之外)
             logger.error(f"同步backstop停損單發生例外({self.label}): {e}")
+            self._backstop_failed(position, self.execution_symbol or execution_module.DEFAULT_SYMBOL,
+                                  position.get("sl_price"), f"程式例外：{e}")
+
+    def _backstop_failed(self, position, symbol, desired, error):
+        """
+        backstop掛單/搬移失敗的唯一計數點(r10第8條「計數和恢復放錯位置」)：
+        交易所拒絕、程式例外、第幾次呼叫都走這裡，計數與告警在同一處。
+        沒有backstop且補掛失敗(第2條)也是這條。
+        """
+        n = position.get("backstop_fail_count", 0) + 1
+        position["backstop_fail_count"] = n
+        if alert_cadence.should_alert(n):
+            self._backstop_alert(
+                f"⚠️ {self.label} 交易所停損單{'搬移' if position.get('backstop_algo_id') else '掛單'}失敗(第 {n} 次)\n"
+                f"幣別：{symbol}\n想要的停損價：{desired}\n"
+                f"目前交易所停損價：{self._current_backstop_text(position)}\n"
+                f"錯誤：{error}\n"
+                f"每輪自動重試直到成功；程式內停損仍正常運作"
+            )
+        logger.warning(f"backstop掛單失敗({self.label}, 第{n}次)，下一輪重試: {error}")
 
     def _current_backstop_text(self, position):
         if not position.get("backstop_algo_id"):
@@ -239,7 +249,7 @@ class PaperTradingEngine:
             if ok:
                 if item["fail_count"]:
                     self._backstop_alert(
-                        f"✅ {self.label} 殘留停損單已撤掉(失敗 {item['fail_count']} 次後恢復)\n"
+                        f"✅ {self.label} 多餘的停損單已撤掉(失敗 {item['fail_count']} 次後恢復)\n"
                         f"幣別：{item['symbol']}\nalgoId：{item['algo_id']}"
                     )
                 continue
@@ -247,9 +257,9 @@ class PaperTradingEngine:
             item["last_error"] = result
             if alert_cadence.should_alert(item["fail_count"]):
                 self._backstop_alert(
-                    f"⚠️ {self.label} 平倉後殘留的停損單撤不掉(第 {item['fail_count']} 次)\n"
+                    f"⚠️ {self.label} 多餘的停損單撤不掉(第 {item['fail_count']} 次)\n"
                     f"幣別：{item['symbol']}\nalgoId：{item['algo_id']}\n"
-                    f"想要的停損價：無(部位已平，這張單應該撤掉)\n目前交易所停損：仍掛著\n"
+                    f"想要的停損價：無(這張是被換掉的舊單或平倉後殘留，應該撤掉)\n目前交易所停損：這張仍掛著\n"
                     f"錯誤：{result}\n每輪自動重試；也可以到幣安手動撤單"
                 )
             remaining.append(item)
@@ -271,6 +281,13 @@ class PaperTradingEngine:
         先觸發把部位平掉了)，呼叫端要用這個線索決定要不要再送一次真實平倉單。
         """
         symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
+        # backstop失敗中、部位從別的路徑平掉(程式出場、-2021、手動平倉)：失敗狀態在這裡
+        # 結束，要發收尾通知，不然使用者收到「失敗」卻永遠等不到結果(r10第8條)
+        failed = position.pop("backstop_fail_count", 0)
+        if failed:
+            self._backstop_alert(
+                f"ℹ️ {self.label} 部位已平倉，交易所停損單失敗狀態結束(期間失敗 {failed} 次)\n幣別：{symbol}"
+            )
         # 先清掉移動時沒撤成功的舊backstop(第13條：reduceOnly+quantity單不會自動消失)，
         # 還是撤不掉就進待撤清單，每輪重試、照節奏提醒
         for stale_id, stale_legacy in position.pop("backstop_stale_ids", []) or []:
@@ -582,6 +599,7 @@ class PaperTradingEngine:
                     if not leverage_ok:
                         raise RuntimeError(f"槓桿設定失敗，放棄下單: {leverage_result}")
 
+                    filled = False
                     success, result = execution_module.open_position(
                         direction=position["direction"],
                         quantity=quantity,
@@ -590,6 +608,7 @@ class PaperTradingEngine:
                         hedge=hedge,
                     )
                     executed = success
+                    filled = bool(success)  # r10第8條「已成交的動作先通知」：之後出錯不能改寫這個事實
                     # 把「這筆單有沒有真的開出真實部位、開了多少」記進部位跟資料庫，
                     # 平倉時只有真的開過才會送真實平倉單(修正記錄見README)
                     position["real_open_executed"] = bool(success)
@@ -646,12 +665,18 @@ class PaperTradingEngine:
                         slippage_note = None
                         logger.error(f"同步下單失敗({self.label}): {result}")
                 except Exception as e:
-                    executed = False
-                    execution_error = str(e)
-                    slippage_note = None
-                    position["real_open_executed"] = False
-                    db.update_paper_trade_real_open(position.get("id"), False, None)
-                    logger.error(f"同步下單發生例外({self.label}): {e}")
+                    if filled:
+                        # 單已經成交：部位是真的，通知照成交發、紀錄照開倉。以前這裡會把
+                        # real_open_executed改成False，出場時不送真實平倉單→交易所留孤兒倉(第3條)
+                        slippage_note = (slippage_note + "\n" if slippage_note else "") + f"(成交後記錄步驟出錯：{e}，不影響部位)"
+                        logger.error(f"開倉已成交但後續步驟出錯({self.label}): {e}")
+                    else:
+                        executed = False
+                        execution_error = str(e)
+                        slippage_note = None
+                        position["real_open_executed"] = False
+                        db.update_paper_trade_real_open(position.get("id"), False, None)
+                        logger.error(f"同步下單發生例外({self.label}): {e}")
 
         # 事件驅動通知：只有「這個引擎目前綁定真實下單」才會發送Telegram通知，
         # 純模擬的引擎完全不通知——原本是每個引擎開倉/平倉都會發，四個引擎
@@ -729,7 +754,7 @@ class PaperTradingEngine:
         # 避免留下沒有對應部位的孤兒掛單(這次修正的重點，見README)。
         position["_closing"] = True
         backstop_triggered = False
-        if position.get("backstop_algo_id") or position.get("backstop_stale_ids"):
+        if position.get("backstop_algo_id") or position.get("backstop_stale_ids") or position.get("backstop_fail_count"):
             backstop_triggered = self._cancel_backstop(position)
 
         if is_execution_engine and real_open is False:
@@ -758,6 +783,7 @@ class PaperTradingEngine:
                 logger.error(f"查詢backstop成交價失敗({self.label}): {e}")
 
         if is_execution_engine:
+            filled = False
             try:
                 success, result = execution_module.close_position(
                     direction=position["direction"],
@@ -769,6 +795,7 @@ class PaperTradingEngine:
                     ),
                 )
                 executed = success
+                filled = bool(success)
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
                     actual_fill_price = execution_module.extract_fill_price(result)
@@ -804,9 +831,13 @@ class PaperTradingEngine:
                     execution_error = result
                     logger.error(f"同步平倉失敗({self.label}): {result}")
             except Exception as e:
-                executed = False
-                execution_error = str(e)
-                logger.error(f"同步平倉發生例外({self.label}): {e}")
+                if filled:
+                    slippage_note = (slippage_note + "\n" if slippage_note else "") + f"(成交後記錄步驟出錯：{e}，不影響平倉)"
+                    logger.error(f"平倉已成交但後續步驟出錯({self.label}): {e}")
+                else:
+                    executed = False
+                    execution_error = str(e)
+                    logger.error(f"同步平倉發生例外({self.label}): {e}")
 
         if is_execution_engine or skip_close_reason:
             try:
