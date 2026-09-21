@@ -46,8 +46,9 @@ def get_daily_pnl_usd(engine, quantity):
             exit_dt = datetime.fromisoformat(exit_time_str)
         except ValueError:
             continue
-        if exit_dt.date() == today:
-            daily_pnl_points += t.get("pnl_points") or 0.0
+        if exit_dt.date() == today and isinstance(t.get("pnl_points"), (int, float)):
+            # 損益未知的不加(不當成0)，筆數另外由get_unknown_pnl_count回報(第8條r27)
+            daily_pnl_points += t["pnl_points"]
 
     return daily_pnl_points * quantity
 
@@ -64,12 +65,23 @@ def get_consecutive_losses(engine):
 
     count = 0
     for t in trades:
-        pnl = t.get("pnl_points") or 0.0
+        pnl = t.get("pnl_points")
+        if pnl is None:
+            continue  # 損益未知：不算虧損、也不打斷連續虧損(第8條r27)，筆數另外回報
         if pnl <= 0:
             count += 1
         else:
             break
     return count
+
+
+def get_unknown_pnl_count(engine):
+    """最近平倉裡損益未知的筆數：每日損益與連續虧損都沒算到它們，要在風控狀態上講明。"""
+    if db.is_enabled():
+        trades = db.get_closed_paper_trades(limit=50, engine_id=engine.engine_id)
+    else:
+        trades = list(engine._closed_trades_memory)
+    return sum(1 for t in trades if t.get("pnl_points") is None)
 
 
 def check_spread_edge(sl_points, spread_points, min_ratio):
@@ -246,6 +258,7 @@ def status(engine, quantity):
     return {
         "daily_pnl_usd": round(get_daily_pnl_usd(engine, quantity), 2),
         "consecutive_losses": get_consecutive_losses(engine),
+        "unknown_pnl_trades": get_unknown_pnl_count(engine),  # 上面兩個數字都沒算到這幾筆
         "tripped": not allowed,
         "reason": reason,
     }

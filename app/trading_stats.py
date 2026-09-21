@@ -10,6 +10,17 @@
 """
 
 
+def real_usd_summary(trades):
+    """
+    真實下單的USDT損益加總(第8條r28「估算也不能把未知包裝成已知」)：只用真實成交價算出來的
+    real_pnl_usd。缺成交價的真實單記「未知」另外計數；純模擬單不算(那不是真錢)。
+    以前網頁的總損益USDT是「全部模擬點數×張數」，連沒真的下過單的交易都算進去。
+    """
+    known = [t["real_pnl_usd"] for t in trades if t.get("real_open_executed") and isinstance(t.get("real_pnl_usd"), (int, float))]
+    unknown = sum(1 for t in trades if t.get("real_open_executed") and not isinstance(t.get("real_pnl_usd"), (int, float)))
+    return {"total": round(sum(known), 2), "known": len(known), "unknown": unknown}
+
+
 def compute_stats(trades, spread_cost_points=0.0):
     """
     輸入已平倉的模擬單清單(順序不拘，函式內部會自行按entry_time排序來算最大回撤)，
@@ -44,6 +55,10 @@ def compute_stats(trades, spread_cost_points=0.0):
         trades = adjusted
 
     total = len(trades)
+    # 損益未知(r24起結帳遇缺欄位會記成None)不算勝負、另外計數(第8條r27)：以前勝率的分母包含它們，
+    # 等於把未知算成虧損、勝率被拉低
+    known_total = sum(1 for t in trades if t.get("pnl_points") is not None)
+    unknown_pnl_trades = total - known_total
     wins = [t for t in trades if t.get("pnl_points") and t["pnl_points"] > 0]
     losses = [t for t in trades if t.get("pnl_points") is not None and t["pnl_points"] <= 0]
 
@@ -51,7 +66,7 @@ def compute_stats(trades, spread_cost_points=0.0):
     gross_profit = sum(t["pnl_points"] for t in wins)
     gross_loss = abs(sum(t["pnl_points"] for t in losses))
 
-    win_rate = (len(wins) / total * 100) if total > 0 else 0.0
+    win_rate = (len(wins) / known_total * 100) if known_total > 0 else 0.0
     avg_win = (gross_profit / len(wins)) if wins else 0.0
     avg_loss = (gross_loss / len(losses)) if losses else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
@@ -84,6 +99,7 @@ def compute_stats(trades, spread_cost_points=0.0):
             drawdown_trough_time = t.get("exit_time") or t.get("entry_time")
 
     return {
+        "unknown_pnl_trades": unknown_pnl_trades,
         "total_trades": total,
         "win_count": len(wins),
         "loss_count": len(losses),

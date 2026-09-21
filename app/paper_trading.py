@@ -463,7 +463,7 @@ class PaperTradingEngine:
         """
         ok, qty, entry, _ = self._side_qty(position["direction"])
         if not ok:
-            return
+            return "unknown"
         base = position.get("real_open_baseline", 0.0) or 0.0
         if qty - base > 1e-9:
             claimed = round(qty - base, 6)
@@ -479,7 +479,7 @@ class PaperTradingEngine:
                 f"數量：{claimed}(取自交易所)　均價：{entry if base <= 1e-9 else '與既有部位合併，無法單獨取得'}"
             )
             # 認領回來的部位一定還沒掛停損，當場掛(第3條r13)；交易所那一列就是證據，不重查(第2條r22)
-            self._sync_backstop(position, known_qty=claimed)
+            return "claimed:" + str(self._sync_backstop(position, known_qty=claimed))
         elif time.time() > (position.get("real_open_pending_until") or 0):
             position["real_open_executed"] = False
             position.pop("real_open_pending_until", None)
@@ -488,6 +488,8 @@ class PaperTradingEngine:
                 f"ℹ️ {self.label} 送單結果不明的開倉，{OPEN_PENDING_SECONDS}秒內交易所都沒有對應部位，判定未成交\n"
                 f"此筆之後只記帳面，出場不送真實平倉單"
             )
+            return "expired"
+        return "waiting"
 
     def _keep_after_failed_close(self, position, exit_price, exit_reason, error, exchange_qty):
         """
@@ -514,17 +516,18 @@ class PaperTradingEngine:
     def _retry_pending_close(self):
         position = self._position
         if not position or not position.get("pending_close"):
-            return
+            return "none"
         if not self._try_claim_close(position):
-            return
+            return "busy"
         pc = position["pending_close"]
         self._close_position(position, _latest_price() or pc.get("price"), pc.get("reason", "待平倉重試"))
+        return "closed" if self._position is not position else "still_pending"
 
     def _check_exchange_quantity(self, position):
         """
         比對交易所數量與帳上數量(第8條r12/r13)：沒有交易所停利單也要做——App手動減碼、
         ADL自動減倉都會讓帳實不符，之後的停損、平倉就會用舊數量。
-          - 變少 → 記一筆部分出場(以標記價估損益)、通知、更新帳上數量
+          - 變少 → 更新帳上數量、通知；減少那部分的成交價不知道，損益記未知(第8條r28，不用標記價估)
           - 連續3輪都是0 → 部位已不在交易所(手動平倉或停損觸發)，走平倉流程確認
         """
         if position.get("pending_close") or position.get("_closing") or position.get("real_open_pending_until"):
@@ -544,16 +547,15 @@ class PaperTradingEngine:
         position.pop("gone_checks", None)
         if qty < recorded - 1e-9:
             reduced = round(recorded - qty, 6)
-            entry_ref = position.get("entry_actual_price") or position["entry_price"]
-            px = mark or _latest_price() or entry_ref
-            pnl = ((px - entry_ref) if position["direction"] == "bullish" else (entry_ref - px)) * reduced
-            position["partial_realized_usd"] = position.get("partial_realized_usd", 0.0) + pnl
+            # 減少那部分(App手動減碼/ADL)的成交價不知道：損益記未知，不用標記價估(第8條r28)
+            position["partial_pnl_unknown"] = True
             position["real_open_quantity"] = round(qty, 6)
             db.update_paper_trade_real_open(position.get("id"), True, round(qty, 6))
             self._backstop_alert(
                 f"ℹ️ {self.label} 交易所部位數量減少 {recorded} → {round(qty, 6)}(可能是App手動減碼或ADL)\n"
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
-                f"已更新帳上數量；減少的 {reduced} 以標記價 {px} 估算損益 {pnl:+.2f} U(估)"
+                f"已更新帳上數量；減少的 {reduced} 成交價不知道，這部分損益未知(以交易所成交明細為準)，"
+                f"這筆的USDT總損益也會記為未知"
             )
             return "reduced"
         return "same"
@@ -1298,8 +1300,9 @@ class PaperTradingEngine:
                 if qty and ea and xa and (executed or backstop_triggered):
                     real_qty = position.get("real_open_quantity") or qty
                     real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
-                    # 先前偵測到的部分出場(App手動減碼/ADL)損益要加回來(第8條r12)
-                    real_pnl_usd += position.get("partial_realized_usd", 0.0)
+                    # 期間有部分出場(App手動減碼/ADL)而那部分成交價不知道：整筆USDT損益記未知(第8條r28)
+                    if position.get("partial_pnl_unknown"):
+                        real_pnl_usd = None
                 # 停損出場時附上「當時的停損位/峰值/出場價與停損位的差」，才分得出是
                 # 停損位本身設在那裡，還是價格跳空穿過停損位(15秒輪詢一次會有落差)
                 stop_note = None
@@ -1364,6 +1367,8 @@ class PaperTradingEngine:
         # 預設值0時，這組數字會跟raw stats完全一樣，不影響任何既有行為。
         spread_points = s.get("execution_assumed_spread_points", 0.0)
         stats_spread_adjusted = compute_stats(stats_trades, spread_cost_points=spread_points)
+        from app.trading_stats import real_usd_summary
+        real_usd = real_usd_summary(stats_trades)
         readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
 
         # 用每筆「實際存下來」的真正執行滑點算真實影響(含肥尾佔比與調整後PF)，
@@ -1393,6 +1398,7 @@ class PaperTradingEngine:
             "readiness": readiness,
             "circuit_breaker": circuit_breaker,  # None代表這個引擎沒有接真實下單，不適用風控斷路器
             # 給dashboard標題用：這個引擎現在有沒有接真實下單、打的是測試網還是正式環境、數量多少
+            "real_usd": real_usd,
             "execution": {
                 "enabled": circuit_breaker is not None,
                 "quantity": s.get("execution_quantity"),

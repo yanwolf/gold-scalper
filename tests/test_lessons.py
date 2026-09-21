@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r25 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r28 第1、2、3、7、8、14條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -776,7 +776,8 @@ class Lesson22(ExecHarness):
             self.eng._retry_orphan_cancels()
         self.assertIn("GOOD", [c.args[0] for c in cc.call_args_list], "壞掉那筆後面的要照樣處理")
         self.assertEqual([i.get("algo_id") for i in self.eng._orphan_cancels], ["BAD"], "壞掉那筆要留在清單，不能丟掉")
-        self.assertTrue(any("BAD" in a for a in self.eng.alerts), self.eng.alerts)
+        self.assertTrue(any("BAD" in a and "資料有問題" in a for a in self.eng.alerts),
+                        f"前提：壞資料真的讓那一筆走到例外處理(用法第5點r28)，不是走一般的撤單失敗：{self.eng.alerts}")
 
     # 2c：手上有正向證據時，直接用已知數量掛停損，不重查
     def test_t2c_open_fill_places_stop_with_known_qty_even_if_exchange_lags(self):
@@ -825,7 +826,12 @@ class Lesson25(ExecHarness):
         self.assertEqual(run(self._real_pos(backstop_algo_id=None), (True, [], 200)), ["skip"])
         self.assertEqual(run(self._real_pos(), (False, {"code": -1001}, 500)), ["unknown"])
         self.assertEqual(run(self._real_pos(), (True, [{"algoId": "B1"}], 200)), ["present"])
-        self.assertEqual(run(self._real_pos(), (True, [], 200), 3), ["missing", "missing", "replaced:placed"])
+        self.run_guard = run
+
+    def test_t2_guard_replace_exit_returns_placement_result(self):
+        """獨立成一個情境(用法第5點r28)：只有這個出口會查部位，不跟上面三個不查部位的出口共用命中次數。"""
+        self.test_t2_guard_every_exit_returns_reason()
+        self.assertEqual(self.run_guard(self._real_pos(), (True, [], 200), 3), ["missing", "missing", "replaced:placed"])
 
     # 第8條r24：結帳排最前面；算損益不能丟例外
     def test_t8a_record_is_written_before_cleanup_and_pnl_error_does_not_block(self):
@@ -887,27 +893,122 @@ class NotifierFormat(unittest.TestCase):
         self.assertEqual(len(sent), 1, f"通知要送出：{sent}")
         self.assertIn("損益：未知", sent[0])
 
+    # 放在這個不mock通知的情境：ExecHarness在setUp裡把notify_trade_event整個mock掉，格式化根本不會執行
+    # 8c：估算不能把未知包裝成已知(第8條r28)
+    def test_t8c_close_notice_does_not_estimate_usd_from_paper_points(self):
+        from app.notifier import notifier as N, TelegramNotifier
+        sent = []
+        with mock.patch.object(TelegramNotifier, "is_enabled", new_callable=mock.PropertyMock, return_value=True), \
+             mock.patch.object(TelegramNotifier, "is_muted", new_callable=mock.PropertyMock, return_value=False), \
+             mock.patch.object(N, "_send_telegram_message", side_effect=lambda t: sent.append(t) or (True, None)):
+            N.notify_trade_event(action="close", label="15分K", direction="bullish", price=4380.0, exit_reason="觸及停損",
+                                 pnl_points=-2.0, executed=True, quantity=0.1, real_pnl_usd=None)
+        self.assertEqual(len(sent), 1, "前提：通知真的組出來、送出了")
+        self.assertIn("-2.00 points", sent[0], "前提：模擬點數照常顯示")
+        self.assertNotIn("-0.20 USDT", sent[0], "真實成交價查不到，不能用模擬點數×張數估出一個USDT")
+        self.assertIn("USDT 損益未知", sent[0])
+
+
+
+# ------------------------------------------------------------------ r26 → r28
+class Lesson28(ExecHarness):
+    # 8b：統計——損益未知不算勝負，另外計數
+    def test_t8b_stats_unknown_pnl_is_neither_win_nor_loss(self):
+        from app import trading_stats as TS
+        trades = [{"entry_time": "2026-09-21T01:00:00+00:00", "pnl_points": 5.0, "direction": "bullish"},
+                  {"entry_time": "2026-09-21T02:00:00+00:00", "pnl_points": -3.0, "direction": "bullish"},
+                  {"entry_time": "2026-09-21T03:00:00+00:00", "pnl_points": None, "direction": "bullish"}]
+        st = TS.compute_stats(trades)
+        self.assertEqual(st["win_rate"], 50.0, "1勝1負；損益未知那筆不能算成虧損拉低勝率")
+        self.assertEqual(st.get("unknown_pnl_trades"), 1, "損益未知的筆數要另外計")
+
+    def test_t8b_risk_guard_unknown_pnl_not_counted_as_loss(self):
+        from app import risk_guard as RG
+        class Eng:
+            _closed_trades_memory = [{"exit_time": "2026-09-21T01:00:00+00:00", "pnl_points": -1.0},
+                                     {"exit_time": "2026-09-21T02:00:00+00:00", "pnl_points": None}]
+            engine_id = "x"
+        with mock.patch.object(RG.db, "is_enabled", return_value=False):
+            n = RG.get_consecutive_losses(Eng())
+            unknown = RG.get_unknown_pnl_count(Eng())
+        self.assertEqual(n, 1, "最新那筆損益未知，不能算成一筆虧損")
+        self.assertEqual(unknown, 1)
+
+    def test_t8c_partial_reduction_pnl_is_unknown_not_mark_estimate(self):
+        pos = _pos(real_open_quantity=0.2, entry_actual_price=4391.0, real_open_baseline=0.0)
+        self.eng._position = pos
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1, mark=4396.0))):
+            status = self.eng._check_exchange_quantity(pos)
+        self.assertEqual(status, "reduced", "前提：偵測到數量減少")
+        self.assertTrue(pos.get("partial_pnl_unknown"), "減少那部分的成交價不知道，損益要記未知")
+        self.assertFalse(any("0.50" in a or "估算損益" in a for a in self.eng.alerts), f"不能用標記價估：{self.eng.alerts}")
+        self.assertTrue(any("未知" in a for a in self.eng.alerts), self.eng.alerts)
+
+    def test_t8c_real_usd_summary_uses_only_actual_fills(self):
+        from app import trading_stats as TS
+        trades = [{"real_open_executed": True, "real_pnl_usd": 1.5},
+                  {"real_open_executed": True, "real_pnl_usd": None, "pnl_points": 30.0},  # 缺成交價：未知
+                  {"real_open_executed": False, "real_pnl_usd": None, "pnl_points": 99.0}]  # 純模擬：不算
+        s = TS.real_usd_summary(trades)
+        self.assertEqual((s["total"], s["known"], s["unknown"]), (1.5, 1, 1))
+
 
 class StaticChecks(unittest.TestCase):
     """全域／靜態檢查自成一個情境(用法第5點r25)：不放在別的情境最後，才不會繼承那個情境的突變命中次數。"""
+    RETURN_FUNCS = ("_check_backstop_present", "_sync_backstop", "_check_exchange_quantity",
+                    "_resolve_open_pending", "_retry_pending_close")
+
+    @staticmethod
+    def return_problems(fn_ast):
+        """回傳原因檢查(第2條r25/r27/r28)：每個return帶值(明寫return None也算沒帶)；最後不能掉出函式。"""
+        import ast
+        out = []
+        for n in ast.walk(fn_ast):
+            if isinstance(n, ast.Return) and (n.value is None or (isinstance(n.value, ast.Constant) and n.value.value is None)):
+                out.append(f"第{n.lineno}行不帶值")
+        def ends(stmts):
+            last = stmts[-1]
+            if isinstance(last, (ast.Return, ast.Raise)):
+                return True
+            if isinstance(last, ast.If):
+                return bool(last.orelse) and ends(last.body) and ends(last.orelse)
+            if isinstance(last, ast.Try):
+                return ends(last.body) and all(ends(h.body) for h in last.handlers)
+            return False
+        if not ends(fn_ast.body):
+            out.append("最後會掉出函式")
+        return out
+
+    def test_return_checker_selftest(self):
+        import ast
+        cases = [("def f():\n    return 1", False), ("def f():\n    if x:\n        return\n    return 1", True),
+                 ("def f():\n    return None", True), ("def f():\n    if x:\n        return 1", True),
+                 ("def f():\n    if x:\n        return 1\n    else:\n        return 2", False),
+                 ("def f():\n    try:\n        return 1\n    except E:\n        pass", True)]
+        for src, bad in cases:
+            self.assertEqual(bool(self.return_problems(ast.parse(src).body[0])), bad, src)
+
     def test_every_return_in_guard_functions_carries_a_value(self):
         import ast, inspect, textwrap
-        for fn in ("_check_backstop_present", "_sync_backstop", "_check_exchange_quantity"):
-            src = textwrap.dedent(inspect.getsource(getattr(pt.PaperTradingEngine, fn)))
-            tree = ast.parse(src).body[0]
-            bare = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value is None]
-            self.assertEqual(bare, [], f"{fn} 有不帶值的return(第2條r25)")
-            last = tree.body[-1]
-            ends = isinstance(last, ast.Return) or (isinstance(last, ast.Try) and
-                   isinstance(last.body[-1], ast.Return) and all(isinstance(h.body[-1], ast.Return) for h in last.handlers))
-            self.assertTrue(ends, f"{fn} 最後會掉出函式、回傳None")
+        for fn in self.RETURN_FUNCS:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(pt.PaperTradingEngine, fn)))).body[0]
+            n_returns = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Return))
+            self.assertGreater(n_returns, 1, f"前提：{fn} 真的解析到了多個出口(第19種：什麼都沒掃到時也會通過)")
+            self.assertEqual(self.return_problems(tree), [], f"{fn}(第2條r25/r27)")
 
 
 class Lesson14(unittest.TestCase):
     def test_t14_pyflakes_no_undefined_names(self):
         import subprocess, sys, os
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        r = subprocess.run([sys.executable, "-m", "pyflakes", "app"], cwd=root, capture_output=True, text=True)
+        # 金絲雀：一個一定有未定義名稱的檔，pyflakes必須報出來(第19種：工具沒真的在查時會空跑)
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as cf:
+            cf.write("def f():\n    return undefined_canary_name\n")
+        canary = subprocess.run([sys.executable, "-m", "pyflakes", cf.name], capture_output=True, text=True).stdout
+        self.assertIn("undefined_canary_name", canary, "前提：pyflakes真的抓得到未定義名稱")
+        r = subprocess.run([sys.executable, "-m", "pyflakes", "app", "tests", "scripts"], cwd=root, capture_output=True, text=True)
+        self.assertNotIn("unable to detect", r.stdout, "有檔案用了import *，pyflakes在那些檔上完全失效(r28)")
         out = r.stdout
         # 前提(靜態檢查抓到只有否定句)：pyflakes真的跑了、真的掃到了程式。沒裝pyflakes時輸出是空的，
         # 「沒有undefined name」就會空跑通過。main.py那一條已知的誤報可以當證據。

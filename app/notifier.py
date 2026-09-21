@@ -147,9 +147,11 @@ class TelegramNotifier:
                 f"出場原因：{exit_reason}\n"
                 + (f"{stop_note}\n" if stop_note else "")
                 + (f"損益：{pnl_sign}{pnl_points:.2f} points" if pnl_points is not None else "損益：未知(平倉紀錄有欄位缺漏)")
-                + (f"（{quantity:g} 張 ≈ {'+' if (real_pnl_usd if real_pnl_usd is not None else pnl_points * quantity) >= 0 else ''}"
-                   f"{(real_pnl_usd if real_pnl_usd is not None else pnl_points * quantity):.2f} USDT"
-                   f"{'，依真實成交價' if real_pnl_usd is not None else ''}）" if quantity and (pnl_points is not None or real_pnl_usd is not None) else "")
+                # 只用真實成交價算的USDT(第8條r28)。查不到時寫未知——模擬點數×張數不是這張單的實際損益
+                + (f"（{quantity:g} 張，USDT 損益未知：成交價查不到，以交易所成交明細為準）" if quantity and real_pnl_usd is None else "")
+                + (f"（{quantity:g} 張 ≈ {'+' if real_pnl_usd >= 0 else ''}"
+                   f"{real_pnl_usd:.2f} USDT"
+                   f"{'，依真實成交價' if real_pnl_usd is not None else ''}）" if quantity and real_pnl_usd is not None else "")
                 + "\n\n"
                 f"{execution_note}"
             )
