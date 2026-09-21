@@ -199,6 +199,18 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS real_open_quantity DOUBLE PRECISION;
                 """)
+                # 交易所backstop停損單(修正記錄見README)：真實開倉成功時順便掛一張
+                # STOP_MARKET條件單當最後防線，algo_id記下來，平倉時要憑這個去撤單；
+                # backstop_used_legacy記錄這張單當初是用新的Algo端點還是舊端點掛的，
+                # 撤單時要照同一個端點打，不能混用。
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS backstop_algo_id TEXT;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS backstop_used_legacy BOOLEAN;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -439,6 +451,28 @@ def update_paper_trade_stop(trade_id, sl_price, peak_price, trailing_active):
         logger.error(f"更新移動停損失敗: {e}")
 
 
+def update_paper_trade_backstop(trade_id, backstop_algo_id, backstop_used_legacy):
+    """
+    記下這筆倉位的交易所backstop停損單algoId，平倉時才知道要撤哪一張
+    (修正記錄見README)。trade_id是None時直接跳過。
+    """
+    if not _enabled or trade_id is None:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE paper_trades SET backstop_algo_id = %s, backstop_used_legacy = %s WHERE id = %s;",
+                    (backstop_algo_id, backstop_used_legacy, trade_id),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"記錄backstop停損單失敗: {e}")
+
+
 def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points,
                        exit_expected_price=None, exit_actual_price=None,
                        exit_slippage_points=None, exit_spread_points=None):
@@ -494,7 +528,8 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
                 cur.execute("""
                     SELECT id, direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                            chan_reason, profile_reason, interval_seconds, engine_id,
-                           real_open_executed, real_open_quantity
+                           real_open_executed, real_open_quantity,
+                           backstop_algo_id, backstop_used_legacy
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -513,6 +548,8 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             "chan_reason": row[7], "profile_reason": row[8], "interval_seconds": row[9],
             "engine_id": row[10],
             "real_open_executed": row[11], "real_open_quantity": row[12],
+            # 服務重啟後要能認回這張backstop停損單(平倉時才知道要撤哪張)(修正記錄見README)
+            "backstop_algo_id": row[13], "backstop_used_legacy": row[14],
         }
     except Exception as e:
         logger.error(f"讀取開倉中模擬單失敗: {e}")

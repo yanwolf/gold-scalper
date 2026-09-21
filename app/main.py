@@ -15,6 +15,7 @@ app/analysis.py，在這裡 import 進來、加新的 endpoint 即可，
 import asyncio
 import logging
 import os
+import threading
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
@@ -35,6 +36,7 @@ from app import execution as execution_module
 from app import db
 from app import role as role_module
 from app import risk_guard
+from app import preflight as preflight_module
 
 logger = logging.getLogger("main")
 
@@ -73,6 +75,9 @@ async def startup_event():
     for engine in PAPER_TRADING_ENGINES.values():
         engine.start()  # 依角色載入的引擎平行啟動，各自獨立追蹤
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
+    # 開機跑一次交易所相容性自檢(BINANCE_LESSONS.md)，異常發Telegram，
+    # 不要等到真的下單才發現API又改了。丟背景thread避免拖慢啟動。
+    threading.Thread(target=lambda: preflight_module.run_and_report(send=True), daemon=True).start()
     if role_module.is_live():
         # 正式端啟動時跟交易所對帳：DB記得有部位但交易所沒有(或反過來)就立刻告警，
         # 避免程序重啟後出現沒人管的孤兒單
@@ -335,6 +340,16 @@ async def health_monitor_status():
     這支endpoint是給想直接查看目前狀態(不用等告警)的用途，dashboard也會顯示。
     """
     return health_monitor.get_status()
+
+
+@app.get("/preflight")
+async def preflight_check(send: bool = False):
+    """
+    交易所相容性自檢(見BINANCE_LESSONS.md、app/preflight.py)：手動重跑用。
+    send=true時異常會額外發一次Telegram(跟開機自動跑的那次一樣)，
+    預設false只回傳結果給網頁看，不重複發通知。
+    """
+    return preflight_module.run_and_report(send=send)
 
 
 # ---------------------------------------------------------------------------

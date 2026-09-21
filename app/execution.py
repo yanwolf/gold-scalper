@@ -82,7 +82,8 @@ def _resolve_symbol(symbol):
     """
     return (symbol or DEFAULT_SYMBOL).upper()
 
-_symbol_precision_cache = {}  # {(account, symbol): precision}
+_symbol_precision_cache = {}  # 已不再使用，保留避免其他地方有殘留參照
+_symbol_filters_cache = {}  # {(account, symbol): precision}
 
 
 def _get_credentials(account=DEFAULT_ACCOUNT):
@@ -145,11 +146,15 @@ def _sign(params: dict, account=DEFAULT_ACCOUNT) -> dict:
     return params
 
 
-def _signed_request(method, path, params=None, account=DEFAULT_ACCOUNT):
-    """呼叫需要簽章的私有端點(帳戶、下單、部位查詢等)。回傳(success, data_or_error)。"""
+def _signed_request(method, path, params=None, account=DEFAULT_ACCOUNT, return_status=False):
+    """呼叫需要簽章的私有端點(帳戶、下單、部位查詢等)。回傳(success, data_or_error)，
+    return_status=True時回傳(success, data_or_error, http_status_code)——只有
+    place_algo_stop()判斷「404=端點不存在，該退回舊寫法」時需要用到狀態碼本身，
+    其他呼叫端不用管這個參數。"""
     api_key, api_secret = _get_credentials(account)
     if not api_key or not api_secret:
-        return False, f"帳戶「{account}」尚未設定API金鑰(BINANCE_API_KEY_{account.upper()}/BINANCE_API_SECRET_{account.upper()})"
+        error = f"帳戶「{account}」尚未設定API金鑰(BINANCE_API_KEY_{account.upper()}/BINANCE_API_SECRET_{account.upper()})"
+        return (False, error, None) if return_status else (False, error)
 
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
@@ -161,41 +166,129 @@ def _signed_request(method, path, params=None, account=DEFAULT_ACCOUNT):
 
     try:
         resp = requests.request(method, url, headers=headers, params=signed_params, timeout=10)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            data = resp.text
         if resp.status_code >= 400:
             logger.error(f"幣安API錯誤(帳戶{account}, {resp.status_code}): {data}")
-            return False, data
-        return True, data
+            return (False, data, resp.status_code) if return_status else (False, data)
+        return (True, data, resp.status_code) if return_status else (True, data)
     except Exception as e:
         logger.error(f"幣安API請求失敗(帳戶{account}): {e}")
-        return False, str(e)
+        return (False, str(e), None) if return_status else (False, str(e))
 
 
 def get_symbol_precision(symbol=None, account=DEFAULT_ACCOUNT):
     """
     查合約的數量精度(quantityPrecision)，下單數量要依這個精度四捨五入，
-    不然幣安會直接拒絕訂單。結果依(帳戶, 商品)快取起來，不同帳戶就算剛好
-    查同一個symbol也分開存，避免未來多帳戶情境下互相污染。這是公開端點，
-    不需要簽章，但測試網/正式環境的base_url仍然依帳戶決定。
+    不然幣安會直接拒絕訂單。內部呼叫get_symbol_filters()、只回傳精度那一項，
+    保留這個函式是為了不用改動既有呼叫點的介面。
+    """
+    return get_symbol_filters(symbol, account=account)["quantity_precision"]
+
+
+def get_symbol_filters(symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    查合約完整的下單規則：數量精度、stepSize(數量最小增量)、tickSize(價格最小
+    增量)、minQty、minNotional(最小名目金額)。結果依(帳戶, 商品)快取。這是公開
+    端點，不需要簽章，但測試網/正式環境的base_url仍然依帳戶決定。
+
+    BINANCE_LESSONS.md 第4條：下單數量/價格沒照交易所精度會被 -1111 拒絕；
+    quantityPrecision只是小數位數，不等於stepSize本身(例如stepSize=5的整數
+    商品，quantityPrecision=0但5顆一批，round()對不上)，這裡改成直接讀
+    LOT_SIZE/PRICE_FILTER/MIN_NOTIONAL三個filter的原始值，round_quantity()/
+    round_price()用這些值做無條件捨去/取整，而不是單純的小數位四捨五入。
     """
     symbol = _resolve_symbol(symbol)
 
     cache_key = (account, symbol)
-    if cache_key in _symbol_precision_cache:
-        return _symbol_precision_cache[cache_key]
+    if cache_key in _symbol_filters_cache:
+        return _symbol_filters_cache[cache_key]
 
+    result = {
+        "quantity_precision": 3, "step_size": 0.001, "tick_size": 0.01,
+        "min_qty": 0.001, "min_notional": 0.0,
+    }
     try:
         resp = requests.get(f"{_base_url(account)}/fapi/v1/exchangeInfo", timeout=10)
         data = resp.json()
         for s in data.get("symbols", []):
-            if s["symbol"] == symbol:
-                precision = s.get("quantityPrecision", 3)
-                _symbol_precision_cache[cache_key] = precision
-                return precision
+            if s["symbol"] != symbol:
+                continue
+            result["quantity_precision"] = s.get("quantityPrecision", 3)
+            for f in s.get("filters", []):
+                ftype = f.get("filterType")
+                if ftype == "LOT_SIZE":
+                    result["step_size"] = float(f.get("stepSize", result["step_size"]))
+                    result["min_qty"] = float(f.get("minQty", result["min_qty"]))
+                elif ftype == "PRICE_FILTER":
+                    result["tick_size"] = float(f.get("tickSize", result["tick_size"]))
+                elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                    result["min_notional"] = float(f.get("notional", f.get("minNotional", result["min_notional"])) or 0)
+            break
+        _symbol_filters_cache[cache_key] = result
     except Exception as e:
-        logger.error(f"查詢合約精度失敗(帳戶{account}, {symbol}): {e}")
+        logger.error(f"查詢合約下單規則失敗(帳戶{account}, {symbol}): {e}")
+        # 查不到就回保守預設值(符合先前查到的XAUUSDT規格)，不快取，讓下一次呼叫重試
 
-    return 3  # 查不到的話用一個保守預設值(0.001精度，符合先前查到的XAUUSDT最小交易單位)
+    return result
+
+
+def _round_step(value, step):
+    """無條件捨去到step的倍數(不是四捨五入)：避免數量湊整後超過原本要下的量/可用保證金。"""
+    if step <= 0:
+        return value
+    import math
+    return math.floor(value / step + 1e-9) * step
+
+
+def round_quantity(quantity, symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    照交易所LOT_SIZE規則處理下單數量：無條件捨去到stepSize，並檢查是否低於
+    minQty。回傳(quantity, error)，error不是None時代表數量太小下不了單，
+    呼叫端應該放棄這次下單而不是硬送出去等交易所拒絕(BINANCE_LESSONS.md第4條)。
+    """
+    filters = get_symbol_filters(symbol, account=account)
+    step = filters["step_size"]
+    qty = _round_step(quantity, step)
+    # 用stepSize的小數位數決定顯示精度，避免浮點數捨去後出現像0.30000000000000004這種尾數
+    decimals = filters["quantity_precision"]
+    qty = round(qty, decimals)
+    if qty < filters["min_qty"] or qty <= 0:
+        return qty, f"數量{qty}低於最小下單量{filters['min_qty']}"
+    return qty, None
+
+
+def round_price(price, symbol=None, account=DEFAULT_ACCOUNT):
+    """照交易所PRICE_FILTER規則把價格取整到tickSize(用於未來要掛真實停損單時)。"""
+    filters = get_symbol_filters(symbol, account=account)
+    tick = filters["tick_size"]
+    if tick <= 0:
+        return price
+    import math
+    rounded = round(price / tick) * tick
+    # tickSize的小數位數用來修掉浮點誤差
+    decimals = max(0, len(str(tick).split(".")[-1])) if "." in str(tick) else 0
+    return round(rounded, decimals)
+
+
+def max_leverage(symbol=None, account=DEFAULT_ACCOUNT):
+    """
+    查這個帳戶對這個商品目前允許的最高槓桿(GET /fapi/v1/leverageBracket)。
+    新子帳戶/小市值幣常見上限比預期低(BINANCE_LESSONS.md第5條)，preflight用
+    這個提前示警，而不是等到真的下單被-4421拒絕才發現(那個是open flow裡的
+    被動重試，這裡是主動查詢)。查不到回傳None，呼叫端自行決定要不要當作異常。
+    """
+    symbol = _resolve_symbol(symbol)
+    success, result = _signed_request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol}, account=account)
+    if not success or not isinstance(result, list) or not result:
+        return None
+    try:
+        brackets = result[0].get("brackets", [])
+        return max(int(b["initialLeverage"]) for b in brackets) if brackets else None
+    except Exception:
+        return None
 
 
 def get_mark_price(symbol, account=DEFAULT_ACCOUNT):
@@ -311,8 +404,7 @@ def estimate_quantity_for_target(target_price_move, target_pnl_usd=1.0, symbol=N
     symbol = _resolve_symbol(symbol)
 
     quantity = target_pnl_usd / target_price_move
-    precision = get_symbol_precision(symbol, account=account)
-    quantity = round(quantity, precision)
+    quantity, _ = round_quantity(quantity, symbol, account=account)  # 這裡只是試算建議值，數量太小也不擋，交給使用者自己判斷
 
     if current_price is None:
         price_ok, price_result = get_mark_price(symbol, account=account)
@@ -344,8 +436,8 @@ def calculate_quantity(risk_usd, sl_points, symbol=None, account=DEFAULT_ACCOUNT
     if sl_points <= 0:
         return 0.0
     quantity = risk_usd / sl_points
-    precision = get_symbol_precision(symbol, account=account)
-    return round(quantity, precision)
+    quantity, _ = round_quantity(quantity, symbol, account=account)  # 同樣是試算建議值
+    return quantity
 
 
 def estimate_risk(quantity, sl_points, account_balance=None, symbol=None, account=DEFAULT_ACCOUNT):
@@ -586,8 +678,18 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     if quantity <= 0:
         return False, "下單數量必須大於0"
 
-    precision = get_symbol_precision(symbol, account=account)
-    quantity = round(quantity, precision)
+    # 照交易所LOT_SIZE規則無條件捨去到stepSize，而不是單純四捨五入到小數位數
+    # (BINANCE_LESSONS.md第4條：quantityPrecision不等於stepSize本身，某些商品
+    # 兩者算出來的結果會不一樣)。開倉數量太小時直接擋下不送單；平倉單即使算出來
+    # 低於minQty也照樣送出去(用原始quantity)，因為這代表要平掉的是先前已經成功
+    # 開倉的部位，寧可讓交易所自己判斷，也不要在這裡卡住導致部位平不掉、變孤兒倉。
+    rounded_quantity, qty_error = round_quantity(quantity, symbol, account=account)
+    if qty_error and not reduce_only:
+        return False, qty_error
+    if qty_error:
+        logger.warning(f"平倉數量精度提醒(帳戶{account}, {symbol}): {qty_error}，仍照原數量送出")
+    else:
+        quantity = rounded_quantity
 
     params = {
         "symbol": symbol,
@@ -615,6 +717,115 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
             result = retry_result
 
     return success, result
+
+
+def place_algo_stop(direction, quantity, stop_price, symbol=None, account=DEFAULT_ACCOUNT, position_side=None):
+    """
+    在交易所掛一張真實的STOP_MARKET條件單，當作程式內停損邏輯的最後防線
+    (修正記錄見README：本專案的停損/移動停損平常都是程式內判斷現價跟sl_price
+    比對，Zeabur服務掛掉或斷線時完全沒有保護。這張單只是backstop，不會跟著
+    移動停損每一格都更新，但至少讓服務中斷時部位不會裸奔到天荒地老)。
+
+    direction是這筆倉位的方向("bullish"/"bearish")，停損單方向要反過來
+    (多單的保護是SELL，空單的保護是BUY)。stop_price是觸發價，已經照
+    round_price()處理過tickSize由呼叫端負責。
+
+    BINANCE_LESSONS.md第1條：條件單已搬到Algo服務(POST /fapi/v1/algoOrder，
+    algoType=CONDITIONAL，stopPrice改叫triggerPrice)，先打新端點，只有
+    404(端點不存在)才退回舊的/fapi/v1/order。第8條：用reduceOnly+quantity
+    (不是closePosition)，之後要移動這張單時才能「先掛新、再撤舊」，不會有
+    裸倉窗口。
+
+    回傳(success, algo_id_or_error, used_legacy)。used_legacy=True代表這個
+    帳戶/環境還在用舊端點，之後cancel_algo_stop()要照這個決定打哪支API。
+    """
+    if quantity <= 0:
+        return False, "下單數量必須大於0", False
+    symbol = _resolve_symbol(symbol)
+    side = "SELL" if direction == "bullish" else "BUY"
+
+    params = {
+        "symbol": symbol, "side": side, "algoType": "CONDITIONAL", "type": "STOP_MARKET",
+        "quantity": quantity, "triggerPrice": stop_price, "workingType": "MARK_PRICE",
+    }
+    if position_side:
+        params["positionSide"] = position_side
+    else:
+        params["reduceOnly"] = "true"
+
+    success, data, status = _signed_request("POST", "/fapi/v1/algoOrder", params, account=account, return_status=True)
+
+    if not success and status == 404:
+        # 新端點不存在，這個環境還在用舊寫法：STOP_MARKET掛回/fapi/v1/order，
+        # 參數名稱換回stopPrice(第1條)。參數錯誤(-1111等)不會是404，不會誤判到這裡。
+        legacy_params = {
+            "symbol": symbol, "side": side, "type": "STOP_MARKET",
+            "quantity": quantity, "stopPrice": stop_price, "workingType": "MARK_PRICE",
+        }
+        if position_side:
+            legacy_params["positionSide"] = position_side
+        else:
+            legacy_params["reduceOnly"] = "true"
+        success, result = _signed_request("POST", "/fapi/v1/order", legacy_params, account=account)
+        if not success:
+            return False, result, True
+        return True, result.get("orderId"), True
+
+    if not success:
+        return False, data, False
+    algo_id = data.get("algoId") or data.get("clientAlgoId") if isinstance(data, dict) else None
+    if not algo_id:
+        return False, f"Algo下單回應沒有algoId：{data}", False
+    return True, algo_id, False
+
+
+def cancel_algo_stop(algo_id, symbol=None, account=DEFAULT_ACCOUNT, used_legacy=False):
+    """
+    撤掉place_algo_stop()掛的backstop停損單——不管是程式自己出場、force_close、
+    或手動平倉，只要部位要關掉，這張單都要一併撤掉(修正記錄見README)：
+    否則部位平掉後這張reduceOnly單還留著，等於一個沒有對應部位的孤兒掛單，
+    下次系統打算重新開反向倉位時可能會被交易所拒絕或造成混淆。
+
+    如果這張單「已經不存在」(查無此單/已經被觸發成交)，視為成功處理掉，
+    但用回傳的第三個值告訴呼叫端「這不是我們主動撤的，可能已經觸發」，
+    呼叫端要用這個線索去判斷部位是不是已經被交易所自己平掉了。
+
+    回傳(success, result, already_gone)。
+    """
+    if not algo_id:
+        return True, None, False
+    symbol = _resolve_symbol(symbol)
+    if used_legacy:
+        success, result = _signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": algo_id}, account=account)
+    else:
+        success, result = _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id}, account=account)
+
+    if success:
+        return True, result, False
+
+    # 「查無此單」代表已經不在掛單清單裡——可能已經觸發成交，也可能早被撤過，
+    # 兩種情況都不該再重試或回報成失敗
+    msg = str(result.get("msg", result) if isinstance(result, dict) else result)
+    if "does not exist" in msg or "Unknown order" in msg or "-2011" in msg or "-2013" in msg:
+        return True, result, True
+
+    logger.error(f"撤銷backstop停損單失敗(帳戶{account}, algoId={algo_id}): {result}")
+    return False, result, False
+
+
+def get_algo_stop_status(algo_id, symbol=None, account=DEFAULT_ACCOUNT, used_legacy=False):
+    """
+    查backstop停損單目前狀態，主要用途是cancel_algo_stop()發現單子已經不在時，
+    回頭確認它是不是真的被觸發成交了(而不是被別的地方手動撤掉)，好讓平倉通知
+    可以準確說明「這筆是交易所backstop自動觸發平倉，不是程式判斷出場」。
+    回傳(success, status_dict_or_error)。
+    """
+    if not algo_id:
+        return False, "沒有algo_id"
+    symbol = _resolve_symbol(symbol)
+    if used_legacy:
+        return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": algo_id}, account=account)
+    return _signed_request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id}, account=account)
 
 
 def open_position(direction, quantity, symbol=None, account=DEFAULT_ACCOUNT, hedge=False):

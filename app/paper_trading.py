@@ -114,6 +114,93 @@ class PaperTradingEngine:
         self._thread.start()
         logger.info(f"模擬單追蹤引擎已啟動({self.label}，{self.strategy_type}策略，移動停損模式)")
 
+    def _place_backstop(self, position, quantity, hedge):
+        """
+        在交易所掛一張真實STOP_MARKET條件單，當程式內停損判斷的最後防線
+        (修正記錄見README：本專案的停損/移動停損平常都是程式內判斷，服務掛掉
+        或斷線時交易所端完全沒有保護)。掛不上只記警告，不影響這筆交易繼續走
+        原本的模擬單流程——backstop是保險，不是主要防線。
+        """
+        try:
+            symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
+            stop_price = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
+            position_side = ("LONG" if position["direction"] == "bullish" else "SHORT") if hedge else None
+            ok, algo_id, used_legacy = execution_module.place_algo_stop(
+                position["direction"], quantity, stop_price,
+                symbol=symbol, account=self.execution_account, position_side=position_side,
+            )
+            if ok:
+                position["backstop_algo_id"] = algo_id
+                position["backstop_used_legacy"] = used_legacy
+                db.update_paper_trade_backstop(position.get("id"), algo_id, used_legacy)
+                logger.info(f"backstop停損單已掛({self.label}): algoId={algo_id}, 觸發價{stop_price}")
+            else:
+                logger.warning(f"backstop停損單掛不上({self.label})，僅靠程式內判斷保護: {algo_id}")
+        except Exception as e:
+            logger.error(f"掛backstop停損單發生例外({self.label}): {e}")
+
+    def _move_backstop(self, position):
+        """
+        移動停損更新sl_price時，backstop也跟著搬(BINANCE_LESSONS.md第8條：
+        先掛新的、再撤舊的，中間沒有裸倉窗口)。掛新的失敗就保留舊的那張不動，
+        至少還有原本距離的保護，不會因為想移動反而失去保護。
+        """
+        old_algo_id = position.get("backstop_algo_id")
+        if not old_algo_id:
+            return
+        try:
+            symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
+            quantity = position.get("real_open_quantity")
+            if not quantity:
+                return
+            stop_price = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
+            s = settings_module.get_settings(engine_id=self.engine_id)
+            hedge = bool(s.get("execution_hedge_mode", 1))
+            position_side = ("LONG" if position["direction"] == "bullish" else "SHORT") if hedge else None
+            ok, new_algo_id, used_legacy = execution_module.place_algo_stop(
+                position["direction"], quantity, stop_price,
+                symbol=symbol, account=self.execution_account, position_side=position_side,
+            )
+            if not ok:
+                logger.warning(f"移動backstop停損單掛新的失敗({self.label})，保留舊的那張不動: {new_algo_id}")
+                return
+            # 新的掛上去了，才撤舊的——這中間就算撤舊失敗，帳戶上頂多同時有兩張
+            # reduceOnly停損單(其中一張會先觸發、另一張因為沒部位可平而自然失效)，
+            # 不會出現「舊的撤了、新的還沒掛上」的裸倉空窗
+            execution_module.cancel_algo_stop(
+                old_algo_id, symbol=symbol, account=self.execution_account,
+                used_legacy=position.get("backstop_used_legacy", False),
+            )
+            position["backstop_algo_id"] = new_algo_id
+            position["backstop_used_legacy"] = used_legacy
+            db.update_paper_trade_backstop(position.get("id"), new_algo_id, used_legacy)
+        except Exception as e:
+            logger.error(f"移動backstop停損單發生例外({self.label}): {e}")
+
+    def _cancel_backstop(self, position):
+        """
+        平倉時一併撤掉backstop停損單(這次修正的重點)：不管是程式判斷出場、
+        快速停損監控、結構停利、還是手動force_close，只要部位要關掉，這張單
+        都要撤，否則會留下一個沒有對應部位的孤兒掛單。
+
+        回傳already_triggered：True代表這張backstop單已經不在了(可能是它自己
+        先觸發把部位平掉了)，呼叫端要用這個線索決定要不要再送一次真實平倉單。
+        """
+        algo_id = position.get("backstop_algo_id")
+        if not algo_id:
+            return False
+        symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
+        ok, result, already_gone = execution_module.cancel_algo_stop(
+            algo_id, symbol=symbol, account=self.execution_account,
+            used_legacy=position.get("backstop_used_legacy", False),
+        )
+        if not ok:
+            logger.error(f"撤銷backstop停損單失敗({self.label}, algoId={algo_id}): {result}，可能留下孤兒掛單，請手動確認")
+            return False
+        if already_gone:
+            logger.warning(f"backstop停損單已經不在({self.label}, algoId={algo_id})，可能已經自動觸發把部位平掉了")
+        return already_gone
+
     def _try_claim_close(self, position):
         """
         原子性地「認領」關掉這筆倉位的權利：只有self._position現在確實還是傳入的
@@ -233,6 +320,8 @@ class PaperTradingEngine:
                 db.update_paper_trade_stop(
                     position.get("id"), position["sl_price"], position["peak_price"], position["trailing_active"]
                 )
+                if position.get("backstop_algo_id"):
+                    self._move_backstop(position)
 
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
@@ -409,6 +498,12 @@ class PaperTradingEngine:
                     position["real_open_quantity"] = quantity if success else None
                     db.update_paper_trade_real_open(position.get("id"), bool(success), quantity if success else None)
                     if success:
+                        # 真實開倉成功才掛backstop停損單：交易所端的最後防線，服務掛掉/
+                        # 斷線時至少不會裸奔(修正記錄見README)。掛不上不影響這筆交易繼續
+                        # 進行——程式內的停損判斷本來就是主要防線，backstop只是保險，
+                        # 掛不上就記警告、繼續走原本流程，不會因此讓這筆單卡住或撤銷。
+                        self._place_backstop(position, quantity, hedge)
+                    if success:
                         logger.info(f"同步下單成功({self.label}): {result}")
                         actual_fill_price = execution_module.extract_fill_price(result)
                         quality = execution_module.analyze_execution_quality(
@@ -530,12 +625,39 @@ class PaperTradingEngine:
         # 嘗試平倉，避免留下孤兒真實部位。
         real_open = position.get("real_open_executed")
         skip_close_reason = None
+        exit_actual_price = None  # 真實平倉成交價(給USDT損益用)
+
+        # 不管出場原因是什麼，只要有掛backstop停損單，平倉時都要一併撤掉，
+        # 避免留下沒有對應部位的孤兒掛單(這次修正的重點，見README)。
+        backstop_triggered = False
+        if position.get("backstop_algo_id"):
+            backstop_triggered = self._cancel_backstop(position)
+
         if is_execution_engine and real_open is False:
             is_execution_engine = False
             skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
             logger.info(f"平倉跳過真實下單({self.label}): {skip_close_reason}")
+        elif is_execution_engine and backstop_triggered:
+            # backstop停損單已經不在了，代表它自己先觸發把部位平掉了(服務可能中斷
+            # 過一段時間，等程式恢復判斷時交易所早就已經出場)——不用也不能再送一次
+            # 真實平倉單，交易所根本沒有部位可平了。盡量查回真實成交價讓損益準確。
+            is_execution_engine = False
+            skip_close_reason = "交易所backstop停損單已先自動觸發平倉，程式判斷出場時部位已不存在，不重複送單"
+            logger.warning(f"backstop已先觸發({self.label}): {skip_close_reason}")
+            try:
+                status_ok, status_data = execution_module.get_algo_stop_status(
+                    position["backstop_algo_id"], symbol=self.execution_symbol, account=self.execution_account,
+                    used_legacy=position.get("backstop_used_legacy", False),
+                )
+                if status_ok:
+                    exit_actual_price = execution_module.extract_fill_price(status_data)
+                    if exit_actual_price:
+                        # 補寫進資料庫，不然這筆的「依真實成交價」標記在成交紀錄清單裡不會出現
+                        # (get_closed_paper_trades是靠exit_actual_price欄位判斷real_pnl_usd)
+                        db.update_paper_trade_exit_execution(position.get("id"), None, exit_actual_price, None, None)
+            except Exception as e:
+                logger.error(f"查詢backstop成交價失敗({self.label}): {e}")
 
-        exit_actual_price = None  # 真實平倉成交價(給USDT損益用)
         if is_execution_engine:
             try:
                 success, result = execution_module.close_position(
@@ -591,10 +713,12 @@ class PaperTradingEngine:
             try:
                 # 真實下單引擎的出場通知附上USDT：優先用真實成交價(進出場都有actual_price時)，
                 # 否則用模擬點數×張數估算。XAUUSDT永續1張=1盎司，1點=1 USDT/張。
-                qty = float(s.get("execution_quantity", 0) or 0) if is_execution_engine else None
+                # backstop觸發的情況is_execution_engine已經被設回False(不會再送真實平倉單)，
+                # 但那仍然是一筆真實成交，qty/real_pnl_usd照樣要算，不能因為這樣就漏算。
+                qty = float(s.get("execution_quantity", 0) or 0) if (is_execution_engine or backstop_triggered) else None
                 real_pnl_usd = None
                 ea, xa = position.get("entry_actual_price"), exit_actual_price
-                if qty and ea and xa and executed:
+                if qty and ea and xa and (executed or backstop_triggered):
                     real_qty = position.get("real_open_quantity") or qty
                     real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
                 # 停損出場時附上「當時的停損位/峰值/出場價與停損位的差」，才分得出是
