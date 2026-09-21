@@ -115,78 +115,88 @@ class PaperTradingEngine:
         logger.info(f"模擬單追蹤引擎已啟動({self.label}，{self.strategy_type}策略，移動停損模式)")
 
     def _place_backstop(self, position, quantity, hedge):
-        """
-        在交易所掛一張真實STOP_MARKET條件單，當程式內停損判斷的最後防線
-        (修正記錄見README：本專案的停損/移動停損平常都是程式內判斷，服務掛掉
-        或斷線時交易所端完全沒有保護)。掛不上只記警告，不影響這筆交易繼續走
-        原本的模擬單流程——backstop是保險，不是主要防線。
-        """
-        try:
-            symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
-            stop_price = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
-            position_side = ("LONG" if position["direction"] == "bullish" else "SHORT") if hedge else None
-            ok, algo_id, used_legacy = execution_module.place_algo_stop(
-                position["direction"], quantity, stop_price,
-                symbol=symbol, account=self.execution_account, position_side=position_side,
-            )
-            if ok:
-                position["backstop_algo_id"] = algo_id
-                position["backstop_used_legacy"] = used_legacy
-                db.update_paper_trade_backstop(position.get("id"), algo_id, used_legacy)
-                logger.info(f"backstop停損單已掛({self.label}): algoId={algo_id}, 觸發價{stop_price}")
-            else:
-                logger.warning(f"backstop停損單掛不上({self.label})，僅靠程式內判斷保護: {algo_id}")
-        except Exception as e:
-            logger.error(f"掛backstop停損單發生例外({self.label}): {e}")
+        """開倉成功後第一次掛backstop：記下想要的停損價，交給_sync_backstop去掛。"""
+        position["backstop_hedge"] = bool(hedge)
+        self._sync_backstop(position)
 
     def _move_backstop(self, position):
+        """移動停損更新時：一樣交給_sync_backstop(它會比對想要的價位跟實際掛著的)。"""
+        self._sync_backstop(position)
+
+    def _sync_backstop(self, position):
         """
-        移動停損更新sl_price時，backstop也跟著搬(BINANCE_LESSONS.md第8條：
-        先掛新的、再撤舊的，中間沒有裸倉窗口)。掛新的失敗就保留舊的那張不動，
-        至少還有原本距離的保護，不會因為想移動反而失去保護。
+        讓交易所的backstop停損單對齊「目前想要的停損價」(程式內sl_price)。
+        BINANCE_LESSONS.md第8條：掛不上不能只告警一次——下一格tick停損不一定再移動，
+        錯過就永遠停在舊價位。所以這支每輪tick都會被呼叫，只要實際掛著的價位跟想要的
+        不一樣(包括根本還沒掛上)，就再試一次，直到成功為止：
+          - 還沒有backstop → 掛新的
+          - 價位不同 → 先掛新的、成功才撤舊的(撤舊失敗記進stale，平倉時再撤，第13條)
+          - 交易所回-2021(觸發價已經被穿過，會立刻觸發) → 代表價格已經穿過停損，
+            直接走正常出場流程，不再掛單
+        告警只在「開始失敗」時發一次、恢復時發一次，不會每15秒騷擾。
         """
-        old_algo_id = position.get("backstop_algo_id")
-        if not old_algo_id:
+        if not position.get("real_open_executed") or not position.get("real_open_quantity"):
+            return
+        if position.get("_closing"):
             return
         try:
             symbol = self.execution_symbol or execution_module.DEFAULT_SYMBOL
-            quantity = position.get("real_open_quantity")
-            if not quantity:
-                return
-            stop_price = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
-            # 用交易所「實際」的持倉模式，不是設定值(BINANCE_LESSONS.md第7條雙向模式)：
-            # 開倉時resolve_position_mode可能已經退回帳戶現有模式，設定值不一定等於實際
+            desired = execution_module.round_price(position["sl_price"], symbol, account=self.execution_account)
+            if position.get("backstop_algo_id") and position.get("backstop_price") == desired:
+                return  # 已對齊
             s = settings_module.get_settings(engine_id=self.engine_id)
-            hedge = execution_module.current_hedge_mode(
-                account=self.execution_account, default=bool(s.get("execution_hedge_mode", 1))
-            )
+            hedge = position.get("backstop_hedge")
+            if hedge is None or position.get("backstop_algo_id"):
+                # 搬移時用交易所實際模式(第7條)；第一次掛用開倉當下resolve出來的模式
+                hedge = execution_module.current_hedge_mode(
+                    account=self.execution_account, default=bool(s.get("execution_hedge_mode", 1))
+                )
             position_side = ("LONG" if position["direction"] == "bullish" else "SHORT") if hedge else None
-            ok, new_algo_id, used_legacy = execution_module.place_algo_stop(
-                position["direction"], quantity, stop_price,
+            ok, new_id, used_legacy = execution_module.place_algo_stop(
+                position["direction"], position["real_open_quantity"], desired,
                 symbol=symbol, account=self.execution_account, position_side=position_side,
             )
             if not ok:
-                logger.warning(f"移動backstop停損單掛新的失敗({self.label})，保留舊的那張不動: {new_algo_id}")
+                code = new_id.get("code") if isinstance(new_id, dict) else None
+                if code == -2021:
+                    # 觸發價已經被穿過：價格已經到停損了，直接出場(第8條)
+                    logger.warning(f"backstop觸發價{desired}已被穿過({self.label})，直接出場")
+                    if self._try_claim_close(position):
+                        self._close_position(position, desired, "觸及移動停損" if position.get("trailing_active") else "觸及停損")
+                    return
+                if not position.get("backstop_failing"):
+                    position["backstop_failing"] = True
+                    self._backstop_alert(
+                        f"⚠️ {self.label} 交易所backstop停損單掛不上(想要的停損價 {desired})，"
+                        f"每輪會自動重試直到成功；程式內停損仍正常運作。原因：{new_id}"
+                    )
+                logger.warning(f"backstop掛單失敗({self.label})，下一輪重試: {new_id}")
                 return
-            # 新的掛上去了，才撤舊的——這中間就算撤舊失敗，帳戶上頂多同時有兩張
-            # reduceOnly停損單(其中一張會先觸發、另一張因為沒部位可平而自然失效)，
-            # 不會出現「舊的撤了、新的還沒掛上」的裸倉空窗
-            cancel_ok, _, _ = execution_module.cancel_algo_stop(
-                old_algo_id, symbol=symbol, account=self.execution_account,
-                used_legacy=position.get("backstop_used_legacy", False),
-            )
-            if not cancel_ok:
-                # 舊單撤不掉：帶quantity的reduceOnly單在部位歸零後「不會」自動消失
-                # (BINANCE_LESSONS.md第13條)，記下來，平倉時一起撤，不然會變孤兒單
-                position.setdefault("backstop_stale_ids", []).append(
-                    (old_algo_id, position.get("backstop_used_legacy", False))
-                )
-                logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_algo_id})，平倉時再撤一次")
-            position["backstop_algo_id"] = new_algo_id
+
+            old_id, old_legacy = position.get("backstop_algo_id"), position.get("backstop_used_legacy", False)
+            position["backstop_algo_id"] = new_id
             position["backstop_used_legacy"] = used_legacy
-            db.update_paper_trade_backstop(position.get("id"), new_algo_id, used_legacy)
+            position["backstop_price"] = desired
+            db.update_paper_trade_backstop(position.get("id"), new_id, used_legacy)
+            if old_id:
+                cancel_ok, _, _ = execution_module.cancel_algo_stop(
+                    old_id, symbol=symbol, account=self.execution_account, used_legacy=old_legacy,
+                )
+                if not cancel_ok:
+                    # 帶quantity的reduceOnly單部位歸零後不會自動消失(第13條)，記下來平倉時再撤
+                    position.setdefault("backstop_stale_ids", []).append((old_id, old_legacy))
+                    logger.warning(f"舊backstop撤不掉({self.label}, algoId={old_id})，平倉時再撤一次")
+            if position.pop("backstop_failing", False):
+                self._backstop_alert(f"✅ {self.label} backstop停損單已補掛成功(停損價 {desired})")
+            logger.info(f"backstop已對齊({self.label}): algoId={new_id}, 停損價{desired}")
         except Exception as e:
-            logger.error(f"移動backstop停損單發生例外({self.label}): {e}")
+            logger.error(f"同步backstop停損單發生例外({self.label}): {e}")
+
+    def _backstop_alert(self, text):
+        try:
+            notifier_module.notifier.send_raw_message(text)
+        except Exception:
+            pass
 
     def _cancel_backstop(self, position):
         """
@@ -350,8 +360,11 @@ class PaperTradingEngine:
                 db.update_paper_trade_stop(
                     position.get("id"), position["sl_price"], position["peak_price"], position["trailing_active"]
                 )
-                if position.get("backstop_algo_id"):
-                    self._move_backstop(position)
+
+            # 第8條：不管這輪停損有沒有移動，都檢查一次backstop有沒有對齊，
+            # 上一輪掛不上的會在這裡重試
+            if self._is_execution_engine(s):
+                self._sync_backstop(position)
 
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
@@ -659,8 +672,9 @@ class PaperTradingEngine:
 
         # 不管出場原因是什麼，只要有掛backstop停損單，平倉時都要一併撤掉，
         # 避免留下沒有對應部位的孤兒掛單(這次修正的重點，見README)。
+        position["_closing"] = True
         backstop_triggered = False
-        if position.get("backstop_algo_id"):
+        if position.get("backstop_algo_id") or position.get("backstop_stale_ids"):
             backstop_triggered = self._cancel_backstop(position)
 
         if is_execution_engine and real_open is False:

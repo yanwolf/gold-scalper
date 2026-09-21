@@ -100,21 +100,36 @@ def _reconcile_with_exchange_on_startup():
             if not ok:
                 lines.append(f"{engine.label}: 查詢交易所部位失敗 {info}")
                 continue
-            exch_qty = 0.0
+            # 依「方向」對帳，不是加總淨部位(BINANCE_LESSONS.md第7條)：雙向模式下
+            # 多0.1+空0.1淨額是0會誤判空手；我的多單已停損、帳上剩別的空單時，
+            # 只看有沒有部位會誤判成自己還在場。
+            long_qty = short_qty = 0.0
             for row in info if isinstance(info, list) else []:
                 try:
-                    exch_qty += float(row.get("positionAmt", 0))
+                    amt = float(row.get("positionAmt", 0))
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                side = row.get("positionSide", "BOTH")
+                if side == "LONG" or (side == "BOTH" and amt > 0):
+                    long_qty += abs(amt)
+                elif side == "SHORT" or (side == "BOTH" and amt < 0):
+                    short_qty += abs(amt)
             has_db = bool(db_pos and db_pos.get("real_open_executed"))
-            has_exch = abs(exch_qty) > 1e-9
-            if has_db != has_exch:
-                lines.append(
-                    f"{engine.label}: 對帳不一致 — 程式記錄{'有' if has_db else '沒有'}真實部位，"
-                    f"交易所{'有' if has_exch else '沒有'}部位(淨 {exch_qty})，請手動確認"
-                )
+            if has_db:
+                my_side_long = db_pos.get("direction") == "bullish"
+                my_qty = long_qty if my_side_long else short_qty
+                other_qty = short_qty if my_side_long else long_qty
+                if my_qty > 1e-9:
+                    lines.append(f"{engine.label}: 對帳一致(有{'多' if my_side_long else '空'}單 {my_qty})")
+                else:
+                    lines.append(
+                        f"{engine.label}: 對帳不一致 — 程式記錄有{'多' if my_side_long else '空'}單，交易所這一側沒有部位"
+                        + (f"(反方向另有 {other_qty}，不是這筆)" if other_qty > 1e-9 else "") + "，請手動確認"
+                    )
+            elif long_qty > 1e-9 or short_qty > 1e-9:
+                lines.append(f"{engine.label}: 對帳不一致 — 程式記錄沒有真實部位，交易所有部位(多 {long_qty} / 空 {short_qty})，請手動確認")
             else:
-                lines.append(f"{engine.label}: 對帳一致({'有部位 淨 ' + str(exch_qty) if has_exch else '空手'})")
+                lines.append(f"{engine.label}: 對帳一致(空手)")
         except Exception as e:
             lines.append(f"{engine.label}: 對帳時發生錯誤 {e}")
     if lines:

@@ -585,7 +585,12 @@ def resolve_position_mode(hedge_wanted, account=DEFAULT_ACCOUNT):
     也回-4067)就退回使用帳戶「目前」的模式下單，並帶回warning讓通知裡說明。
     回傳(effective_hedge: bool, warning: str或None)。
     """
-    ok, result = ensure_position_mode(hedge_wanted, account=account)
+    # auto_cancel_orders=False(BINANCE_LESSONS.md第7條「守衛只能碰自己記錄過id的單」)：
+    # 切模式被-4067(有掛單)擋下時，以前會把整個帳戶所有幣的掛單全撤——當初就是這樣
+    # 撤掉了crypto-screener的KAS條件單，現在也會撤掉自己其他引擎的backstop。
+    # 切不過去本來就會退回帳戶現有模式下單，不需要為了切模式去撤別人的單。
+    # (dashboard的「取消全部掛單」是使用者手動按的，不受影響)
+    ok, result = ensure_position_mode(hedge_wanted, account=account, auto_cancel_orders=False)
     if ok:
         return bool(hedge_wanted), None
     mode_ok, current = get_position_mode(account=account)
@@ -663,6 +668,41 @@ def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)
 
 
+MODE_MISMATCH_CODES = (-4061, -1106)
+
+
+def _is_mode_mismatch(result):
+    return isinstance(result, dict) and result.get("code") in MODE_MISMATCH_CODES
+
+
+def _convert_mode_params(params, side, is_closing, hedge_now):
+    """
+    帳戶持倉模式跟送單時假設的不一樣(被切換過)時，把參數換成目前模式的寫法
+    (BINANCE_LESSONS.md第7條雙向模式)：雙向要帶positionSide、不能帶reduceOnly；
+    單向相反。is_closing決定positionSide：開多BUY/平多SELL=LONG，開空SELL/平空BUY=SHORT。
+    """
+    params = dict(params)
+    params.pop("positionSide", None)
+    params.pop("reduceOnly", None)
+    if hedge_now:
+        is_long_side = (side == "BUY") != bool(is_closing)
+        params["positionSide"] = "LONG" if is_long_side else "SHORT"
+    elif is_closing:
+        params["reduceOnly"] = "true"
+    return params
+
+
+def _resend_on_mode_mismatch(method, path, params, side, is_closing, result, account):
+    """送單回-4061/-1106時：查交易所實際模式(不用任何快取)、換參數重送一次。"""
+    if not _is_mode_mismatch(result):
+        return None
+    mode_ok, hedge_now = get_position_mode(account=account)
+    if not mode_ok:
+        return None
+    logger.warning(f"持倉模式不符({result.get('code')})，交易所目前是{'雙向' if hedge_now else '單向'}，換參數重送一次")
+    return _signed_request(method, path, _convert_mode_params(params, side, is_closing, hedge_now), account=account)
+
+
 def place_market_order(side, quantity, symbol=None, reduce_only=False, account=DEFAULT_ACCOUNT, position_side=None):
     """
     送出市價單(指定帳戶)。side是"BUY"或"SELL"，quantity是張數(已經套用過精度)。
@@ -702,6 +742,12 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     elif reduce_only:
         params["reduceOnly"] = "true"
     success, result = _signed_request("POST", "/fapi/v1/order", params, account=account)
+    if not success:
+        # 是平倉單：單向模式帶reduceOnly，雙向模式是SELL+LONG或BUY+SHORT
+        is_closing = reduce_only or (position_side and (side == "SELL") == (position_side == "LONG"))
+        retry = _resend_on_mode_mismatch("POST", "/fapi/v1/order", params, side, is_closing, result, account)
+        if retry is not None:
+            success, result = retry
 
     # 市價單理論上會立刻成交，但幣安(尤其測試網)偶爾撮合結果回填進這次API回應
     # 的時間點會比訂單狀態實際確認慢半拍，導致這次回應裡的avgPrice還是"0"
@@ -754,6 +800,12 @@ def place_algo_stop(direction, quantity, stop_price, symbol=None, account=DEFAUL
         params["reduceOnly"] = "true"
 
     success, data, status = _signed_request("POST", "/fapi/v1/algoOrder", params, account=account, return_status=True)
+    if not success and _is_mode_mismatch(data):
+        # 停損單一定是平倉方向
+        retry = _resend_on_mode_mismatch("POST", "/fapi/v1/algoOrder", params, side, True, data, account)
+        if retry is not None:
+            success, data = retry
+            status = 200 if success else status
 
     if not success and status == 404:
         # 新端點不存在，這個環境還在用舊寫法：STOP_MARKET掛回/fapi/v1/order，
