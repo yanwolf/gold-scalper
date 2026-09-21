@@ -81,7 +81,9 @@ async def startup_event():
     if role_module.is_live():
         # 正式端啟動時跟交易所對帳：DB記得有部位但交易所沒有(或反過來)就立刻告警，
         # 避免程序重啟後出現沒人管的孤兒單
-        import threading
+        # (注意：這裡不能再寫 import threading——函式內任何地方出現 import，
+        # Python 會把 threading 當成整個函式的區域變數，上面那行用到 threading
+        # 時就會 UnboundLocalError，整個服務啟動失敗。threading 已在檔案最上方匯入)
         threading.Thread(target=_reconcile_with_exchange_on_startup, daemon=True).start()
 
 
