@@ -428,20 +428,20 @@ class PaperTradingEngine:
         """
         algo_id = pos.get("backstop_algo_id")
         if not algo_id or not pos.get("real_open_executed"):
-            return
+            return "skip"
         ok, present = execution_module.find_open_stop(
             algo_id, used_legacy=pos.get("backstop_used_legacy", False),
             symbol=self.execution_symbol, account=self.execution_account,
         )
         if not ok:
-            return
+            return "unknown"
         if present:
             pos.pop("backstop_missing", None)
-            return
+            return "present"
         n = pos.get("backstop_missing", 0) + 1
         pos["backstop_missing"] = n
         if n < 3:
-            return
+            return "missing"
         pos.pop("backstop_missing", None)
         logger.warning(f"交易所停損單連續3輪查不到({self.label}, id={algo_id})，重新掛單")
         self._backstop_alert(
@@ -450,7 +450,7 @@ class PaperTradingEngine:
         )
         pos.pop("backstop_algo_id", None)
         pos.pop("backstop_price", None)
-        self._sync_backstop(pos)
+        return "replaced:" + str(self._sync_backstop(pos))
 
     def _resolve_open_pending(self, position):
         """
@@ -655,11 +655,15 @@ class PaperTradingEngine:
     def stop(self):
         self._stop_flag.set()
 
+    def _loop_once(self):
+        """背景迴圈的一輪(第8條r23/r24)：tick本身出錯也要照節奏推播、恢復時通知，不能只寫日誌。"""
+        self._run_step("每輪判斷", self._tick)
+
     def _run_forever(self):
         while not self._stop_flag.is_set():
             try:
-                self._tick()
-            except Exception as e:
+                self._loop_once()
+            except Exception as e:  # 最後一道：連推播都出錯時，至少讓執行緒活著
                 logger.error(f"模擬單檢查失敗({self.label}): {e}")
             self._stop_flag.wait(PAPER_POLL_SECONDS)
 
@@ -1090,6 +1094,30 @@ class PaperTradingEngine:
     def _raise(e):
         raise e
 
+    def _safe(self, label, fn, default=None):
+        """
+        結帳之後的收尾步驟(第8條r24)：各自try，一步出錯不影響其他收尾；出錯推播(不能被吞掉，第14條)。
+        這些步驟一筆平倉只跑一次，不用節奏計數。
+        """
+        try:
+            return fn()
+        except Exception as e:
+            logger.error(f"平倉收尾「{label}」出錯({self.label}): {e}")
+            try:
+                self._backstop_alert(f"⚠️ {self.label} 平倉收尾「{label}」出錯(帳已結、不影響部位)\n錯誤：{type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return default
+
+    def _safe_closed_record(self, position, exit_price, exit_reason, exit_time):
+        """算平倉紀錄不能丟例外(第8條r24)：缺欄位時損益記為未知(None)，照樣結帳。"""
+        try:
+            return trading_core.close_position(position, exit_price, exit_reason, exit_time)
+        except Exception as e:
+            logger.error(f"算平倉損益出錯({self.label})，損益記為未知: {e}")
+            return {**position, "exit_price": exit_price, "exit_time": exit_time,
+                    "exit_reason": exit_reason, "pnl_points": None}
+
     def _close_position_inner(self, position, exit_price, exit_reason, bid=None, ask=None, book_stale=None):
         """
         平倉流程(BINANCE_LESSONS.md第8條r12/r13「平倉單送出後一定要看結果」)，順序是：
@@ -1215,10 +1243,26 @@ class PaperTradingEngine:
                                                   ex_qty if ok_q else None)
                     return
 
-        # ---- 確認平掉之後才撤交易所停損 ----
+        # ---- 平倉確認：交易所這一側已經沒了(或本來就沒送真實單)。從這裡開始不可逆 ----
+        # 順序(第8條r24)：先算紀錄(不丟例外) → 寫紀錄、移出帳(界線) → 撤停損、通知、統計各自try。
+        # 以前是先撤停損、再算損益寫紀錄：算損益一丟例外，停損撤了、紀錄沒寫。
+        position["_close_confirmed"] = True  # 外層包裝據此判斷：之後出錯不能把部位放回帳上
+        failed_closes = position.pop("close_fail_count", 0)
+        position.pop("pending_close", None)
+        position.pop("_closing", None)
+        exit_time = datetime.now(timezone.utc).isoformat()
+        closed_record = self._safe_closed_record(position, exit_price, exit_reason, exit_time)
+        self._safe("寫平倉紀錄", lambda: db.close_paper_trade(
+            position.get("id"), exit_price, exit_time, exit_reason, closed_record.get("pnl_points")))
+        self._closed_trades_memory.append(closed_record)
+        with self._lock:
+            if self._position is position:
+                self._position = None
+
+        # ---- 界線之後：撤交易所停損、收尾，每一步各自try ----
         backstop_triggered = False
         if position.get("backstop_algo_id") or position.get("backstop_stale_ids") or position.get("backstop_fail_count"):
-            backstop_triggered = self._cancel_backstop(position)
+            backstop_triggered = self._safe("撤交易所停損", lambda: self._cancel_backstop(position), default=False)
         if closed_externally and backstop_triggered and position.get("backstop_algo_id"):
             skip_close_reason = "交易所backstop停損單已先觸發平倉，程式判斷出場時部位已不存在，不重複送單"
             try:
@@ -1233,28 +1277,14 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"查詢backstop成交價失敗({self.label}): {e}")
 
-        # ---- 平倉確認：帳上紀錄到這裡才結掉 ----
-        position["_close_confirmed"] = True  # 從這裡開始是不可逆的(外層包裝據此判斷)
-        failed_closes = position.pop("close_fail_count", 0)
-        position.pop("pending_close", None)
-        self._end_position_step_errors()
-        position.pop("_closing", None)
-        exit_time = datetime.now(timezone.utc).isoformat()
-        closed_record = trading_core.close_position(position, exit_price, exit_reason, exit_time)
-        db.close_paper_trade(position.get("id"), exit_price, exit_time, exit_reason, closed_record["pnl_points"])
-        self._closed_trades_memory.append(closed_record)
-        with self._lock:
-            if self._position is position:
-                self._position = None
-        logger.info(
-            f"模擬單平倉({self.label}): {position['direction']} @ {exit_price:.2f} "
-            f"({exit_reason}, 損益:{closed_record['pnl_points']:+.2f})"
-        )
+        self._safe("出錯次數收尾", self._end_position_step_errors)
+        pnl_txt = f"{closed_record['pnl_points']:+.2f}" if closed_record.get("pnl_points") is not None else "未知"
+        logger.info(f"模擬單平倉({self.label}): {position.get('direction')} @ {exit_price} ({exit_reason}, 損益:{pnl_txt})")
         if failed_closes:
-            self._backstop_alert(
+            self._safe("平倉恢復通知", lambda: self._backstop_alert(
                 f"✅ {self.label} 平倉已完成(失敗 {failed_closes} 次後恢復)\n"
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}"
-            )
+            ))
 
         if is_execution_engine or skip_close_reason:
             try:

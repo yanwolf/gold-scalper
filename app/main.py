@@ -15,6 +15,7 @@ app/analysis.py，在這裡 import 進來、加新的 endpoint 即可，
 import asyncio
 import logging
 import os
+import functools
 import threading
 from typing import Optional
 
@@ -217,7 +218,44 @@ async def control_resume(payload: dict = Body(...)):
     return {"success": True, "manual_halt": state}
 
 
+# 網頁交易入口的保護(第8條r24「網頁請求也是另一條執行緒」)：例外穿出去時網頁只看到連線中斷、
+# 沒有推播。包一層：回錯誤給網頁、照第8條節奏推播、恢復時通知。引擎的平倉(強制平倉)另外有
+# 自己的外層包裝，結帳前出錯會記待平倉。
+_web_trade_errors = {}
+
+
+def guard_trade(op):
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            from app import alert_cadence
+            try:
+                res = await fn(*args, **kwargs)
+            except Exception as e:
+                n = _web_trade_errors.get(op, 0) + 1
+                _web_trade_errors[op] = n
+                logger.error(f"網頁操作「{op}」出錯(第{n}次): {e}")
+                if alert_cadence.should_alert(n):
+                    try:
+                        notifier.send_raw_message(
+                            f"⚠️ 網頁操作「{op}」出錯(第 {n} 次)\n錯誤：{type(e).__name__}: {e}\n"
+                            f"這次操作沒有完成，請到幣安確認帳戶狀態")
+                    except Exception:
+                        pass
+                return {"error": f"{type(e).__name__}: {e}", "op": op}
+            n = _web_trade_errors.pop(op, 0)
+            if n:
+                try:
+                    notifier.send_raw_message(f"✅ 網頁操作「{op}」已恢復(出錯 {n} 次後)")
+                except Exception:
+                    pass
+            return res
+        return wrapper
+    return deco
+
+
 @app.post("/control/flatten")
+@guard_trade("強制平倉")
 async def control_flatten(payload: dict = Body(...)):
     """
     強制平倉：payload {"password", "engine_id"(可選，不給=全部載入中的引擎), "reason"}。
@@ -597,6 +635,7 @@ async def execution_open_orders(password: str = "", account: str = "gold"):
 
 
 @app.post("/execution/cancel-open-orders")
+@guard_trade("取消掛單")
 async def execution_cancel_open_orders(payload: dict = Body(...)):
     """
     取消帳戶所有未成交掛單：payload {"password": "...", "account": "gold"}。
@@ -660,6 +699,7 @@ async def execution_estimate_quantity(
 
 
 @app.post("/execution/set-leverage")
+@guard_trade("設定槓桿")
 async def execution_set_leverage(payload: dict = Body(...)):
     """手動設定槓桿倍數：payload格式 {"password": "...", "leverage": 10, "account": "gold"}。"""
     ok, error = settings_module.verify_password(payload.get("password", ""))
@@ -676,6 +716,7 @@ async def execution_set_leverage(payload: dict = Body(...)):
 
 
 @app.post("/execution/test-order")
+@guard_trade("手動測試下單")
 async def execution_test_order(payload: dict = Body(...)):
     """
     手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
@@ -757,6 +798,7 @@ async def execution_test_order(payload: dict = Body(...)):
 
 
 @app.post("/execution/test-close")
+@guard_trade("手動測試平倉")
 async def execution_test_close(payload: dict = Body(...)):
     """
     手動測試平倉：payload格式 {"password": "...", "direction": "bullish"/"bearish", "account": "gold"}。

@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r22 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r25 第1、2、3、7、8、14條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -8,7 +8,8 @@ BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程�
   所以每一個都要有「前提」斷言：證明走到被測那一步所需的每個動作真的發生了(測錯方式8、12)。
   斷言看「這一步之後新發生的事」(只算這一步建立的mock/清單)，不看被測前就存在的最終狀態(測錯方式13)。
   否定句的前提要檢查查詢的「結果」，不只是「有去查」(測錯方式16)：「沒掛停損」可能是「部位沒了」也可能是「查不到」，
-  前提要寫出是哪一個。分類看斷言本身，不看測試描述(測錯方式15)。執行：python -m unittest tests.test_lessons -v
+  前提要寫出是哪一個。分類看斷言本身，不看測試描述(測錯方式15)。
+  注入要綁在被測的那一步，不用「第幾次查詢」計數(測錯方式18)：多一次查詢就會錯位。執行：python -m unittest tests.test_lessons -v
 
 每個測試名稱前綴對應清單段落：
   t7a 反轉依被拒的單   t7b 送單前偵測失敗   t7c 記住/清掉假設
@@ -88,10 +89,17 @@ class Lesson7(unittest.TestCase):
 
     def test_t7b_open_detection_failure_does_not_assume_wanted_mode(self):
         """開倉：切模式失敗、再偵測也失敗時，不能直接假設「設定想要的模式」。"""
+        with mock.patch.object(ex, "ensure_position_mode", return_value=(False, {"code": -1001})) as en, \
+             mock.patch.object(ex, "get_position_mode", return_value=(False, "timeout")) as gm:
+            effective, _ = ex.resolve_position_mode(True, account="gold")
+        self.assertTrue(en.called and gm.called, "前提：真的嘗試切模式、切不過去後真的重新偵測(而且失敗)")
+        self.assertFalse(effective, "從沒偵測成功過：假設單向，不是設定想要的雙向")
+        # 正向(靜態檢查抓到只有否定句)：有舊值時要回舊值——結果非得經過退路邏輯不可
+        ex._last_known_hedge["gold"] = True
         with mock.patch.object(ex, "ensure_position_mode", return_value=(False, {"code": -1001})), \
              mock.patch.object(ex, "get_position_mode", return_value=(False, "timeout")):
-            effective, _ = ex.resolve_position_mode(True, account="gold")
-        self.assertFalse(effective)
+            effective2, _ = ex.resolve_position_mode(False, account="gold")
+        self.assertIs(effective2, True, "偵測失敗、有舊值(雙向)：用舊值，不是設定想要的單向")
 
     def test_t7c_resend_success_remembers_resend_failure_clears(self):
         """重送成功才記住成功的那個假設；重送也失敗就清掉，不留沒驗證過的值。"""
@@ -264,15 +272,26 @@ class Lesson1(unittest.TestCase):
 
 
 class Lesson3(ExecHarness):
-    def _open(self, open_ret, rows_seq):
-        it = iter(rows_seq)
+    def _open(self, open_ret, before, after):
+        """
+        部位查詢綁在「開倉單送出」這一步(測錯方式18)：送出之前回before(基準)、之後回after。
+        after=None代表這個情境送單後不該再查部位。self.inj記錄每次注入是在送單前還是後觸發。
+        """
         eng = self.eng
+        state = {"sent": False}
+        self.inj = []
+        def fake_open(*a, **k):
+            state["sent"] = True
+            return open_ret
+        def fake_rows(*a, **k):
+            self.inj.append("after" if state["sent"] else "before")
+            return (after if state["sent"] else before) or (False, "不該在送單後查部位")
         with mock.patch.object(pt.risk_guard, "check", return_value=(True, None, None)), \
              mock.patch.object(ex, "resolve_position_mode", return_value=(False, None)), \
              mock.patch.object(ex, "set_margin_type", return_value=(True, {})), \
              mock.patch.object(ex, "set_leverage", return_value=(True, {})), \
-             mock.patch.object(ex, "open_position", return_value=open_ret) as self.op, \
-             mock.patch.object(ex, "get_position_info", side_effect=lambda *a, **k: next(it)), \
+             mock.patch.object(ex, "open_position", side_effect=fake_open) as self.op, \
+             mock.patch.object(ex, "get_position_info", side_effect=fake_rows), \
              mock.patch.object(eng, "_sync_backstop") as sync:
             eng._position = None
             eng._open_position({"direction": "bullish", "bid": 4389.9, "ask": 4390.0,
@@ -281,7 +300,8 @@ class Lesson3(ExecHarness):
 
     def test_t3a_timeout_but_filled_is_claimed_with_exchange_qty_and_price(self):
         # 設定要0.2張、交易所實際0.1張；訊號價4390、交易所均價4391.5(測錯方式1：兩個來源不同值)
-        pos, sync = self._open((False, "Read timed out"), [(True, _rows(0)), (True, _rows(0.1))])
+        pos, sync = self._open((False, "Read timed out"), before=(True, _rows(0)), after=(True, _rows(0.1)))
+        self.assertEqual(self.inj, ["before", "after"], "前提：基準在送單前查、認領在送單後查(注入觸發時機)")
         self.assertIs(pos.get("real_open_executed"), True)
         self.assertEqual(pos.get("real_open_quantity"), 0.1)
         self.assertEqual(pos.get("entry_actual_price"), 4391.5)
@@ -289,7 +309,8 @@ class Lesson3(ExecHarness):
         self.assertIs(self.notes[-1].get("executed"), True)
 
     def test_t3b_timeout_not_yet_visible_is_kept_pending_with_deadline(self):
-        pos, _ = self._open((False, "Read timed out"), [(True, _rows(0)), (True, _rows(0))])
+        pos, _ = self._open((False, "Read timed out"), before=(True, _rows(0)), after=(True, _rows(0)))
+        self.assertEqual(self.inj, ["before", "after"], "前提：送單後真的查了、而且看到的是『還沒有』")
         self.assertIsNot(pos.get("real_open_executed"), False, "結果不明不能直接記成沒開倉")
         self.assertTrue(pos.get("real_open_pending_until"))
         eng = self.eng
@@ -304,7 +325,8 @@ class Lesson3(ExecHarness):
         self.assertTrue(any("未成交" in a for a in eng.alerts), eng.alerts)
 
     def test_t3c_explicit_reject_is_not_pending(self):
-        pos, _ = self._open((False, {"code": -2019, "msg": "Margin is insufficient."}), [(True, _rows(0))])
+        pos, _ = self._open((False, {"code": -2019, "msg": "Margin is insufficient."}), before=(True, _rows(0)), after=None)
+        self.assertEqual(self.inj, ["before"], "明確拒絕不是結果不明，送單後不該再查部位")
         self.assertEqual(self.op.call_count, 1, "前提：單真的送出去、被交易所拒絕")
         self.assertIs(pos.get("real_open_executed"), False)
         self.assertFalse(pos.get("real_open_pending_until"))
@@ -769,7 +791,9 @@ class Lesson22(ExecHarness):
     def test_t2c_claim_places_stop_with_claimed_qty_without_requery(self):
         pos = self._real_pos(real_open_executed=None, real_open_pending_until=time.time() + 100,
                              backstop_algo_id=None, backstop_price=None)
-        with mock.patch.object(ex, "get_position_info", side_effect=[(True, _rows(0.1)), (True, _rows(0))]) as gp, \
+        # 綁在被測那一步(測錯方式18)：認領前交易所看得到0.1；認領之後再查會拿到0(模擬還沒反映)
+        rows = lambda *a, **k: (True, _rows(0.1 if pos.get("real_open_executed") is None else 0))
+        with mock.patch.object(ex, "get_position_info", side_effect=rows) as gp, \
              mock.patch.object(ex, "place_algo_stop", return_value=(True, "N2", False)) as pl:
             self.eng._resolve_open_pending(pos)
         self.assertIs(pos.get("real_open_executed"), True, "前提：認領成功")
@@ -777,11 +801,118 @@ class Lesson22(ExecHarness):
         self.assertEqual(pl.call_count, 1)
 
 
+# ------------------------------------------------------------------ r23 → r25
+class Lesson25(ExecHarness):
+    def _real_pos(self, **kw):
+        p = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, backstop_algo_id="B1",
+                 backstop_price=4380.0, backstop_used_legacy=False, real_open_baseline=0.0)
+        p.update(kw)
+        return p
+
+    # 第2條：停損守衛每個出口都回傳原因
+    def test_t2_guard_every_exit_returns_reason(self):
+        eng = self.eng
+        def run(pos, algo_resp, rounds=1):
+            def fake(method, path, params=None, account=None, return_status=False):
+                r = (True, _rows(0.1), 200) if path == "/fapi/v2/positionRisk" else algo_resp
+                return r if return_status else r[:2]
+            out = []
+            with mock.patch.object(ex, "_signed_request", side_effect=fake), \
+                 mock.patch.object(ex, "place_algo_stop", return_value=(True, "R1", False)):
+                for _ in range(rounds):
+                    out.append(eng._check_backstop_present(pos))
+            return out
+        self.assertEqual(run(self._real_pos(backstop_algo_id=None), (True, [], 200)), ["skip"])
+        self.assertEqual(run(self._real_pos(), (False, {"code": -1001}, 500)), ["unknown"])
+        self.assertEqual(run(self._real_pos(), (True, [{"algoId": "B1"}], 200)), ["present"])
+        self.assertEqual(run(self._real_pos(), (True, [], 200), 3), ["missing", "missing", "replaced:placed"])
+
+    # 第8條r24：結帳排最前面；算損益不能丟例外
+    def test_t8a_record_is_written_before_cleanup_and_pnl_error_does_not_block(self):
+        pos = self._real_pos()
+        pos.pop("entry_price")                        # 算損益會缺欄位
+        order = []
+        with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})) as cp, \
+             mock.patch.object(pt.db, "close_paper_trade", side_effect=lambda *a, **k: order.append(("db", a))), \
+             mock.patch.object(self.eng, "_cancel_backstop", side_effect=lambda p: order.append(("cancel",)) or False):
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出並成交")
+        self.assertEqual([o[0] for o in order], ["db", "cancel"], "先寫紀錄、移出帳，撤停損在後")
+        self.assertIsNone(order[0][1][4], "缺欄位時損益記為未知，不能丟例外")
+
+    def test_t8a_cleanup_error_after_record_does_not_stop_other_cleanup(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})), \
+             mock.patch.object(self.eng, "_end_position_step_errors", side_effect=RuntimeError("inj-end")), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False) as cb:
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(len(self.dbclose), 1, "前提：帳已經結了")
+        self.assertEqual(cb.call_count, 1, "收尾的一步出錯，撤停損照樣要做")
+        self.assertIsNone(self.eng._position)
+        self.assertFalse(pos.get("pending_close"))
+        self.assertTrue(any("inj-end" in a for a in self.eng.alerts), self.eng.alerts)
+        self.assertTrue(any(n.get("action") == "close" for n in self.notes), "收尾出錯，平倉通知照樣要發")
+
+    # 第8條r23/r24：背景迴圈本身出錯要推播
+    def test_t8c_background_loop_error_is_pushed(self):
+        with mock.patch.object(self.eng, "_tick", side_effect=RuntimeError("inj-loop")):
+            self.eng._loop_once()
+        self.assertTrue(any("inj-loop" in a and "第 1 次" in a for a in self.eng.alerts), self.eng.alerts)
+
+    # 第8條r24：網頁交易入口出錯要回錯誤給網頁、並推播
+    def test_t8b_web_trade_entry_error_returns_error_and_pushes(self):
+        import asyncio
+        import app.main as m
+        pushed = []
+        with mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)), \
+             mock.patch.object(ex, "is_enabled", return_value=True, create=True), \
+             mock.patch.object(ex, "close_position", side_effect=RuntimeError("inj-web")) as cp, \
+             mock.patch.object(m.notifier, "send_raw_message", side_effect=pushed.append):
+            res = asyncio.run(m.execution_test_close({"password": "x", "direction": "bullish", "account": "gold"}))
+        self.assertTrue(cp.called, "前提：真的走到了送平倉單那一步")
+        self.assertIn("inj-web", str(res.get("error")), res)
+        self.assertTrue(any("inj-web" in t for t in pushed), pushed)
+
+
+class NotifierFormat(unittest.TestCase):
+    """損益未知時通知不能格式化失敗(第8條r24)。其他測試都把通知mock掉，這一段要真的跑格式化。"""
+    def test_close_notice_with_unknown_pnl_is_sent(self):
+        from app.notifier import notifier as N, TelegramNotifier
+        sent = []
+        with mock.patch.object(TelegramNotifier, "is_enabled", new_callable=mock.PropertyMock, return_value=True), \
+             mock.patch.object(TelegramNotifier, "is_muted", new_callable=mock.PropertyMock, return_value=False), \
+             mock.patch.object(N, "_send_telegram_message", side_effect=lambda t: sent.append(t) or (True, None)):
+            N.notify_trade_event(action="close", label="15分K", direction="bullish", price=4380.0,
+                                 exit_reason="觸及停損", pnl_points=None, executed=True, quantity=0.1)
+        self.assertEqual(len(sent), 1, f"通知要送出：{sent}")
+        self.assertIn("損益：未知", sent[0])
+
+
+class StaticChecks(unittest.TestCase):
+    """全域／靜態檢查自成一個情境(用法第5點r25)：不放在別的情境最後，才不會繼承那個情境的突變命中次數。"""
+    def test_every_return_in_guard_functions_carries_a_value(self):
+        import ast, inspect, textwrap
+        for fn in ("_check_backstop_present", "_sync_backstop", "_check_exchange_quantity"):
+            src = textwrap.dedent(inspect.getsource(getattr(pt.PaperTradingEngine, fn)))
+            tree = ast.parse(src).body[0]
+            bare = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value is None]
+            self.assertEqual(bare, [], f"{fn} 有不帶值的return(第2條r25)")
+            last = tree.body[-1]
+            ends = isinstance(last, ast.Return) or (isinstance(last, ast.Try) and
+                   isinstance(last.body[-1], ast.Return) and all(isinstance(h.body[-1], ast.Return) for h in last.handlers))
+            self.assertTrue(ends, f"{fn} 最後會掉出函式、回傳None")
+
+
 class Lesson14(unittest.TestCase):
     def test_t14_pyflakes_no_undefined_names(self):
         import subprocess, sys, os
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        out = subprocess.run([sys.executable, "-m", "pyflakes", "app"], cwd=root, capture_output=True, text=True).stdout
+        r = subprocess.run([sys.executable, "-m", "pyflakes", "app"], cwd=root, capture_output=True, text=True)
+        out = r.stdout
+        # 前提(靜態檢查抓到只有否定句)：pyflakes真的跑了、真的掃到了程式。沒裝pyflakes時輸出是空的，
+        # 「沒有undefined name」就會空跑通過。main.py那一條已知的誤報可以當證據。
+        self.assertNotIn("No module named", r.stderr, "前提：pyflakes有安裝")
+        self.assertIn("undefined name 'fastapi'", out, "前提：真的掃到了app/main.py")
         bad = [l for l in out.splitlines() if "undefined name" in l and "'fastapi'" not in l]
         self.assertEqual(bad, [])
 
