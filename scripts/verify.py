@@ -35,7 +35,7 @@ else:
          f"金絲雀{'有' if 'undefined_canary_name' in canary else '沒有'}報出、掃到main.py已知誤報、問題 {len(bad)} 項 {bad[:3]}")
 
 # 2. 行為測試＋測試靜態檢查：要全部通過、數量達標
-r = run([PY, "-m", "unittest", "tests.test_lessons", "tests.check_tests"])
+r = run([PY, "-m", "unittest", "tests.test_lessons", "tests.check_tests", "tests.check_indexing"])
 ran = next((int(l.split()[1]) for l in r.stderr.splitlines() if l.startswith("Ran ")), 0)
 step("行為測試＋靜態檢查", r.returncode == 0 and ran >= 60, f"執行 {ran} 項，{'全部通過' if r.returncode == 0 else r.stderr.strip().splitlines()[-1]}")
 
@@ -54,6 +54,12 @@ step("逐項突變檢查", r.returncode == 0 and bool(summary), summary)
 r = run([PY, "-m", "tests.error_scan"])
 step("錯誤掃描", r.returncode == 0, (r.stdout.strip().splitlines() or ["(沒有輸出)"])[-1][:160])
 
-ok = all(o for _, o in results) and len(results) == 5
+# 6.(選用) 在上一版程式上重跑：GS_PREV=<舊版目錄>。框架/測試崩掉要是0(用法第5點r34/r37)
+prev = os.environ.get("GS_PREV")
+if prev:
+    r = run([PY, "-m", "tests.rerun_old", prev])
+    step("在上一版程式上重跑", r.returncode == 0, (r.stdout.strip().splitlines() or ["(沒有輸出)"])[0][:160])
+
+ok = all(o for _, o in results) and len(results) == (6 if prev else 5)
 print("\n" + ("全部通過" if ok else f"有 {sum(1 for _, o in results if not o)} 步失敗"))
 sys.exit(0 if ok else 1)

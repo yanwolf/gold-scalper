@@ -2341,3 +2341,15 @@ smc_exit_mode / smc_min_rr`(TRADING_RELEVANT_KEYS，可用「此引擎專屬參�
 `smc_exit_mode=1` 時進場會把目標設在趨勢方向的前一個swing點(position["tp_price"])，即時/回測都會以
 「觸及結構停利」出場；`smc_min_rr` 低於門檻的訊號會退回「關注」並在漏斗顯示「訊號但風報比不足」。
 tp_price目前只存在記憶體，服務重啟後那筆未平倉單退回只用移動停損。
+
+## 舊版程式要留著（BINANCE_LESSONS.md 用法第 5 點 r37）
+
+每次照清單修改、部署前，在 git 打標籤，之後才能拿新的測試跑舊版、確認框架在舊版上不會崩：
+
+```bash
+git tag lessons-r38          # 版本號跟 BINANCE_LESSONS.md 最上面一致
+git push origin lessons-r38
+# 要比對時：
+git worktree add ../gs-r38 lessons-r38
+GS_PREV=../gs-r38 python scripts/verify.py      # 或單獨跑：python -m tests.rerun_old ../gs-r38
+```

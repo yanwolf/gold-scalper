@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r34 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r37 第1、2、3、7、8、14條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -51,6 +51,7 @@ def _engine():
     eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
     eng._qty_check_tick = 0
     eng._position = None
+    eng._seeded_from_db = True   # r37起「持倉紀錄沒載入就不開倉」：前一個測試模擬讀不到時留下的False不能帶進來
     # 模組層級的「記住的持倉模式」也會被測試改到。在舊版程式上重跑時它可能還不存在(r10才加)，
     # 不存在就略過，不要讓框架本身崩掉(用法第5點r34)
     if hasattr(ex, "_last_known_hedge"):
@@ -415,7 +416,7 @@ class Lesson8Close(ExecHarness):
              mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))):
             self.eng._close_position(pos, 4380.0, "觸及停損")
         self.assertTrue(pos.get("pending_close"), "前提：第一次被拒後進入待平倉")
-        self.assertIn("目前交易所部位：0.1", self.eng.alerts[0],
+        self.assertIn("目前交易所部位：0.1", one(self.eng.alerts, "平倉單沒有成交"),
                       "前提：確認的結果是『部位還在0.1』，不是『查不到』(測錯方式16：兩者都會進待平倉)")
         with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})), \
              mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))), \
@@ -722,6 +723,7 @@ class Lesson19(ExecHarness):
              mock.patch.object(m.logger, "info", side_effect=got.append), mock.patch.object(m.db, "insert_settings_audit"):
             m._reconcile_with_exchange_on_startup()
         self.assertTrue(gp.called)
+        self.assertGreater(len(got), 0, "前提：對帳訊息有寫出來")
         self.assertIn("查不到", got[-1].splitlines()[1])
 
 
@@ -865,6 +867,7 @@ class Lesson25(ExecHarness):
              mock.patch.object(self.eng, "_cancel_backstop", side_effect=lambda p: order.append(("cancel",)) or False):
             self.eng._close_position(pos, 4380.0, "觸及停損")
         self.assertEqual(cp.call_count, 1, "前提：平倉單送出並成交")
+        self.assertEqual(len(order), 2, "前提：寫紀錄與撤停損都有發生")
         self.assertEqual([o[0] for o in order], ["db", "cancel"], "先寫紀錄、移出帳，撤停損在後")
         self.assertIsNone(order[0][1][4], "缺欄位時損益記為未知，不能丟例外")
 
@@ -1147,15 +1150,16 @@ class Lesson34(ExecHarness):
         """缺值不能退成0：界線不是數字就記未知，不能把這個幣歷史上所有平倉成交算成這筆的出場(r34)。"""
         pos = _pos(real_open_quantity=0.1, real_open_baseline=0.0, fill_boundary_id="", real_open_order_id=None)
         fills = (True, _fills((5, 1, "SELL", 0.1, 4300.0, -9.0, 100)))
-        with mock.patch.object(ex, "get_user_trades", return_value=fills, create=True) as ut:
-            st = self.eng._closing_fills(pos, 0.1)
-        self.assertTrue(ut.called, "前提：真的查了成交明細")
+        with mock.patch.object(ex, "get_user_trades", return_value=fills, create=True):
+            st = self.eng._closing_fills(pos, 0.1)  # 固定長度
+        # 前提看判定的原因(第16種)：界線不是數字時在查成交明細之前就判定，不能用「有沒有查」當前提
+        self.assertIn("界線不是數字", st[4], st)
         self.assertEqual(st[0], "unknown", st)
 
     # 8e：雙向模式看 positionSide
     def test_t8e_hedge_other_open_short_is_not_our_close(self):
         pos = _pos(real_open_quantity=0.1, real_open_baseline=0.0, fill_boundary_id=100)
-        rows = _fills((101, 5000, "SELL", 0.1, 4385.0, 0.0, 2000), (102, 5100, "SELL", 0.1, 4380.0, -1.1, 2000))
+        rows = _fills((101, 5000, "SELL", 0.1, 4385.0, 0.0, 2000), (102, 5100, "SELL", 0.1, 4380.0, -1.1, 2000))  # 固定長度
         rows[0]["positionSide"] = "SHORT"   # 別的專案同幣開空：也是SELL
         rows[1]["positionSide"] = "LONG"    # 自己多單的平倉
         with mock.patch.object(ex, "get_user_trades", return_value=(True, rows), create=True):
@@ -1180,6 +1184,121 @@ class Lesson34(ExecHarness):
             got = pt.db.get_open_paper_trade(engine_id="chan_profile_900")
         self.assertEqual(got.get("id"), 7, "前提：真的解析了這一列")
         self.assertEqual((got.get("real_open_order_id"), got.get("fill_boundary_id")), (9001, 202))
+
+
+# ------------------------------------------------------------------ r35 → r37
+class Lesson37(ExecHarness):
+    # 8d：開機讀持倉紀錄失敗，不能當成「沒有持倉」
+    def test_t8d_startup_read_failure_is_not_flat(self):
+        eng = self.eng
+        self.assertTrue(hasattr(eng, "_ensure_state_loaded"), "前提：程式有「載入持倉紀錄」這一步(在舊版程式上重跑時是斷言失敗、不是崩掉)")
+        eng._seeded_from_db = False
+        with mock.patch.object(pt.db, "load_open_paper_trade", return_value=(False, "connection refused"), create=True) as ld, \
+             mock.patch.object(pt.db, "get_open_paper_trade", return_value=None):
+            eng._ensure_state_loaded()
+        self.assertTrue(ld.called, "前提：真的去讀了")
+        a = one(eng.alerts, "每輪步驟「讀取持倉紀錄」出錯")
+        self.assertIn("connection refused", a)
+        self.assertIn("暫停開新倉", a)
+        self.assertIs(eng._seeded_from_db, False, "讀不到就還沒載入，不能當成已載入的空手")
+        with mock.patch.object(eng, "_run_step", wraps=eng._run_step) as rs, \
+             mock.patch.object(pt.db, "load_open_paper_trade", return_value=(False, "connection refused"), create=True):
+            opened = eng._open_position({"direction": "bullish", "bid": 1, "ask": 1,
+                                         "chan": {"reason": "t"}, "profile": {"reason": "t"}}, 4390.0, 10.0)
+        self.assertEqual(opened, "state_not_loaded", "持倉紀錄沒載入前不能開新倉")
+
+    def test_t8d_startup_read_recovers_and_restores_position(self):
+        eng = self.eng
+        self.assertTrue(hasattr(eng, "_ensure_state_loaded"), "前提：程式有「載入持倉紀錄」這一步(在舊版程式上重跑時是斷言失敗、不是崩掉)")
+        eng._seeded_from_db = False
+        row = _pos(id=11, real_open_executed=True)
+        with mock.patch.object(pt.db, "load_open_paper_trade", side_effect=[(False, "timeout"), (True, row)], create=True):
+            eng._ensure_state_loaded()
+            eng._ensure_state_loaded()
+        self.assertIs(eng._position, row, "第二次讀到了：還原持倉")
+        self.assertIs(eng._seeded_from_db, True)
+        one(eng.alerts, "每輪步驟「讀取持倉紀錄」已恢復")
+
+    # 8b：資料庫寫入失敗要推播、照節奏、恢復時通知
+    def test_t8b_db_write_failure_is_pushed_and_recovery_notified(self):
+        pushed = []
+        class Boom:
+            def getconn(self): raise RuntimeError("inj-db-write")
+            def putconn(self, c): pass
+        class Ok:
+            def getconn(self):
+                class C:
+                    def cursor(s):
+                        class Cur:
+                            def __enter__(c): return c
+                            def __exit__(c, *a): return False
+                            def execute(c, *a): pass
+                        return Cur()
+                    def commit(s): pass
+                return C()
+            def putconn(self, c): pass
+        pt.db._db_fail_counts.clear() if hasattr(pt.db, "_db_fail_counts") else None
+        with mock.patch.object(pt.db, "_enabled", True), \
+             mock.patch.object(pt.notifier_module.notifier, "send_raw_message", side_effect=pushed.append):
+            with mock.patch.object(pt.db, "_pool", Boom(), create=True):
+                pt.db.update_paper_trade_fills(7, 9001, 202)
+            with mock.patch.object(pt.db, "_pool", Ok(), create=True):
+                pt.db.update_paper_trade_fills(7, 9001, 202)
+        a = one(pushed, "資料庫寫入失敗")
+        self.assertIn("inj-db-write", a)
+        self.assertIn("第 1 次", a)
+        one(pushed, "資料庫寫入已恢復")
+
+    # 8f：在鎖裡面觸發「會回頭拿同一把鎖」的推播，不能死鎖
+    def test_t8f_push_path_reacquiring_engine_lock_does_not_deadlock(self):
+        import threading
+        eng = self.eng
+        self.assertTrue(hasattr(eng, "_ensure_state_loaded"), "前提：程式有「載入持倉紀錄」這一步(在舊版程式上重跑時是斷言失敗、不是崩掉)")
+        reached = []
+        def push_that_takes_lock(text):
+            with eng._lock:                  # 模擬r37：推播路徑回頭拿同一把鎖
+                reached.append(text)
+        def body():
+            with eng._lock:
+                with mock.patch.object(pt.db, "load_open_paper_trade", return_value=(False, "inj-lock"), create=True):
+                    eng._seeded_from_db = False
+                    eng._ensure_state_loaded()
+        with mock.patch.object(eng, "_backstop_alert", side_effect=push_that_takes_lock):
+            th = threading.Thread(target=body, daemon=True)
+            th.start()
+            th.join(timeout=3)
+        self.assertFalse(th.is_alive(), "死鎖：3秒內沒結束")
+        self.assertTrue(any("讀取持倉紀錄" in r.splitlines()[0] and "inj-lock" in r for r in reached),
+                        f"前提：推播路徑真的有走到：{reached}")
+
+    # 8h：成交明細帶fromId往後分頁查完
+    def test_t8h_fills_paged_from_boundary_not_last_n(self):
+        pos = _pos(real_open_quantity=0.1, real_open_baseline=0.0, fill_boundary_id=150, entry_actual_price=4391.2)
+        all_rows = _fills((151, 9001, "BUY", 0.1, 4391.2, 0.0, 1000),
+                          (152, 9100, "SELL", 0.05, 4386.0, -0.26, 2000),
+                          (153, 9100, "SELL", 0.05, 4380.0, -0.56, 2000))
+        calls = []
+        def fake(symbol=None, account=None, limit=100, from_id=None):
+            calls.append(from_id)
+            if from_id is None:
+                return True, all_rows[-limit:] if limit < len(all_rows) else all_rows[-1:]   # 只給最近的(最後一頁)
+            return True, [r for r in all_rows if r["id"] >= from_id][:limit]
+        with mock.patch.object(ex, "get_user_trades", side_effect=fake, create=True), \
+             mock.patch.object(pt, "FILL_PAGE_SIZE", 2, create=True):
+            st = self.eng._closing_fills(pos, 0.1)
+        self.assertEqual(calls[:1], [151], "從界線＋1往後查")
+        self.assertEqual(st[:3], ("ok", 4383.0, 0.1), "兩頁的平倉成交都要採用(只拿最後一頁會算出4380這個確定的錯數字)")
+
+    def test_t8h_too_many_pages_is_unknown_not_partial(self):
+        pos = _pos(real_open_quantity=0.1, real_open_baseline=0.0, fill_boundary_id=150)
+        def fake(symbol=None, account=None, limit=100, from_id=None):
+            base = from_id or 151
+            return True, _fills(*[(base + k, 1, "BUY", 0.01, 4391.0, 0.0, 1000) for k in range(limit)])
+        with mock.patch.object(ex, "get_user_trades", side_effect=fake, create=True) as ut, \
+             mock.patch.object(pt, "FILL_PAGE_SIZE", 2, create=True), mock.patch.object(pt, "FILL_MAX_PAGES", 3, create=True):
+            st = self.eng._closing_fills(pos, 0.1)  # 固定長度
+        self.assertEqual(ut.call_count, 3, "前提：查到頁數上限")
+        self.assertEqual(st[0], "unknown", "沒拿完就是不完整，記未知，不能用拿到的部分算")
 
 
 class StaticChecks(unittest.TestCase):

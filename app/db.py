@@ -336,13 +336,14 @@ def insert_trades(trades):
                     [(t["time"], t["price"], t["qty"], t.get("is_buyer_maker")) for t in trades],
                 )
             conn.commit()
+            _db_write_ok("寫入逐筆成交")
         finally:
             _pool.putconn(conn)
 
         _last_write_ok_at = datetime.now(timezone.utc)
         _last_write_error = None
     except Exception as e:
-        logger.error(f"寫入逐筆成交失敗: {e}")
+        _db_write_error("寫入逐筆成交", e)
         _last_write_error = str(e)
 
 
@@ -431,11 +432,12 @@ def insert_open_paper_trade(position):
                 )
                 new_id = cur.fetchone()[0]
             conn.commit()
+            _db_write_ok("新增模擬單")
             return new_id
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"新增模擬單失敗: {e}")
+        _db_write_error("新增模擬單", e)
         return None
 
 
@@ -460,10 +462,11 @@ def update_paper_trade_stop(trade_id, sl_price, peak_price, trailing_active):
                     (sl_price, peak_price, trailing_active, trade_id),
                 )
             conn.commit()
+            _db_write_ok("更新移動停損")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"更新移動停損失敗: {e}")
+        _db_write_error("更新移動停損", e)
 
 
 def update_paper_trade_fills(trade_id, order_id, boundary_id):
@@ -477,10 +480,11 @@ def update_paper_trade_fills(trade_id, order_id, boundary_id):
                 cur.execute("UPDATE paper_trades SET real_open_order_id = %s, fill_boundary_id = %s WHERE id = %s;",
                             (order_id, boundary_id, trade_id))
             conn.commit()
+            _db_write_ok("記錄成交明細界線")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"記錄成交明細界線失敗: {e}")
+        _db_write_error("記錄成交明細界線", e)
 
 
 def update_paper_trade_baseline(trade_id, baseline):
@@ -493,10 +497,11 @@ def update_paper_trade_baseline(trade_id, baseline):
             with conn.cursor() as cur:
                 cur.execute("UPDATE paper_trades SET real_open_baseline = %s WHERE id = %s;", (baseline, trade_id))
             conn.commit()
+            _db_write_ok("記錄基準數量")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"記錄基準數量失敗: {e}")
+        _db_write_error("記錄基準數量", e)
 
 
 def update_paper_trade_backstop(trade_id, backstop_algo_id, backstop_used_legacy):
@@ -515,10 +520,11 @@ def update_paper_trade_backstop(trade_id, backstop_algo_id, backstop_used_legacy
                     (backstop_algo_id, backstop_used_legacy, trade_id),
                 )
             conn.commit()
+            _db_write_ok("記錄backstop停損單")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"記錄backstop停損單失敗: {e}")
+        _db_write_error("記錄backstop停損單", e)
 
 
 def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points,
@@ -553,13 +559,44 @@ def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points,
                     ),
                 )
             conn.commit()
+            _db_write_ok("平倉模擬單")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"平倉模擬單失敗: {e}")
+        _db_write_error("平倉模擬單", e)
 
 
-def get_open_paper_trade(engine_id="chan_profile_60"):
+# 資料庫寫入失敗不能只寫日誌(第8條r36)：開倉單號、成交界線、待平倉、backstop都靠資料庫才能跨重啟，
+# 寫不進去時下次重啟才發現全沒了。照第8條節奏推播，恢復時通知一次。推播路徑不拿任何引擎的鎖(r37的死鎖)。
+_db_fail_counts = {}
+
+
+def _db_write_error(op, e):
+    logger.error(f"{op}失敗: {e}")
+    n = _db_fail_counts.get(op, 0) + 1
+    _db_fail_counts[op] = n
+    try:
+        from app import alert_cadence
+        from app.notifier import notifier
+        if alert_cadence.should_alert(n):
+            notifier.send_raw_message(
+                f"⚠️ 資料庫寫入失敗「{op}」(第 {n} 次)\n錯誤：{type(e).__name__}: {e}\n"
+                f"記憶體裡的狀態仍正確，但重啟後可能遺失；請檢查資料庫")
+    except Exception:
+        pass
+
+
+def _db_write_ok(op):
+    n = _db_fail_counts.pop(op, 0)
+    if n:
+        try:
+            from app.notifier import notifier
+            notifier.send_raw_message(f"✅ 資料庫寫入已恢復「{op}」(失敗 {n} 次後)")
+        except Exception:
+            pass
+
+
+def load_open_paper_trade(engine_id="chan_profile_60"):
     """
     服務啟動時呼叫：查有沒有還沒平倉的模擬單(每個engine_id各自最多一筆)，
     用來回填記憶體狀態。engine_id區分是哪一個追蹤引擎在查(例如1分K纏論
@@ -567,7 +604,7 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
     interval_seconds同樣是60也不會查到彼此的資料)。
     """
     if not _enabled:
-        return None
+        return True, None  # 沒接資料庫(純記憶體模式)：確實沒有持倉紀錄
 
     try:
         conn = _pool.getconn()
@@ -589,8 +626,8 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             _pool.putconn(conn)
 
         if not row:
-            return None
-        return {
+            return True, None
+        return True, {
             "id": row[0], "direction": row[1], "entry_price": row[2],
             "entry_time": row[3].isoformat() if row[3] else None,
             "sl_price": row[4], "peak_price": row[5], "trailing_active": row[6],
@@ -603,8 +640,16 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
             "real_open_order_id": row[16], "fill_boundary_id": row[17],
         }
     except Exception as e:
+        # 讀取失敗≠沒有持倉(第8條r37)：以前這裡回None，跟「沒有持倉」一模一樣——資料庫短暫連不上的那次重啟，
+        # 引擎就以為自己空手，不管交易所上的真實部位、還可能再開新倉
         logger.error(f"讀取開倉中模擬單失敗: {e}")
-        return None
+        return False, f"{type(e).__name__}: {e}"
+
+
+def get_open_paper_trade(engine_id="chan_profile_60"):
+    """舊介面(只回部位或None)。會分不出「讀取失敗」與「沒有持倉」——需要分辨的地方用 load_open_paper_trade。"""
+    ok, pos = load_open_paper_trade(engine_id)
+    return pos if ok else None
 
 
 def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
@@ -680,10 +725,11 @@ def update_paper_trade_real_open(trade_id, executed, quantity=None):
                     (bool(executed), quantity, trade_id),
                 )
             conn.commit()
+            _db_write_ok("更新開倉真實下單狀態")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"更新開倉真實下單狀態失敗: {e}")
+        _db_write_error("更新開倉真實下單狀態", e)
 
 
 def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, slippage_points, spread_points, book_stale=False):
@@ -710,10 +756,11 @@ def update_paper_trade_entry_execution(trade_id, expected_price, actual_price, s
                     (expected_price, actual_price, slippage_points, spread_points, bool(book_stale), trade_id),
                 )
             conn.commit()
+            _db_write_ok("更新開倉執行品質資料")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"更新開倉執行品質資料失敗: {e}")
+        _db_write_error("更新開倉執行品質資料", e)
 
 
 def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, slippage_points, spread_points, book_stale=False):
@@ -735,10 +782,11 @@ def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, sl
                     (expected_price, actual_price, slippage_points, spread_points, bool(book_stale), trade_id),
                 )
             conn.commit()
+            _db_write_ok("更新平倉執行品質資料")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"更新平倉執行品質資料失敗: {e}")
+        _db_write_error("更新平倉執行品質資料", e)
 
 
 def get_trades_by_hour(engine_id="chan_profile_60", hour_utc=0, side="entry", limit=100):
@@ -1067,10 +1115,11 @@ def insert_settings_audit(action, engine_id=None, version=None, detail=None):
                     (action, engine_id, version, _json.dumps(detail or {}, ensure_ascii=False, default=str)),
                 )
             conn.commit()
+            _db_write_ok("寫入審計紀錄")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"寫入審計紀錄失敗: {e}")
+        _db_write_error("寫入審計紀錄", e)
 
 
 def get_settings_audit(limit=50):

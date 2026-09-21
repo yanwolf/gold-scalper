@@ -96,6 +96,9 @@ def _reconcile_with_exchange_on_startup():
         if not getattr(engine, "execution_index", None):
             continue
         try:
+            if not getattr(engine, "_seeded_from_db", True):
+                lines.append(f"{engine.label}: 持倉紀錄還沒從資料庫載入(讀不到)，無法對帳，請檢查資料庫")
+                continue
             db_pos = engine.get_position() if hasattr(engine, "get_position") else getattr(engine, "_position", None)
             ok, info = execution_module.get_position_info(account=engine.execution_account)
             if not ok:

@@ -45,7 +45,9 @@ MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼�
 
 
 OPEN_PENDING_SECONDS = 180  # 開倉回應不明時，保留待確認的期限(第3條，r13)
-QTY_CHECK_EVERY_TICKS = 4   # 每4輪(約60秒)比對一次交易所數量(第8條減碼偵測；第6條限流)
+QTY_CHECK_EVERY_TICKS = 4
+FILL_PAGE_SIZE = 1000      # 成交明細每頁筆數(幣安上限1000)
+FILL_MAX_PAGES = 10        # 界線之後超過這麼多頁就當成沒拿完、記未知(第8條r37)   # 每4輪(約60秒)比對一次交易所數量(第8條減碼偵測；第6條限流)
 
 
 def _latest_price():
@@ -82,7 +84,8 @@ class PaperTradingEngine:
         # 不指定的話自動產生(例如"chan_profile_60")
         self.engine_id = engine_id or f"{strategy_type}_{interval_seconds}"
 
-        self._lock = threading.Lock()
+        # 可重入(第8條r37)：存檔/讀檔失敗的推播路徑若回頭拿同一把鎖，不可重入的Lock會讓整支程式卡住
+        self._lock = threading.RLock()
         self._position = None
         self._closed_trades_memory = deque(maxlen=MAX_MEMORY_TRADES)
         self._thread = None
@@ -115,9 +118,7 @@ class PaperTradingEngine:
 
     def start(self):
         if not self._seeded_from_db:
-            with self._lock:
-                self._position = db.get_open_paper_trade(engine_id=self.engine_id)
-            self._seeded_from_db = True
+            self._ensure_state_loaded()
 
         if not self._fast_stop_registered:
             # 快速停損監控：掛在幣安bookTicker(買一/賣一)串流上，sub-second更新，
@@ -482,6 +483,24 @@ class PaperTradingEngine:
         except Exception as e:
             logger.error(f"記錄成交明細界線失敗({self.label})，平倉時出場價會記未知: {e}")
 
+    def _trades_after(self, boundary):
+        """
+        界線之後的全部成交：帶fromId(界線＋1)往後分頁查到拿完(第8條r37)。以前只查最近100筆——
+        界線之後的平倉成交掉了幾筆時，照樣用剩下的算出一個「確定」的出場價，比未知更糟。
+        頁數到上限還沒拿完 → 回失敗(記未知)，不用拿到的部分算。
+        """
+        out, nxt = [], int(boundary) + 1
+        for _ in range(FILL_MAX_PAGES):
+            ok, page = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account,
+                                                        limit=FILL_PAGE_SIZE, from_id=nxt)
+            if not ok or not isinstance(page, list):
+                return False, f"成交明細查不到：{page}"
+            out.extend(page)
+            if len(page) < FILL_PAGE_SIZE:
+                return True, out
+            nxt = max(int(t["id"]) for t in page) + 1
+        return False, f"界線之後的成交超過 {FILL_MAX_PAGES} 頁，沒拿完"
+
     def _closing_fills(self, position, want_qty):
         """
         從成交明細挑出這筆部位的平倉成交(第8條r30/r31)，回傳(status, 均價, 數量, 最後採用的id, 說明)：
@@ -493,9 +512,6 @@ class PaperTradingEngine:
         """
         if (position.get("real_open_baseline") or 0) > 1e-9:
             return "unknown", None, 0.0, None, "同側有基準部位，成交明細分不出哪幾筆是自己的"
-        ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
-        if not ok or not isinstance(trades, list):
-            return "unknown", None, 0.0, None, f"成交明細查不到：{trades}"
         boundary = position.get("fill_boundary_id")
         if boundary is not None and not isinstance(boundary, int):
             # 缺值不能退成0(第8條r34)：界線是0時，這個幣歷史上所有平倉成交都會被算成這筆的出場——不是未知，是算錯
@@ -504,11 +520,18 @@ class PaperTradingEngine:
             else:
                 return "unknown", None, 0.0, None, f"界線不是數字({boundary!r})"
         if boundary is None:
+            # 沒記到界線(修正前的舊部位)：從最近的成交裡找開倉那張單
             oid = position.get("real_open_order_id")
-            opens = [int(t["id"]) for t in trades if oid is not None and str(t.get("orderId")) == str(oid)]
+            ok, recent = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
+            if not ok or not isinstance(recent, list):
+                return "unknown", None, 0.0, None, f"成交明細查不到：{recent}"
+            opens = [int(t["id"]) for t in recent if oid is not None and str(t.get("orderId")) == str(oid)]
             if not opens:
                 return "unknown", None, 0.0, None, "找不到開倉那筆成交，定不出界線"
             boundary = max(opens)
+        ok, trades = self._trades_after(boundary)
+        if not ok:
+            return "unknown", None, 0.0, None, trades
         bullish = position["direction"] == "bullish"
         close_side, pos_side = ("SELL", "LONG") if bullish else ("BUY", "SHORT")
         cands = sorted((t for t in trades if int(t.get("id", 0)) > boundary and t.get("side") == close_side
@@ -758,6 +781,8 @@ class PaperTradingEngine:
 
     def _tick(self):
         self._last_tick_at = datetime.now(timezone.utc)
+        if not self._ensure_state_loaded():
+            return  # 持倉紀錄讀不到：什麼都不判斷(不知道有沒有部位)，已照節奏推播、下一輪重試
         # 開頭的兩件事各自try(第8條r18)：出錯不能讓整輪tick中止——後面的出場判斷
         # (程式內停損)是最重要的保護，不能因為維護步驟出錯就不跑
         if self._orphan_cancels:
@@ -873,7 +898,26 @@ class PaperTradingEngine:
             if not is_choppy and not market_closed and not atr_too_low and trend_ok:
                 self._open_position(result, current_price, sl_points)
 
+    def _load_state(self):
+        """從資料庫載入持倉紀錄。讀取失敗就拋出去(由_run_step照節奏推播)，不能當成「沒有持倉」(第8條r37)。"""
+        ok, pos = db.load_open_paper_trade(engine_id=self.engine_id)
+        if not ok:
+            raise RuntimeError(f"讀不到持倉紀錄(資料庫)：{pos}；這個引擎暫停開新倉、每輪重試，不會當成沒有持倉")
+        with self._lock:
+            self._position = pos
+        self._seeded_from_db = True
+
+    def _ensure_state_loaded(self):
+        """持倉紀錄載入了沒？沒有就試一次。資料庫讀取在鎖外面做，鎖只包住指定部位那一下。"""
+        if self._seeded_from_db:
+            return True
+        self._run_step("讀取持倉紀錄", self._load_state)
+        return self._seeded_from_db
+
     def _open_position(self, signal_result, current_price, sl_points):
+        if not self._seeded_from_db:
+            # 持倉紀錄還沒載入：不知道有沒有部位，不能開新倉(第8條r37)
+            return "state_not_loaded"
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,
