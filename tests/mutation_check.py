@@ -1,11 +1,17 @@
 """
-突變驗證(BINANCE_LESSONS.md 用法第5點 r18)：把新規則的前置條件弄壞，會用到它的測試必須全部明確失敗；
-還通過的就是在空跑(斷言在程式什麼都沒做時也成立)。
+突變驗證(BINANCE_LESSONS.md 用法第5點 r18/r21/r22)。
 
 突變：PaperTradingEngine._side_qty 一律回「查不到」
-  → 送單前基準查不到、不送進場單(第3條r16)
-  → 掛停損前確認不到部位、不掛停損(第2條r19)
-執行：python -m tests.mutation_check        (有空跑的項目時以非0結束)
+  → 送單前基準查不到、不送進場單(第3條r16)；掛停損前確認不到、不掛(第2條r19)；平倉確認查不到、待平倉(第8條r13)
+
+逐項比對(r21)：全部測試都在突變下跑，突變下仍通過的每一項都要有理由，否則就是空跑。理由分三類，全部由程式驗證：
+  無關   —— 自動判定：這項測試在突變下根本沒呼叫被突變的查詢(呼叫次數=0)，不需要列清單。
+  前提   —— 同一個情境裡，另有一項(被引用的那一項)在突變下明確失敗。
+  對照組 —— 被引用的那一項在「沒有突變」時通過、「突變」時失敗，證明正常時那條路走得通。
+另外報出過期的豁免(列在清單、但已經不在突變下通過／測試不存在)。
+檢查器自我驗證(r22)：故意拿掉一項豁免、把一項引用改成突變下會通過的項目，確認兩個都會被報出來。
+
+執行：python -m tests.mutation_check   (有任何問題時以非0結束)
 """
 import sys
 import unittest
@@ -13,58 +19,112 @@ from unittest import mock
 
 import tests.test_lessons as T
 
-# 會送進場單的情境
-SENDS_ENTRY = [
-    "Lesson3.test_t3a_timeout_but_filled_is_claimed_with_exchange_qty_and_price",
-    "Lesson3.test_t3b_timeout_not_yet_visible_is_kept_pending_with_deadline",
-    "Lesson3.test_t3c_explicit_reject_is_not_pending",
-    "Lesson8.test_t8d_open_filled_then_later_step_raises_still_reported_as_filled",
-]
-# 會掛(或搬移、補掛)停損的情境
-PLACES_STOP = [
-    "Lesson8.test_t8b_backstop_fail_once_then_recover_sends_recovery",
-    "Lesson8.test_t8c1_exception_in_backstop_sync_is_counted",
-    "Lesson8.test_t8c1_stale_cancel_failure_during_move_is_counted_at_failure",
-    "Lesson8.test_t8c2_failure_state_cleared_by_close_sends_notice",
-    "Lesson16.test_t1a_guard_replaces_backstop_missing_three_rounds",
-    "Lesson16.test_t1b_algo_404_falls_back_to_legacy_query_instead_of_skipping",
-    "Lesson16.test_t8b_guard_replace_hits_minus2021_exits",
-    "Lesson16.test_t3c_claim_then_same_round_checks_do_not_close",
-    "Lesson19.test_t2b_quantity_is_min_of_exchange_minus_baseline_and_recorded",
-]
-# 突變豁免：本來就在測「查不到」這個條件。對照組(同樣的呼叫在沒注入時確實會送單/掛單)寫在右邊
+# 突變下仍通過、且確實經過被突變查詢的項目：{測試: (類別, 被引用的測試, 說明)}
 EXEMPT = {
-    "Lesson16.test_t3a_baseline_query_failure_does_not_send": "對照組 Lesson8.test_t8d(同樣的開倉呼叫，基準查得到時有送單)",
-    "Lesson19.test_t2b_query_failure_skips_round_without_counting_failure": "對照組 Lesson19.test_t2b_quantity(同樣的呼叫，查得到時有掛單)",
-    "Lesson19.test_t2b_no_backstop_when_own_position_gone": "突變下仍不掛單屬預期；對照組同上",
-    "Lesson19.test_t2b_moving_stop_also_confirms_position": "突變下仍不掛單屬預期；對照組同上",
+    # 目前沒有。r22 對照時原本列了 3 項，檢查器報出它們在突變下其實已經會失敗(前提斷言「真的查了部位」
+    # 抓到了突變)，屬於過期豁免，已刪除。
 }
+
+
+def _all_tests():
+    suite = unittest.defaultTestLoader.loadTestsFromModule(T)
+    out = []
+    def walk(s):
+        for x in s:
+            if isinstance(x, unittest.TestSuite):
+                walk(x)
+            else:
+                out.append(f"{type(x).__name__}.{x._testMethodName}")
+    walk(suite)
+    return out
 
 
 def _run(name):
     cls, meth = name.split(".")
-    suite = unittest.TestSuite([getattr(T, cls)(meth)])
-    return unittest.TextTestRunner(stream=open("/dev/null", "w")).run(suite).wasSuccessful()
+    return unittest.TextTestRunner(stream=open("/dev/null", "w")).run(
+        unittest.TestSuite([getattr(T, cls)(meth)])).wasSuccessful()
+
+
+def run_mutated():
+    """回傳 {測試: (突變下是否通過, 被突變查詢的呼叫次數)}"""
+    calls = {"n": 0}
+    def broken(self, direction):
+        calls["n"] += 1
+        return (False, 0.0, None, None)
+    res = {}
+    with mock.patch.object(T.pt.PaperTradingEngine, "_side_qty", broken):
+        for name in _all_tests():
+            calls["n"] = 0
+            res[name] = (_run(name), calls["n"])
+    return res
+
+
+def check(exempt, mutated, normal_pass):
+    problems, unrelated = [], []
+    for name, (passed, n) in mutated.items():
+        if not passed:
+            continue
+        if n == 0:
+            unrelated.append(name)
+            continue
+        if name not in exempt:
+            problems.append(f"空跑：{name}（突變下通過、呼叫了被突變的查詢 {n} 次、沒有豁免理由）")
+            continue
+        kind, cited, _ = exempt[name]
+        if cited not in mutated:
+            problems.append(f"豁免無效：{name} 引用的 {cited} 不存在")
+        elif mutated[cited][0]:
+            problems.append(f"豁免無效：{name} 引用的 {cited} 在突變下也通過，證明不了什麼")
+        elif kind == "對照組" and not normal_pass.get(cited):
+            problems.append(f"豁免無效：{name} 的對照組 {cited} 在沒有突變時不通過")
+    for name in exempt:
+        if name not in mutated:
+            problems.append(f"過期豁免：{name} 已不存在")
+        elif not mutated[name][0]:
+            problems.append(f"過期豁免：{name} 在突變下已經會失敗，請從清單刪掉")
+        elif mutated[name][1] == 0:
+            problems.append(f"過期豁免：{name} 已不經過被突變的查詢(自動判定為無關)，請從清單刪掉")
+    return problems, unrelated
+
+
+def self_test():
+    """
+    檢查器自我驗證(r22)：用固定的人造資料，不依賴當下的豁免清單——清單裡的項目可能本身就過期，
+    拿它來弄壞，檢查器根本不會去看引用，自我驗證就空跑了(第一版就是這樣)。
+    A：突變下通過、有呼叫查詢；C：突變下失敗；U：突變下通過、沒呼叫查詢；S：列在清單但突變下已失敗
+    """
+    m = {"A": (True, 2), "C": (False, 1), "U": (True, 0), "S": (False, 3)}
+    good = {"A": ("前提", "C", "")}
+    cases = [
+        ("正確的清單不報錯", good, lambda p: p == []),
+        ("拿掉一項豁免→報空跑", {}, lambda p: any(x.startswith("空跑") and "A" in x for x in p)),
+        ("引用改成突變下會通過的項目→報無效", {"A": ("前提", "U", "")}, lambda p: any("也通過" in x for x in p)),
+        ("對照組在沒突變時也不通過→報無效", {"A": ("對照組", "C", "")}, lambda p: any("沒有突變時不通過" in x for x in p)),
+        ("清單裡有突變下已失敗的項目→報過期", dict(good, S=("前提", "C", "")), lambda p: any("過期" in x and "S" in x for x in p)),
+    ]
+    ok = True
+    for label, ex_list, expect in cases:
+        normal = {"C": label != "對照組在沒突變時也不通過→報無效"}
+        p, _ = check(ex_list, m, normal)
+        hit = expect(p)
+        ok = ok and hit
+        print(f"  自我驗證：{label} → {'OK' if hit else '沒抓到!!'}")
+    return ok
 
 
 def main():
-    broken = lambda self, direction: (False, 0.0, None, None)
-    hollow = []
-    with mock.patch.object(T.pt.PaperTradingEngine, "_side_qty", broken):
-        for group, names in (("送進場單", SENDS_ENTRY), ("掛停損", PLACES_STOP)):
-            for n in names:
-                ok = _run(n)
-                print(f"{'空跑!!' if ok else '明確失敗'}  [{group}] {n}")
-                if ok:
-                    hollow.append(n)
-        for n, why in EXEMPT.items():
-            print(f"豁免({'通過' if _run(n) else '失敗'})  {n} — {why}")
-    # 對照組在沒有突變時必須通過(證明「會送單/會掛單」的前提在正常情況下成立)
-    for n in ("Lesson8.test_t8d_open_filled_then_later_step_raises_still_reported_as_filled",
-              "Lesson19.test_t2b_quantity_is_min_of_exchange_minus_baseline_and_recorded"):
-        print(f"對照組(無突變){'通過' if _run(n) else '失敗!!'}  {n}")
-    print("空跑項目：", hollow or "無")
-    return 1 if hollow else 0
+    mutated = run_mutated()
+    normal_pass = {n: _run(n) for n in {c for _, c, _ in EXEMPT.values()}}
+    problems, unrelated = check(EXEMPT, mutated, normal_pass)
+    failed = [n for n, (p, _) in mutated.items() if not p]
+    print(f"全部 {len(mutated)} 項：突變下明確失敗 {len(failed)} 項、無關(未呼叫被突變查詢) {len(unrelated)} 項、"
+          f"經驗證的豁免 {len(EXEMPT)} 項")
+    for n, (k, c, why) in EXEMPT.items():
+        print(f"  豁免[{k}] {n}\n      ← {c}：{why}")
+
+    self_ok = self_test()
+    print("問題：", "\n  ".join(problems) if problems else "無")
+    return 0 if (not problems and self_ok) else 1
 
 
 if __name__ == "__main__":

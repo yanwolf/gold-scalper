@@ -1,12 +1,14 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r19 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r22 第1、2、3、7、8、14條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
   否定句斷言(「沒送單」「帳上紀錄還在」「停損沒被撤」)——程式什麼都沒做也成立，
   所以每一個都要有「前提」斷言：證明走到被測那一步所需的每個動作真的發生了(測錯方式8、12)。
-  斷言看「這一步之後新發生的事」(只算這一步建立的mock/清單)，不看被測前就存在的最終狀態(測錯方式13)。執行：python -m unittest tests.test_lessons -v
+  斷言看「這一步之後新發生的事」(只算這一步建立的mock/清單)，不看被測前就存在的最終狀態(測錯方式13)。
+  否定句的前提要檢查查詢的「結果」，不只是「有去查」(測錯方式16)：「沒掛停損」可能是「部位沒了」也可能是「查不到」，
+  前提要寫出是哪一個。分類看斷言本身，不看測試描述(測錯方式15)。執行：python -m unittest tests.test_lessons -v
 
 每個測試名稱前綴對應清單段落：
   t7a 反轉依被拒的單   t7b 送單前偵測失敗   t7c 記住/清掉假設
@@ -34,6 +36,8 @@ def _engine():
     eng._orphan_cancels = []
     eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
     eng._qty_check_tick = 0
+    eng._position = None
+    ex._last_known_hedge.clear()   # 模組層級的「記住的持倉模式」也會被測試改到
     return eng
 
 
@@ -313,8 +317,9 @@ class Lesson7Manual(unittest.TestCase):
         with mock.patch.object(ex, "is_enabled", return_value=True), \
              mock.patch.object(ex, "get_position_info", return_value=(True, rows)) as gp, \
              mock.patch.object(ex, "place_market_order") as pm:
-            ok, _ = ex.close_position("bullish", account="gold", quantity=None, hedge=True)
+            ok, msg = ex.close_position("bullish", account="gold", quantity=None, hedge=True)
         self.assertTrue(gp.called, "前提：真的查了部位表")
+        self.assertIn("LONG", str(msg), "前提：不送的原因是『自己那一側沒有部位』(測錯方式16)")
         self.assertFalse(ok)
         self.assertEqual(pm.call_count, 0, "不能退而平掉別的那一列(測錯方式4：要看有沒有送單)")
 
@@ -366,6 +371,9 @@ class Lesson8Close(ExecHarness):
         with mock.patch.object(ex, "close_position", return_value=(False, {"code": -2019})), \
              mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))):
             self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertTrue(pos.get("pending_close"), "前提：第一次被拒後進入待平倉")
+        self.assertIn("目前交易所部位：0.1", self.eng.alerts[0],
+                      "前提：確認的結果是『部位還在0.1』，不是『查不到』(測錯方式16：兩者都會進待平倉)")
         with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})), \
              mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.1))), \
              mock.patch.object(self.eng, "_cancel_backstop", return_value=False), \
@@ -437,6 +445,7 @@ class Lesson16(ExecHarness):
         pos = self._real_pos()
         calls, pl = self._guard(pos, (False, {"code": -1001}, 500), (False, {"code": -1001}, 500), 5)
         self.assertEqual(calls.count("/fapi/v1/openAlgoOrders"), 5, "前提：5輪都真的查了")
+        self.assertIsNone(pos.get("backstop_missing"), "前提：5輪的結果都是『查不到』，沒有被算成『不見』")
         self.assertEqual(pl.call_count, 0, "查詢失敗不能當成停損不見(第2條)")
 
     def test_t1b_algo_404_falls_back_to_legacy_query_instead_of_skipping(self):
@@ -472,6 +481,7 @@ class Lesson16(ExecHarness):
             self.eng._close_position(pos, 4380.0, "觸及停損")
         self.assertEqual(cp.call_count, 1, "前提：平倉單真的送出")
         self.assertTrue(gp.called)
+        self.assertTrue(pos.get("pending_close"), "前提：結果是『無法確認、待平倉』(測錯方式16)")
         self.assertEqual(self.dbclose, [], "空清單不能當成已平倉")
         self.assertFalse(cb.called)
         pend = self._real_pos(real_open_executed=None, real_open_pending_until=1.0, real_open_baseline=0.0)
@@ -501,8 +511,9 @@ class Lesson16(ExecHarness):
         pos = self._real_pos(real_open_baseline=0.3)
         with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.4))) as gp, \
              mock.patch.object(pt.db, "update_paper_trade_real_open") as upd:
-            self.eng._check_exchange_quantity(pos)
+            status = self.eng._check_exchange_quantity(pos)
         self.assertTrue(gp.called, "前提：真的比對了(測錯方式13：數量0.1是測試前就有的狀態，不能只看它)")
+        self.assertEqual(status, "same", "前提：比對結果是『數量沒變』，不是『查不到』(測錯方式16)")
         self.assertFalse(upd.called, "0.4−基準0.3＝0.1，沒有減少，不能更新帳上數量")
         self.assertEqual(pos["real_open_quantity"], 0.1)
         self.assertFalse(any("減少" in a for a in self.eng.alerts), self.eng.alerts)
@@ -525,7 +536,8 @@ class Lesson16(ExecHarness):
         with mock.patch.object(ex, "is_enabled", return_value=True), \
              mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.3))), \
              mock.patch.object(ex, "place_market_order", side_effect=lambda side, q, **k: sent.append(q) or (True, {})):
-            ok, _ = ex.close_position("bullish", account="gold", quantity=0.1, hedge=False, baseline=0.3)
+            ok, msg = ex.close_position("bullish", account="gold", quantity=0.1, hedge=False, baseline=0.3)
+        self.assertIn("基準", str(msg), "前提：不送的原因是『扣掉基準後沒有自己的』")
         self.assertFalse(ok)
         self.assertEqual(sent, [], "扣掉基準後沒有自己的部位，不能送單")
         with mock.patch.object(ex, "is_enabled", return_value=True), \
@@ -566,16 +578,18 @@ class Lesson19(ExecHarness):
         pos = self._real_pos()
         with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.3))) as gp, \
              mock.patch.object(ex, "place_algo_stop", return_value=(True, "X", False)) as pl:
-            self.eng._sync_backstop(pos)
+            status = self.eng._sync_backstop(pos)
         self.assertTrue(gp.called, "前提：掛單前真的查了部位")
+        self.assertEqual(status, "gone", "前提：確認的結果是『沒了』，不是『查不到』(測錯方式16)")
         self.assertEqual(pl.call_count, 0, "交易所只剩基準(別人的)0.3，不能掛孤兒reduce-only單")
 
     def test_t2b_query_failure_skips_round_without_counting_failure(self):
         pos = self._real_pos()
         with mock.patch.object(ex, "get_position_info", return_value=(False, "Read timed out")) as gp, \
              mock.patch.object(ex, "place_algo_stop") as pl:
-            self.eng._sync_backstop(pos)
+            status = self.eng._sync_backstop(pos)
         self.assertTrue(gp.called, "前提：真的查了")
+        self.assertEqual(status, "unknown", "前提：結果是『查不到』")
         self.assertEqual(pl.call_count, 0)
         self.assertEqual(self.eng.alerts, [], "查不到是這輪不動，不是掛單失敗")
 
@@ -591,8 +605,9 @@ class Lesson19(ExecHarness):
         pos = self._real_pos(backstop_algo_id="OLD", backstop_price=4370.0)
         with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.3))) as gp, \
              mock.patch.object(ex, "place_algo_stop") as pl:
-            self.eng._sync_backstop(pos)
+            status = self.eng._sync_backstop(pos)
         self.assertTrue(gp.called, "前提：搬移前真的查了部位")
+        self.assertEqual(status, "gone", "前提：確認的結果是『沒了』")
         self.assertEqual(pl.call_count, 0)
 
     # 8a/8b：每一步各自try；出錯的步驟排在最前面(測錯方式11)
@@ -664,6 +679,102 @@ class Lesson19(ExecHarness):
             m._reconcile_with_exchange_on_startup()
         self.assertTrue(gp.called)
         self.assertIn("查不到", got[-1].splitlines()[1])
+
+
+# ------------------------------------------------------------------ r20 → r22
+class Lesson22(ExecHarness):
+    def _real_pos(self, **kw):
+        p = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, backstop_algo_id="B1",
+                 backstop_price=4380.0, backstop_used_legacy=False, real_open_baseline=0.0)
+        p.update(kw)
+        self.eng._position = None  # 已被claim
+        return p
+
+    # 8c：結帳之後出錯——已經做完的不可逆動作不能被當成沒做
+    def test_t8c_error_after_close_confirmed_is_not_restored(self):
+        pos = self._real_pos()
+        def close_then_fail(*a, **k):
+            self.dbclose.append(a)            # 帳已經寫進去了(不可逆)
+            raise RuntimeError("inj-after")   # 之後的步驟才出錯
+        with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})) as cp, \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False) as cb, \
+             mock.patch.object(pt.db, "close_paper_trade", side_effect=close_then_fail):
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出並成交")
+        self.assertEqual(cb.call_count, 1, "前提：停損已撤")
+        self.assertEqual(len(self.dbclose), 1, "前提：帳已經結了")
+        self.assertIsNone(self.eng._position, "已結帳的部位不能被放回帳上")
+        self.assertFalse(pos.get("pending_close"), "已結帳的部位不能被記成待平倉")
+        self.assertTrue(any("inj-after" in a for a in self.eng.alerts), self.eng.alerts)
+
+    # 8c：結帳之前出錯——部位不能被弄丟
+    def test_t8c_error_before_confirmation_keeps_position(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "close_position", return_value=(False, "Read timed out")) as cp, \
+             mock.patch.object(self.eng, "_own_qty", side_effect=RuntimeError("inj-before")), \
+             mock.patch.object(self.eng, "_cancel_backstop") as cb:
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、沒成交")
+        self.assertIs(self.eng._position, pos, "沒確認平掉就出錯，部位要放回帳上")
+        self.assertTrue(pos.get("pending_close"), "並記成待平倉、每輪重試")
+        self.assertFalse(cb.called, "沒確認平掉不能撤停損")
+        self.assertEqual(self.dbclose, [])
+        self.assertTrue(any("inj-before" in a and "第 1 次" in a for a in self.eng.alerts), self.eng.alerts)
+
+    def test_t8c_exit_price_none_still_closes(self):
+        pos = self._real_pos()
+        with mock.patch.object(ex, "close_position", return_value=(True, {"avgPrice": "4379.4"})), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False), \
+             mock.patch.object(pt, "_latest_price", return_value=None):
+            self.eng._close_position(pos, None, "交易所端部位已不在")
+        self.assertEqual(len(self.dbclose), 1)
+
+    # 8a：快速停損在背景執行緒送平倉，出錯要計數推播(不能沒人接)
+    def test_t8a_fast_stop_thread_error_is_counted(self):
+        pos = self._real_pos()
+        self.eng._position = pos
+        class SyncThread:
+            def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                self.t, self.a, self.k = target, args, kwargs or {}
+            def start(self):
+                self.t(*self.a, **self.k)
+        with mock.patch.object(pt.threading, "Thread", SyncThread), \
+             mock.patch.object(self.eng, "_close_position", side_effect=RuntimeError("inj-fast")) as cl:
+            self.eng._fast_stop_check(4379.0, 4379.2)
+        self.assertEqual(cl.call_count, 1, "前提：快速停損真的觸發了平倉")
+        self.assertTrue(any("inj-fast" in a and "第 1 次" in a for a in self.eng.alerts), self.eng.alerts)
+
+    # 8d：逐筆重試，壞掉的那筆排在前面(測錯方式11)
+    def test_t8d_broken_orphan_item_does_not_stop_the_rest(self):
+        self.eng._orphan_cancels = [
+            {"algo_id": "BAD"},  # 缺欄位
+            {"algo_id": "GOOD", "used_legacy": False, "symbol": "XAUUSDT", "fail_count": 1, "last_error": ""},
+        ]
+        with mock.patch.object(ex, "cancel_algo_stop", return_value=(True, {}, False)) as cc:
+            self.eng._retry_orphan_cancels()
+        self.assertIn("GOOD", [c.args[0] for c in cc.call_args_list], "壞掉那筆後面的要照樣處理")
+        self.assertEqual([i.get("algo_id") for i in self.eng._orphan_cancels], ["BAD"], "壞掉那筆要留在清單，不能丟掉")
+        self.assertTrue(any("BAD" in a for a in self.eng.alerts), self.eng.alerts)
+
+    # 2c：手上有正向證據時，直接用已知數量掛停損，不重查
+    def test_t2c_open_fill_places_stop_with_known_qty_even_if_exchange_lags(self):
+        pos = self._real_pos(backstop_algo_id=None, backstop_price=None)
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))) as gp, \
+             mock.patch.object(ex, "place_algo_stop", return_value=(True, "N1", False)) as pl:
+            self.eng._place_backstop(pos, 0.1, False)
+        self.assertEqual(pl.call_count, 1, "剛成交的回應就是部位在的證據，交易所還沒反映也要掛")
+        self.assertEqual(pl.call_args[0][1], 0.1)
+        self.assertFalse(gp.called, "有正向證據時不重查")
+
+    def test_t2c_claim_places_stop_with_claimed_qty_without_requery(self):
+        pos = self._real_pos(real_open_executed=None, real_open_pending_until=time.time() + 100,
+                             backstop_algo_id=None, backstop_price=None)
+        with mock.patch.object(ex, "get_position_info", side_effect=[(True, _rows(0.1)), (True, _rows(0))]) as gp, \
+             mock.patch.object(ex, "place_algo_stop", return_value=(True, "N2", False)) as pl:
+            self.eng._resolve_open_pending(pos)
+        self.assertIs(pos.get("real_open_executed"), True, "前提：認領成功")
+        self.assertEqual(gp.call_count, 1, "認領那一列就是證據，掛停損不重查")
+        self.assertEqual(pl.call_count, 1)
 
 
 class Lesson14(unittest.TestCase):
