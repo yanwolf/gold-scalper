@@ -452,6 +452,42 @@ class PaperTradingEngine:
         pos.pop("backstop_price", None)
         return "replaced:" + str(self._sync_backstop(pos))
 
+    def _closing_fills(self, position, want_qty):
+        """
+        從成交明細挑出這筆部位的平倉成交(第8條r30/r31)，回傳(status, 均價, 數量, 最後採用的id, 說明)：
+          - 界線用成交id(不用時間：同一毫秒可能有好幾筆)：第一次從開倉那張單的最後一筆成交id起算，
+            之後用「已採用的最後一筆」——部分出場採用過的成交，最後出場不能再算一次
+          - 挑平倉成交看方向(多單的平倉是SELL)，不看realizedPnl≠0：打平出場那筆的realizedPnl剛好是0
+          - 同側有基準部位(別人的倉)時分不出哪幾筆是自己的 → unknown
+        status：ok / none(界線之後沒有平倉成交) / unknown(查不到或分不出來)
+        """
+        if (position.get("real_open_baseline") or 0) > 1e-9:
+            return "unknown", None, 0.0, None, "同側有基準部位，成交明細分不出哪幾筆是自己的"
+        ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
+        if not ok or not isinstance(trades, list):
+            return "unknown", None, 0.0, None, f"成交明細查不到：{trades}"
+        boundary = position.get("fill_boundary_id")
+        if boundary is None:
+            oid = position.get("real_open_order_id")
+            opens = [int(t["id"]) for t in trades if oid is not None and str(t.get("orderId")) == str(oid)]
+            if not opens:
+                return "unknown", None, 0.0, None, "找不到開倉那筆成交，定不出界線"
+            boundary = max(opens)
+        bullish = position["direction"] == "bullish"
+        close_side, pos_side = ("SELL", "LONG") if bullish else ("BUY", "SHORT")
+        cands = sorted((t for t in trades if int(t.get("id", 0)) > boundary and t.get("side") == close_side
+                        and t.get("positionSide", "BOTH") in ("BOTH", pos_side)), key=lambda t: int(t["id"]))
+        take, q = [], 0.0
+        for t in cands:
+            if q >= want_qty - 1e-9:
+                break
+            take.append(t)
+            q += float(t["qty"])
+        if not take:
+            return "none", None, 0.0, None, "界線之後沒有平倉成交"
+        vwap = sum(float(t["price"]) * float(t["qty"]) for t in take) / q
+        return "ok", round(vwap, 6), round(q, 6), int(take[-1]["id"]), ""
+
     def _resolve_open_pending(self, position):
         """
         開倉回應不明(逾時/5xx)時保留的pending(第3條r12/r13)。每輪查一次：
@@ -547,15 +583,24 @@ class PaperTradingEngine:
         position.pop("gone_checks", None)
         if qty < recorded - 1e-9:
             reduced = round(recorded - qty, 6)
-            # 減少那部分(App手動減碼/ADL)的成交價不知道：損益記未知，不用標記價估(第8條r28)
-            position["partial_pnl_unknown"] = True
+            # 減少那部分(App手動減碼/ADL)：查得到成交明細就用實際成交價、推進界線；查不到記未知，
+            # 不用標記價估(第8條r28/r30)
+            st, px, fq, last_id, why = self._closing_fills(position, reduced)
+            entry_ref = position.get("entry_actual_price")
+            if st == "ok" and abs(fq - reduced) < 1e-6 and isinstance(entry_ref, (int, float)):
+                pnl = ((px - entry_ref) if position["direction"] == "bullish" else (entry_ref - px)) * fq
+                position["partial_realized_usd"] = (position.get("partial_realized_usd") or 0.0) + pnl
+                position["fill_boundary_id"] = last_id
+                partial_txt = f"這部分依成交明細 {fq}@{px}，損益 {pnl:+.2f} U"
+            else:
+                position["partial_pnl_unknown"] = True
+                partial_txt = f"這部分損益未知({why or '成交明細數量對不上'})，以交易所成交明細為準，這筆的USDT總損益也會記為未知"
             position["real_open_quantity"] = round(qty, 6)
             db.update_paper_trade_real_open(position.get("id"), True, round(qty, 6))
             self._backstop_alert(
                 f"ℹ️ {self.label} 交易所部位數量減少 {recorded} → {round(qty, 6)}(可能是App手動減碼或ADL)\n"
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
-                f"已更新帳上數量；減少的 {reduced} 成交價不知道，這部分損益未知(以交易所成交明細為準)，"
-                f"這筆的USDT總損益也會記為未知"
+                f"已更新帳上數量；{partial_txt}"
             )
             return "reduced"
         return "same"
@@ -945,6 +990,8 @@ class PaperTradingEngine:
                     # 平倉時只有真的開過才會送真實平倉單(修正記錄見README)
                     position["real_open_executed"] = bool(success)
                     position["real_open_quantity"] = quantity if success else None
+                    # 開倉單號：之後查成交明細時，界線從這張單的最後一筆成交id開始(第8條r30/r31)
+                    position["real_open_order_id"] = result.get("orderId") if (success and isinstance(result, dict)) else None
                     db.update_paper_trade_real_open(position.get("id"), bool(success), quantity if success else None)
                     if claim_entry:
                         position["entry_actual_price"] = claim_entry
@@ -1112,7 +1159,11 @@ class PaperTradingEngine:
             return default
 
     def _safe_closed_record(self, position, exit_price, exit_reason, exit_time):
-        """算平倉紀錄不能丟例外(第8條r24)：缺欄位時損益記為未知(None)，照樣結帳。"""
+        """算平倉紀錄不能丟例外(第8條r24)：缺欄位時損益記為未知(None)，照樣結帳。
+        交易所端平掉、成交明細又查不到時，出場價不知道，損益也記未知(第8條r30)。"""
+        if position.pop("_exit_unknown", False):
+            return {**position, "exit_price": exit_price, "exit_time": exit_time,
+                    "exit_reason": exit_reason, "pnl_points": None}
         try:
             return trading_core.close_position(position, exit_price, exit_reason, exit_time)
         except Exception as e:
@@ -1239,6 +1290,15 @@ class PaperTradingEngine:
                     executed, execution_error = None, None
                     skip_close_reason = ("平倉單回應失敗或逾時，但交易所這一側已經沒有部位"
                                          "(可能其實已成交，或被交易所停損觸發)，視為已平倉")
+                    # 出場價只用實際成交價(第8條r30)：查成交明細；查不到就記未知，不用偵測當下的標記價
+                    st, px, fq, last_id, why = self._closing_fills(position, position.get("real_open_quantity") or 0.0)
+                    if st == "ok":
+                        exit_actual_price = px
+                        exit_price = px
+                        position["fill_boundary_id"] = last_id
+                    else:
+                        position["_exit_unknown"] = True
+                        skip_close_reason += f"；出場成交價未知({why})，損益記為未知"
                 else:
                     # 還在、或查不到(查不到≠已經沒了，第2條)：保留部位，每輪重試
                     self._keep_after_failed_close(position, exit_price, exit_reason, execution_error,
@@ -1297,12 +1357,14 @@ class PaperTradingEngine:
                 qty = float(s.get("execution_quantity", 0) or 0) if (is_execution_engine or backstop_triggered) else None
                 real_pnl_usd = None
                 ea, xa = position.get("entry_actual_price"), exit_actual_price
-                if qty and ea and xa and (executed or backstop_triggered):
+                if qty and ea and xa and (executed or backstop_triggered or closed_externally):
                     real_qty = position.get("real_open_quantity") or qty
                     real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
                     # 期間有部分出場(App手動減碼/ADL)而那部分成交價不知道：整筆USDT損益記未知(第8條r28)
                     if position.get("partial_pnl_unknown"):
                         real_pnl_usd = None
+                    else:
+                        real_pnl_usd += position.get("partial_realized_usd") or 0.0  # 各段加總(任一段未知就整筆未知)
                 # 停損出場時附上「當時的停損位/峰值/出場價與停損位的差」，才分得出是
                 # 停損位本身設在那裡，還是價格跳空穿過停損位(15秒輪詢一次會有落差)
                 stop_note = None

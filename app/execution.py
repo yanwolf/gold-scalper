@@ -683,6 +683,14 @@ def get_position_info(symbol=None, account=DEFAULT_ACCOUNT):
     return _signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, account=account)
 
 
+def get_user_trades(symbol=None, account=DEFAULT_ACCOUNT, limit=100):
+    """
+    成交明細(GET /fapi/v1/userTrades)：交易所端觸發的停損、App手動平倉的實際成交價從這裡查
+    (第8條r30)。回傳(success, list)，每筆有 id / orderId / side / positionSide / qty / price / realizedPnl / time。
+    """
+    return _signed_request("GET", "/fapi/v1/userTrades", {"symbol": _resolve_symbol(symbol), "limit": limit}, account=account)
+
+
 def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
     """查詢指定訂單的目前狀態，用來在avgPrice還沒被填入時重新確認實際成交價。"""
     return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)

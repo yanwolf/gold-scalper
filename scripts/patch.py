@@ -26,7 +26,7 @@ def apply(changes):
     for i, ch in enumerate(changes):
         path, old, new = ch[0], ch[1], ch[2]
         count = ch[3] if len(ch) > 3 else 1
-        if old.endswith("\n") != new.endswith("\n"):
+        if new and old.endswith("\n") != new.endswith("\n"):  # new為空＝整段刪除，允許
             # 結尾換行不一致：替換後下一行會黏上來、或多出空行(r26那次的語法錯誤就是這樣來的)
             sys.exit(f"apply中止(一個檔都沒寫)：第{i + 1}處 {path} 比對字串與替換字串的結尾換行不一致：{old[-40:]!r}")
         if path not in texts:
@@ -65,4 +65,21 @@ def selftest():
     reset()
     apply([(a, "x\n", "X\n"), (b, "y\n", "Y\n")])
     r3 = open(a, encoding="utf-8").read() == "X\ny\n" and open(b, encoding="utf-8").read() == "x\nY\n"
-    return {"第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3}
+    with open(a, "w", encoding="utf-8") as f:
+        f.write("    def f():\n        return 1\n    x = 2\n")
+    r4 = exact(a, "def f():", 2) == "    def f():\n        return 1\n"
+    return {"第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4}
+
+
+def exact(path, first_line_contains, n_lines):
+    """
+    從檔案讀出「含first_line_contains的那一行起、連續n_lines行」的原文當比對字串(第14條r31)，
+    不手抄縮排——手抄時最容易把縮排或結尾換行抄錯，apply就會對不上(或更糟：對到別的地方)。
+    那一行必須恰好出現一次。
+    """
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines(keepends=True)
+    hits = [i for i, l in enumerate(lines) if first_line_contains in l]
+    if len(hits) != 1:
+        sys.exit(f"exact中止：{path} 含{first_line_contains!r}的行有{len(hits)}行，預期1行")
+    return "".join(lines[hits[0]:hits[0] + n_lines])
