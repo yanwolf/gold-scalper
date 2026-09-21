@@ -6,7 +6,8 @@
   len(X)、X.called、X.call_count、assertTrue(X、one(X、pick(X  (X 的最左邊名稱也算，例如 pl.call_args 看 pl)
 前提本身也算：「前提」那一行自己就索引、而更早沒確認，一樣報出來(r36：插入腳本自己犯過)。
 排除(不會空、或不是讀取)：賦值目標、for 迴圈變數、行尾註明「# 固定長度」的來源(函式固定回傳 tuple)、
-同一行的短路保護(`X and X[0]`)、從函式呼叫算出來的值(例如 `ast.parse(原文).body[0]`，不是測試累積的狀態)。
+同一行的短路保護(`X and X[0]`)、`ast.parse(原文).body[0]`(解析一個函式永遠有一個節點)。
+**不整類排除函式呼叫的結果**(r40 crypto-screener 的提醒)：`工具輸出.splitlines()[-1]` 在工具沒輸出時真的是空的。
 執行：python -m unittest tests.check_indexing -v
 """
 import ast
@@ -38,7 +39,7 @@ def problems(source):
                 if not (isinstance(n, ast.Subscript) and isinstance(n.slice, (ast.Constant, ast.UnaryOp))):
                     continue
                 idx = ast.literal_eval(n.slice) if isinstance(n.slice, (ast.Constant, ast.UnaryOp)) else None
-                if idx not in (0, -1) or id(n) in targets or isinstance(n.value, ast.Call):
+                if idx not in (0, -1) or id(n) in targets:
                     continue
                 if isinstance(n.value, ast.Subscript):   # 巢狀取值：只看最內層那一次索引
                     continue
@@ -46,8 +47,8 @@ def problems(source):
                 root = _root(n.value)
                 if root in loop_vars or root in fixed or x_src is None:
                     continue
-                if any(isinstance(c, ast.Call) for c in ast.walk(n.value)):
-                    continue  # 從函式呼叫算出來的值，不是測試累積的清單
+                if x_src.startswith("ast.parse(") and x_src.endswith(".body"):
+                    continue  # 解析一個函式的原文，body永遠有一個節點(具名排除，不整類排除函式呼叫)
                 if f"{x_src} and {x_src}[" in lines[n.lineno - 1]:
                     continue  # 同一行的短路保護
                 earlier = "\n".join(lines[fn.lineno - 1:n.lineno - 1])
@@ -67,7 +68,8 @@ SELFTEST = [  # (測試主體, 預期是否被報出)
     ("self.assertIn('p', x[0], '前提')", True),              # 前提本身就索引
     ("st = f()  # 固定長度\n        st[0]", False),
     ("self.assertEqual(x and x[-1], 1)", False),               # 同一行短路保護
-    ("t = ast.parse(s).body[0]", False),                       # 從函式呼叫算出來的值
+    ("t = ast.parse(s).body[0]", False),                       # 具名排除
+    ("t = r.stdout.strip().splitlines()[-1]", True),           # 函式呼叫的結果不整類排除：沒輸出時真的是空的
 ]
 
 

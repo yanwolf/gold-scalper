@@ -54,12 +54,14 @@ step("逐項突變檢查", r.returncode == 0 and bool(summary), summary)
 r = run([PY, "-m", "tests.error_scan"])
 step("錯誤掃描", r.returncode == 0, (r.stdout.strip().splitlines() or ["(沒有輸出)"])[-1][:160])
 
-# 6.(選用) 在上一版程式上重跑：GS_PREV=<舊版目錄>。框架/測試崩掉要是0(用法第5點r34/r37)
-prev = os.environ.get("GS_PREV")
-if prev:
-    r = run([PY, "-m", "tests.rerun_old", prev])
-    step("在上一版程式上重跑", r.returncode == 0, (r.stdout.strip().splitlines() or ["(沒有輸出)"])[0][:160])
+# 6. 在舊版程式上重跑：tests/legacy/ 下每一版都跑，另外 GS_PREV=<目錄> 可加一版。框架/測試崩掉要是0(用法第5點r34/r37/r40)
+olds = [f"legacy:{v}" for v in sorted(os.listdir(os.path.join(ROOT, "tests", "legacy")))] if os.path.isdir(os.path.join(ROOT, "tests", "legacy")) else []
+if os.environ.get("GS_PREV"):
+    olds.append(os.environ["GS_PREV"])
+for old in olds:
+    r = run([PY, "-m", "tests.rerun_old", old])
+    step(f"在舊版程式上重跑({old})", r.returncode == 0, (r.stdout.strip().splitlines() or ["(沒有輸出)"])[0][:160])
 
-ok = all(o for _, o in results) and len(results) == (6 if prev else 5)
+ok = all(o for _, o in results) and len(results) == 5 + len(olds) and len(olds) >= 1
 print("\n" + ("全部通過" if ok else f"有 {sum(1 for _, o in results if not o)} 步失敗"))
 sys.exit(0 if ok else 1)

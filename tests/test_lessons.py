@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r37 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r40 第1、2、3、7、8、14條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -43,6 +43,20 @@ def one(alerts, title):
     return got[0]
 
 
+def _reset_module_state():
+    """
+    模組層級、會被測試改到的狀態(第14種)。gold-scalper 沒有狀態檔(狀態都在資料庫，測試時資料庫是關的)，
+    所以沒有「前一個情境留在磁碟上」的問題(r40)；要重設的是記憶體裡的這些。在舊版程式上重跑時不存在的就略過。
+    """
+    import app.main as m
+    from app.notifier import notifier as N
+    for obj, attr in ((pt.db, "_db_fail_counts"), (m, "_web_trade_errors"), (N, "errors")):
+        if hasattr(obj, attr):
+            getattr(obj, attr).clear()
+    if hasattr(N, "_unconfigured_recorded"):
+        N._unconfigured_recorded = False
+
+
 def _engine():
     eng = next(iter(pt.PAPER_TRADING_ENGINES.values()))
     eng.alerts = []
@@ -51,6 +65,7 @@ def _engine():
     eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
     eng._qty_check_tick = 0
     eng._position = None
+    _reset_module_state()
     eng._seeded_from_db = True   # r37起「持倉紀錄沒載入就不開倉」：前一個測試模擬讀不到時留下的False不能帶進來
     # 模組層級的「記住的持倉模式」也會被測試改到。在舊版程式上重跑時它可能還不存在(r10才加)，
     # 不存在就略過，不要讓框架本身崩掉(用法第5點r34)
@@ -1299,6 +1314,108 @@ class Lesson37(ExecHarness):
             st = self.eng._closing_fills(pos, 0.1)  # 固定長度
         self.assertEqual(ut.call_count, 3, "前提：查到頁數上限")
         self.assertEqual(st[0], "unknown", "沒拿完就是不完整，記未知，不能用拿到的部分算")
+
+
+# ------------------------------------------------------------------ r38 → r40
+class Lesson40(ExecHarness):
+    # 8f：推播沒設定不能靜靜return——記一次、自檢列出來
+    def test_t8f_unconfigured_push_is_recorded_once_and_listed_by_preflight(self):
+        from app.notifier import notifier as N
+        from app import preflight as pf
+        self.assertTrue(hasattr(N, "errors"), "前提：推播有記錄錯誤的地方")
+        N.errors.clear()
+        N._unconfigured_recorded = False
+        with mock.patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}):
+            N.send_raw_message("a")
+            N.send_raw_message("b")
+            item = pf.notify_check()
+        unconf = [e for e in N.errors if e["kind"] == "未設定"]
+        self.assertEqual(len(unconf), 1, "沒設定：記一次，不是每則都記、也不是完全不記")
+        self.assertEqual(item["status"], "warn", item)
+        self.assertIn("TELEGRAM_BOT_TOKEN", item["msg"])
+
+    # 8d：推播送出失敗要記下來，而且記錄本身不再推播(不遞迴)
+    def test_t8d_push_send_failure_is_recorded_without_recursion(self):
+        from app.notifier import notifier as N
+        N.errors.clear() if hasattr(N, "errors") else None
+        with mock.patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}), \
+             mock.patch("app.notifier.requests.post", side_effect=RuntimeError("inj-push")) as post:
+            ok, err = N.send_raw_message("hello")
+        self.assertEqual(post.call_count, 1, "前提：真的嘗試送出一次，而且記錄錯誤時沒有再送(不遞迴)")
+        self.assertFalse(ok)
+        self.assertTrue(hasattr(N, "errors"), "前提：推播有記錄錯誤的地方")
+        fails = [e for e in N.errors if e["kind"] == "送出失敗"]
+        self.assertEqual(len(fails), 1)
+        self.assertIn("inj-push", fails[0]["msg"])
+
+    # 8c：手動下單也要擋——持倉紀錄沒載入時不能送
+    def test_t8c_manual_test_order_blocked_when_state_not_loaded(self):
+        import asyncio
+        import app.main as m
+        eng = self.eng
+        eng._seeded_from_db = False
+        with mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)) as vp, \
+             mock.patch.object(ex, "open_position", return_value=(True, {"avgPrice": "4391"})) as op, \
+             mock.patch.object(ex, "place_market_order", return_value=(True, {"avgPrice": "4391"})) as pm:
+            res = asyncio.run(m.execution_test_order({"password": "x", "direction": "bullish", "quantity": 0.1,
+                                                     "account": eng.execution_account, "confirm_live": True}))
+        self.assertTrue(vp.called, "前提：通過了密碼檢查，擋下的是持倉紀錄這一關")
+        self.assertIn("持倉紀錄", str(res.get("error")), res)
+        self.assertEqual(op.call_count + pm.call_count, 0, "沒送出任何單")
+
+    # 8e：設定一次套用——有一個值不對，全部都不套用
+    def test_t8e_update_settings_is_all_or_nothing(self):
+        S = pt.settings_module
+        self.assertTrue(hasattr(S, "SettingsValidationError"), "前提：程式有「整批驗證」這個機制(在舊版上重跑時是斷言失敗、不是崩掉)")
+        before = dict(S.get_settings())
+        key_ok, key_bad = "paper_sl_points", "paper_trail_trigger_points"
+        new_ok = before[key_ok] + 1.0 if before[key_ok] < 50 else before[key_ok] - 1.0
+        with mock.patch.object(pt.db, "is_enabled", return_value=False):
+            with self.assertRaises(S.SettingsValidationError) as cm:
+                S.update_settings({key_ok: new_ok, key_bad: "not-a-number"})
+        self.assertIn(key_bad, str(cm.exception), "錯誤要講是哪個欄位")
+        self.assertEqual(S.get_settings()[key_ok], before[key_ok], "有一個值不對：其他欄位也不能先套用(不能停在半套)")
+
+    def test_t8e_param_set_import_rejects_whole_set_on_bad_value(self):
+        import asyncio
+        import app.main as m
+        S = pt.settings_module
+        eid = self.eng.engine_id
+        before = dict(S.get_engine_overrides(eid) or {})
+        ps = {"format": "gold-scalper-param-set/1", "engine_id": eid,
+              "params": {"paper_sl_points": 7.5, "paper_trail_trigger_points": "abc"}}
+        with mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)), \
+             mock.patch.object(pt.db, "is_enabled", return_value=False), \
+             mock.patch.object(m.notifier, "send_raw_message"):
+            res = asyncio.run(m.settings_import({"password": "x", "param_set": ps, "force": True}))
+        self.assertIs(res.get("success"), False, res)
+        self.assertIn("paper_trail_trigger_points", str(res.get("error")))
+        self.assertEqual(dict(S.get_engine_overrides(eid) or {}), before, "整份拒絕，一個欄位都沒套用")
+
+    # 5f：全量部位表跟真的一樣列出數量0的列(所有交易過的幣、雙向兩側)
+    def test_t5f_orphan_check_with_realistic_full_position_table(self):
+        from app import preflight as pf
+        full = [{"symbol": "XAUUSDT", "positionSide": "BOTH", "positionAmt": "0.1"},
+                {"symbol": "KASUSDT", "positionSide": "BOTH", "positionAmt": "0"},       # 交易過、現在是0
+                {"symbol": "BTCUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                {"symbol": "BTCUSDT", "positionSide": "SHORT", "positionAmt": "0"}]
+        orders = [{"symbol": "XAUUSDT", "side": "SELL", "algoId": 1, "positionSide": "BOTH"},
+                  {"symbol": "KASUSDT", "side": "BUY", "algoId": 2, "positionSide": "BOTH"},
+                  {"symbol": "BTCUSDT", "side": "SELL", "algoId": 3, "positionSide": "LONG"}]
+        with mock.patch.object(ex, "_get_credentials", return_value=("k", "s")), \
+             mock.patch.object(ex, "get_symbol_filters", return_value={"step_size": .001, "tick_size": .01, "min_notional": 5}), \
+             mock.patch.object(ex, "current_hedge_mode", return_value=False), \
+             mock.patch.object(ex, "get_algo_stop_status", return_value=(False, {"code": -2013, "msg": "Order does not exist."})), \
+             mock.patch.object(ex, "usdt_balance_line", return_value="x"), mock.patch.object(ex, "max_leverage", return_value=5), \
+             mock.patch.object(ex, "get_open_algo_orders", return_value=(True, orders)), \
+             mock.patch.object(pf, "_signed_positions", return_value=(True, full)), \
+             mock.patch.object(ex, "get_position_info", return_value=(True, [])):
+            res = {r["item"]: r for r in pf.check(account="gold")}
+        msg = res["孤兒條件單"]["msg"]
+        self.assertEqual(res["孤兒條件單"]["status"], "fail", msg)
+        self.assertIn("algoId=2", msg, "數量0的列不算有部位")
+        self.assertIn("algoId=3", msg, "雙向兩側都是0也不算")
+        self.assertNotIn("algoId=1", msg, "真的有部位的不算孤兒")
 
 
 class StaticChecks(unittest.TestCase):
