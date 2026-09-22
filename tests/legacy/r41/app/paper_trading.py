@@ -474,13 +474,7 @@ class PaperTradingEngine:
                 return
             ids = [int(t["id"]) for t in trades if isinstance(t.get("id"), (int, float)) or str(t.get("id", "")).isdigit()]
             oid = position.get("real_open_order_id")
-            own_rows = [t for t in trades if not latest and oid is not None and str(t.get("orderId")) == str(oid)]
-            own = [int(t["id"]) for t in own_rows]
-            if own_rows and not isinstance(position.get("entry_actual_price"), (int, float)):
-                # 回應沒有均價(ACK或回填慢)：用這張開倉單的成交明細算加權均價(實際成交價，不是估算)
-                q = sum(float(t["qty"]) for t in own_rows)
-                if q > 0:
-                    position["entry_actual_price"] = round(sum(float(t["price"]) * float(t["qty"]) for t in own_rows) / q, 6)
+            own = [int(t["id"]) for t in trades if not latest and oid is not None and str(t.get("orderId")) == str(oid)]
             boundary = max(own) if own else (max(ids) if ids else None)
             if boundary is None:
                 return
@@ -488,20 +482,6 @@ class PaperTradingEngine:
             db.update_paper_trade_fills(position.get("id"), position.get("real_open_order_id"), boundary)
         except Exception as e:
             logger.error(f"記錄成交明細界線失敗({self.label})，平倉時出場價會記未知: {e}")
-
-    def _fill_vwap_by_order(self, order_result):
-        """回應裡沒有均價時，用這張單號在成交明細裡的成交算加權均價；查不到回None(記未知，不估算)。"""
-        try:
-            oid = order_result.get("orderId") if isinstance(order_result, dict) else None
-            if oid is None:
-                return None
-            ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
-            rows = [t for t in trades if str(t.get("orderId")) == str(oid)] if ok and isinstance(trades, list) else []
-            q = sum(float(t["qty"]) for t in rows)
-            return round(sum(float(t["price"]) * float(t["qty"]) for t in rows) / q, 6) if q > 0 else None
-        except Exception as e:
-            logger.error(f"用成交明細算均價失敗({self.label}): {e}")
-            return None
 
     def _trades_after(self, boundary):
         """
@@ -1090,11 +1070,6 @@ class PaperTradingEngine:
                             logger.warning(f"開倉回應不明但交易所已有部位({self.label})，認領數量{quantity}")
                         else:
                             ambiguous_pending = True
-                    if success:
-                        fq = execution_module.extract_filled_qty(result)
-                        if fq is not None and fq < quantity - 1e-9:
-                            logger.warning(f"開倉只成交 {fq}/{quantity}({self.label})，真實數量以成交量為準")
-                            quantity = round(fq, 6)  # 真實數量用交易所確認的成交量，不是送出的數量
                     executed = success
                     filled = bool(success)  # r10第8條「已成交的動作先通知」：之後出錯不能改寫這個事實
                     # 把「這筆單有沒有真的開出真實部位、開了多少」記進部位跟資料庫，
@@ -1127,7 +1102,7 @@ class PaperTradingEngine:
                         self._place_backstop(position, quantity, hedge)
                     if success:
                         logger.info(f"同步下單成功({self.label}): {result}")
-                        actual_fill_price = execution_module.extract_fill_price(result) or position.get("entry_actual_price")
+                        actual_fill_price = execution_module.extract_fill_price(result)
                         quality = execution_module.analyze_execution_quality(
                             position["direction"], bid, ask, actual_fill_price, is_close=False,
                         ) if actual_fill_price else None
@@ -1333,7 +1308,7 @@ class PaperTradingEngine:
                 filled = bool(success)
                 if success:
                     logger.info(f"同步平倉成功({self.label}): {result}")
-                    actual_fill_price = execution_module.extract_fill_price(result) or self._fill_vwap_by_order(result)
+                    actual_fill_price = execution_module.extract_fill_price(result)
                     exit_actual_price = actual_fill_price
                     quality = execution_module.analyze_execution_quality(
                         position["direction"], bid, ask, actual_fill_price, is_close=True,

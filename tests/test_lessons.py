@@ -1418,6 +1418,84 @@ class Lesson40(ExecHarness):
         self.assertNotIn("algoId=1", msg, "真的有部位的不算孤兒")
 
 
+# ------------------------------------------------------------------ 實盤：市價單回應沒有成交資訊(2026-09-22)
+ACK = {"orderId": 16598305424, "symbol": "XAUUSDT", "status": "NEW", "price": "0.00", "origQty": "0.100",
+       "executedQty": "0.000", "cumQty": "0.000", "type": "MARKET", "side": "BUY", "positionSide": "LONG"}
+
+
+class LiveAckResponse(ExecHarness):
+    """實盤 2026-09-22 00:00:06 的開倉：回應是ACK(status NEW、沒有avgPrice)，程式當成已成交但沒有成交價。"""
+
+    def _send(self, first, polls):
+        sent, polled = [], []
+        def fake_req(method, path, params=None, account=None, return_status=False):
+            if method == "POST":
+                sent.append(dict(params))
+                return (True, first, 200) if return_status else (True, first)
+            polled.append(params.get("orderId"))
+            r = polls[min(len(polled) - 1, len(polls) - 1)]
+            return (True, r, 200) if return_status else (True, r)
+        with mock.patch.object(ex, "_signed_request", side_effect=fake_req), \
+             mock.patch.object(ex, "round_quantity", return_value=(0.1, None)), mock.patch("time.sleep"):
+            ok, res = ex.place_market_order("BUY", 0.1, account="gold", position_side="LONG")
+        return ok, res, sent, polled
+
+    def test_order_requests_full_result_response(self):
+        filled = dict(ACK, status="FILLED", executedQty="0.100", avgPrice="4373.52")
+        ok, res, sent, _ = self._send(filled, [filled])
+        self.assertEqual(len(sent), 1, "前提：送出一張單")
+        self.assertEqual(sent[0].get("newOrderRespType"), "RESULT", "要求回應包含成交資訊，不用預設的ACK")
+
+    def test_ack_then_filled_on_poll_returns_fill(self):
+        filled = dict(ACK, status="FILLED", executedQty="0.100", avgPrice="4373.52")
+        ok, res, _, polled = self._send(ACK, [ACK, ACK, filled])
+        self.assertEqual(len(polled), 3, "前提：沒確認成交時多查幾次，不是只查一次")
+        self.assertTrue(ok)
+        self.assertEqual(res.get("avgPrice"), "4373.52")
+
+    def test_never_confirmed_is_ambiguous_not_success(self):
+        ok, res, _, polled = self._send(ACK, [ACK])
+        self.assertGreater(len(polled), 1, "前提：真的查了訂單")
+        self.assertFalse(ok, "沒確認成交不能回報成功(平倉時會直接撤停損、結帳)")
+        self.assertTrue(ex.is_ambiguous_result(res), "要當成結果不明，走查部位確認的路")
+
+    def test_open_uses_executed_qty_and_fill_price_from_trades(self):
+        eng = self.eng
+        partial = dict(ACK, status="FILLED", executedQty="0.060", avgPrice="0.00")   # 成交0.06、回應沒均價
+        fills = (True, _fills((201, 16598305424, "BUY", 0.02, 4373.4, 0.0, 1000),
+                               (202, 16598305424, "BUY", 0.04, 4373.7, 0.0, 1000)))
+        with mock.patch.object(pt.risk_guard, "check", return_value=(True, None, None)), \
+             mock.patch.object(ex, "resolve_position_mode", return_value=(True, None)), \
+             mock.patch.object(ex, "set_margin_type", return_value=(True, {})), \
+             mock.patch.object(ex, "set_leverage", return_value=(True, {})), \
+             mock.patch.object(ex, "open_position", return_value=(True, partial)) as op, \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))), \
+             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True), \
+             mock.patch.object(eng, "_sync_backstop"):
+            eng._position = None
+            eng._open_position({"direction": "bullish", "bid": 4373.4, "ask": 4373.5,
+                                "chan": {"reason": "t"}, "profile": {"reason": "t"}}, 4373.49, 10.0)
+        self.assertEqual(op.call_count, 1, "前提：開倉單送出")
+        pos = eng._position
+        self.assertIsNotNone(pos, "前提：開倉了")
+        self.assertEqual(pos.get("real_open_quantity"), 0.06, "真實數量用交易所回報的成交量，不是送出的0.1")
+        self.assertAlmostEqual(pos.get("entry_actual_price") or 0, (4373.4 * 0.02 + 4373.7 * 0.04) / 0.06, places=4,
+                               msg="回應沒有均價：用這張單號的成交明細算")
+
+    def test_close_fill_price_from_trades_when_response_lacks_it(self):
+        pos = _pos(real_open_quantity=0.1, entry_actual_price=4373.5, real_open_baseline=0.0, backstop_algo_id="B1")
+        filled = {"orderId": 777, "status": "FILLED", "executedQty": "0.100", "avgPrice": "0.00"}
+        fills = (True, _fills((301, 777, "SELL", 0.1, 4380.2, 0.67, 2000)))
+        with mock.patch.object(ex, "close_position", return_value=(True, filled)) as cp, \
+             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、成交")
+        self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
+        self.assertAlmostEqual(self.notes[-1].get("real_pnl_usd") or 0, (4380.2 - 4373.5) * 0.1, places=4,
+                               msg="平倉回應沒有均價：用這張單號的成交明細算出真實損益")
+
+
 class StaticChecks(unittest.TestCase):
     """全域／靜態檢查自成一個情境(用法第5點r25)：不放在別的情境最後，才不會繼承那個情境的突變命中次數。"""
     RETURN_FUNCS = ("_check_backstop_present", "_sync_backstop", "_check_exchange_quantity",

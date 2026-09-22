@@ -1,0 +1,243 @@
+"""
+統一的訊號計算邏輯。
+
+拆成兩層：
+- compute_signal_from_trades()：純計算，輸入一份逐筆成交清單，輸出完整訊號結果。
+  不碰即時資料源，可以餵歷史資料進去，這是回測(backtest.py)能重用同一套訊號
+  邏輯的關鍵。
+- compute_full_signal()：即時版本，從binance_streamer抓最新資料，
+  再呼叫上面那個純函式。/signal/latest API、Telegram通知、即時模擬單
+  三邊都呼叫這個。
+
+這樣「即時判斷」和「回測重播」永遠共用同一套訊號規則，不會有回測邏輯
+跟正式運作邏輯兜不起來的風險。
+
+STRATEGY_TYPE切換(修正記錄見README)：新增"resonance_fvg"實驗性策略
+(多條件共振+FVG)，跟原本的"chan_profile"策略並存。目前刻意設計成
+「只接回測，不接即時」——compute_full_signal()(即時模擬單/通知/API都是
+呼叫這個)完全不接受strategy_type參數，永遠用預設的"chan_profile"，
+新策略只有透過backtest.py明確指定strategy_type="resonance_fvg"才會生效，
+確保即時運作中的系統完全不受這個實驗性策略影響，直到先用回測驗證過
+訊號量和勝率再決定要不要接上即時。
+"""
+
+import os
+
+from app.binance_client import binance_streamer
+from app.analysis import (
+    build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile,
+    compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
+    compute_trend_filter,
+)
+from app.signal import generate_signal, generate_signal_resonance_fvg
+from app import smc_structure
+
+CHAN_LOOKBACK_TRADES = 100000  # (回測/舊路徑用)從逐筆成交建K棒時的回看筆數
+CHAN_MAX_CANDLES = 600  # 即時路徑從1分鐘K棒快取取樣時，最多餵給纏論/ATR的K棒數(控制每次tick的計算量)
+                              # (跟binance_client.py的MAX_TRADE_HISTORY保持一致，這裡切太少
+                              # 也沒用，實際能用的資料量是兩者取較小值)
+
+DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" / "resonance_fvg" / "smc_structure"
+STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure")
+
+
+def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
+                                current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
+                                trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
+                                smc_candles=None, smc_cfg=None):
+    """
+    純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
+    回傳跟compute_full_signal()一樣格式的完整訊號結果。
+
+    trades必須是時間遞增排序、格式為[{"time","price","qty",...}, ...]。
+    trade_limit只影響分價量表的取樣範圍，纏論一律用CHAN_LOOKBACK_TRADES內的資料
+    (如果傳進來的trades本身就比較短，就整份都用)。
+
+    current_price可以外部指定(例如即時模式想用bid/ask中價而不是最後一筆成交價)，
+    不指定的話預設用trades最後一筆的成交價。這個值必須在呼叫generate_signal()
+    之前就決定好，否則訊號判斷理由裡引用的價格會跟回傳的current_price對不上。
+
+    strategy_type不指定時用DEFAULT_STRATEGY_TYPE("chan_profile")。只有明確
+    傳入"resonance_fvg"才會計算EMA/RSI/MACD/FVG這些額外指標並改用共振策略
+    判斷——這些指標平常(chan_profile模式)不會計算，避免每次即時訊號檢查都
+    白白多花運算資源在用不到的指標上。
+
+    resonance_min_conditions只有resonance_fvg模式才會用到：四個子條件
+    (RSI/EMA-FVG/價格行為/成交量)裡要符合幾個(含)以上才給訊號，預設4代表
+    要全部符合(原本的嚴格AND邏輯)，調低可以放寬門檻，用回測比較「訊號量
+    vs 品質」的取捨(修正記錄見README)。
+    """
+    strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
+
+    if strategy_type == "smc_structure":
+        # SMC結構策略走獨立的輕量路徑：不算纏論/分價量表(它用不到，而且長天數回測每根
+        # 1小時K都要檢查，纏論會拖垮速度)，ATR/震盪指數改用1小時K算，讓ATR停損模式仍可用。
+        # smc_candles有給(回測：預先切好、只到當下時間點)就直接用，絕不去抓REST(避免look-ahead)；
+        # 沒給(即時路徑)才用本地K棒，不夠長就補REST歷史。
+        if smc_candles is None:
+            if candles is None:
+                candles = build_candles(trades, interval_seconds=smc_structure.SMC_INTERVAL_SECONDS)
+            smc_candles = candles
+            if len(smc_candles) < smc_structure.SMC_MIN_CANDLES + 1:
+                smc_candles = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
+        smc_candles = smc_candles[-smc_structure.SMC_MAX_CANDLES:]
+        if current_price is None:
+            current_price = trades[-1]["price"] if trades else (smc_candles[-1]["close"] if smc_candles else None)
+        if smc_cfg is None:
+            # 即時路徑：SMC參數從dashboard「此引擎專屬參數」讀(settings.py的smc_*欄位)
+            from app import settings as _settings
+            smc_cfg = smc_structure.cfg_from_settings(_settings.get_settings(engine_id=smc_structure.SMC_ENGINE_ID))
+        result = smc_structure.generate_signal_smc(smc_candles, current_price=current_price, cfg=smc_cfg)
+        result["trend_filter"] = (
+            compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
+            if trend_candles else None
+        )
+        closed = smc_candles[:-1] if len(smc_candles) > 1 else smc_candles
+        result["strategy_type"] = strategy_type
+        result["atr"] = compute_atr(closed)
+        result["choppiness_index"] = compute_choppiness_index(closed)
+        result["emas"] = result["rsi"] = result["macd"] = result["fvgs"] = None
+        result["chan_detail"] = {"interval_seconds": smc_structure.SMC_INTERVAL_SECONDS,
+                                 "source_candle_count": len(smc_candles)}
+        result["profile_detail"] = {"bucket_size": bucket_size, "trade_count": 0, "profile": [], "interpretation": None}
+        return result
+
+    # candles有給(即時路徑從1分鐘K棒快取取樣)就直接用，歷史長度不受成交筆數限制；
+    # 沒給(回測/舊路徑)才從逐筆成交建(修正記錄見README)
+    if candles is None:
+        chan_trades = trades[-CHAN_LOOKBACK_TRADES:] if len(trades) > CHAN_LOOKBACK_TRADES else trades
+        candles = build_candles(chan_trades, interval_seconds=interval_seconds)
+    chan_data = analyze_chan(candles)
+    atr = compute_atr(candles)  # 給ATR動態停損模式用，資料不足時是None(呼叫端要處理)
+    choppiness_index = compute_choppiness_index(candles)  # 給震盪濾網用，資料不足時是None
+
+    profile_trades = trades[-trade_limit:] if len(trades) > trade_limit else trades
+    profile = compute_volume_profile(profile_trades, bucket_size=bucket_size)
+    poc_info = poc_and_value_area(profile)
+
+    if current_price is None:
+        current_price = trades[-1]["price"] if trades else None
+
+    emas = rsi = macd = fvgs = None
+    if strategy_type == "resonance_fvg":
+        emas = compute_ema(candles)
+        rsi = compute_rsi(candles)
+        macd = compute_macd(candles)
+        fvgs = find_fvg(candles)
+        result = generate_signal_resonance_fvg(
+            candles=candles, emas=emas, rsi=rsi, macd=macd, fvgs=fvgs,
+            choppiness_index=choppiness_index, current_price=current_price,
+            min_conditions_met=resonance_min_conditions,
+        )
+    else:
+        result = generate_signal(chan_data, poc_info, current_price)
+
+    # 大週期雙SuperTrend方向(給趨勢濾網用)：trend_candles有給才算，沒給就是None
+    result["trend_filter"] = (
+        compute_trend_filter(trend_candles, fast_multiplier=trend_fast_multiplier, slow_multiplier=trend_slow_multiplier)
+        if trend_candles else None
+    )
+    result["strategy_type"] = strategy_type
+    result["atr"] = atr
+    result["choppiness_index"] = choppiness_index
+    result["emas"] = emas
+    result["rsi"] = rsi
+    result["macd"] = macd
+    result["fvgs"] = fvgs
+    result["chan_detail"] = {
+        "interval_seconds": interval_seconds,
+        "source_candle_count": len(candles),
+        **chan_data,
+    }
+    result["profile_detail"] = {
+        "bucket_size": bucket_size,
+        "trade_count": len(profile_trades),
+        "profile": profile,
+        **poc_info,
+        # 多空分布的文字解讀(主動買賣比、價格相對VA/POC位置、上下籌碼、HVN/LVN)
+        "interpretation": interpret_volume_profile(profile, poc_info, current_price, bucket_size=bucket_size),
+    }
+    return result
+
+
+TREND_CANDLE_LIMIT = 300  # 給趨勢濾網的大週期K棒數上限(ST period=10只需要幾十根，多留一些讓Wilder平滑穩定)
+
+
+def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
+                         strategy_type="chan_profile", resonance_min_conditions=4,
+                         trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
+    """
+    即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
+    (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
+
+    strategy_type預設值刻意寫死字串"chan_profile"，不是讀DEFAULT_STRATEGY_TYPE
+    (那個會受STRATEGY_TYPE環境變數影響)——這樣任何沒有明確指定strategy_type的
+    呼叫端(通知、API直接呼叫等)永遠安全地拿到chan_profile，不會因為Zeabur不小心
+    設了STRATEGY_TYPE環境變數就被意外帶偏。只有呼叫端「明確傳入」strategy_type=
+    "resonance_fvg"才會真的用到共振策略——目前只有paper_trading.py裡特地建立的
+    1分K共振模擬單引擎會這樣做(修正記錄見README)，這是使用者看過真實回測數據
+    (獲利因子/勝率不錯，但需要留意最大回撤偏大)後決定要開始收集即時資料。
+
+    result額外附上bid/ask(不只是current_price這個中間價)：使用者實測發現，
+    真實下單成交價(市價買單成交在賣一Ask、市價賣單成交在買一Bid)跟中間價
+    本來就有落差，這是買賣價差(spread)造成的固定成本，不是執行延遲造成的
+    滑點——兩者性質不同，混在一起看會誤判「執行品質」。有了bid/ask，
+    paper_trading.py才能算出真正的「執行滑點」(成交價 vs 決策當下的
+    bid/ask，而不是vs中間價)，把價差成本跟真正的滑點分開呈現
+    (修正記錄見README)。
+    """
+    trades = binance_streamer.get_recent_trades(limit=CHAN_LOOKBACK_TRADES)
+
+    # 盤口報價過期防護(修正記錄見README)：盤口(bookTicker)跟成交(aggTrade)是兩條
+    # 獨立WebSocket，盤口那條一旦假死，bid/ask會凍結在舊值而成交流繼續跑——
+    # 訊號是新的、基準價是舊的。使用者實際遇到訊號說「站上4437」但bid/ask還在
+    # 4398，40點落差被誤判成滑點、帳面損益也跟著錯(真實-25pt記成+4pt)。
+    # 這裡用交易所事件時間+價格偏離兩個條件判斷盤口是否過期；過期就退回用
+    # 最後成交價當current_price，並把bid/ask也設成最後成交價(讓下游的執行品質
+    # 分析有一個「當下真實」的基準，價差會顯示0代表沒有可信盤口)，同時在result
+    # 帶book_stale讓通知與紀錄標示出來。
+    current_price = None
+    bid = ask = None
+    book_stale = None
+    freshness = binance_streamer.get_book_freshness()
+    latest_tick = binance_streamer.get_latest()
+    if not freshness["stale"] and latest_tick and latest_tick.get("bid") and latest_tick.get("ask"):
+        bid = float(latest_tick["bid"])
+        ask = float(latest_tick["ask"])
+        current_price = (bid + ask) / 2
+    elif trades:
+        last_trade_price = trades[-1]["price"]
+        current_price = last_trade_price
+        bid = ask = last_trade_price
+        book_stale = {
+            "lag_seconds": freshness.get("lag_seconds"),
+            "divergence": freshness.get("divergence"),
+            "book_mid": freshness.get("book_mid"),
+        }
+
+    if strategy_type == "smc_structure":
+        # SMC結構策略固定用1小時K(不管引擎的interval_seconds怎麼設)，避免誤把它掛在小週期上
+        interval_seconds = smc_structure.SMC_INTERVAL_SECONDS
+    candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
+    # 趨勢濾網用的大週期K棒：丟掉進行中的最後一根，只用已收盤的，方向才不會在同一根K棒內來回翻
+    trend_candles = None
+    if trend_interval_seconds:
+        tc = binance_streamer.get_recent_candles(interval_seconds=int(trend_interval_seconds), limit=TREND_CANDLE_LIMIT + 1)
+        trend_candles = tc[:-1] if len(tc) > 1 else None
+    result = compute_signal_from_trades(
+        trades,
+        interval_seconds=interval_seconds,
+        bucket_size=bucket_size,
+        trade_limit=trade_limit,
+        current_price=current_price,
+        strategy_type=strategy_type,
+        resonance_min_conditions=resonance_min_conditions,
+        candles=candles or None,
+        trend_candles=trend_candles,
+        trend_fast_multiplier=trend_fast_multiplier,
+        trend_slow_multiplier=trend_slow_multiplier,
+    )
+    result["bid"] = bid
+    result["ask"] = ask
+    result["book_stale"] = book_stale
+    return result
