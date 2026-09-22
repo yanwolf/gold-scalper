@@ -17,7 +17,31 @@ def patch(path, old, new, count=1):
 
 import json as _json
 import os
+# 待重跑檔放專案內(放 /tmp 會跟別的專案共用，r68)。自我驗證期間改指到暫存目錄、結束還原(不碰真的那份)
 PENDING = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".apply_pending.json")
+
+
+def _pending_path():
+    return PENDING
+
+
+def clear_pending():
+    if os.path.exists(_pending_path()):
+        os.remove(_pending_path())
+
+
+def _pyflakes_undefined(text, path):
+    """用 pyflakes 的 API 在記憶體裡掃(r68)：compile() 只抓語法，抓不到「用了沒匯入的名稱」(r66 改寫工具自己就這樣壞掉)。
+    pyflakes 沒裝時回 None(印警告、不擋)。"""
+    try:
+        from pyflakes import api as _api, reporter as _rep
+    except ImportError:
+        print(f"警告：pyflakes 沒有安裝，{path} 只做了語法檢查，沒掃未定義名稱", file=sys.stderr)
+        return None
+    import io
+    buf = io.StringIO()
+    _api.check(text, path, _rep.Reporter(buf, buf))
+    return [l for l in buf.getvalue().splitlines() if "undefined name" in l and "'fastapi'" not in l]
 
 
 def _fingerprints(changes):
@@ -27,22 +51,22 @@ def _fingerprints(changes):
 
 def _abort(changes, msg):
     """整批中止：記下這批的指紋，下一次只帶了一部分就擋下(r64/r65：中止後重跑整批)。"""
-    with open(PENDING, "w", encoding="utf-8") as f:
+    with open(_pending_path(), "w", encoding="utf-8") as f:
         _json.dump(_fingerprints(changes), f)
     sys.exit(msg)
 
 
 def _check_pending(changes):
-    if not os.path.exists(PENDING):
+    if not os.path.exists(_pending_path()):
         return
-    with open(PENDING, encoding="utf-8") as f:
+    with open(_pending_path(), encoding="utf-8") as f:
         prev = set(_json.load(f))
     now = set(_fingerprints(changes))
     missing = prev - now
     if missing:
         sys.exit(f"apply中止(一個檔都沒寫)：上一批中止的修改有 {len(missing)} 處不在這一批裡——中止後要重跑整批，"
                  f"不能只重跑一部分(用法第5點r64)。缺的：{[m.splitlines()[0] + ' … ' + m.splitlines()[1][:40] for m in sorted(missing)][:3]}；"
-                 f"確定要放棄那些修改就刪掉 {PENDING}")
+                 f"確定要放棄那些修改就 clear_pending() 或刪掉 {_pending_path()}")
 
 
 def apply(changes):
@@ -84,26 +108,41 @@ def apply(changes):
                 compile(text, path, "exec")
             except SyntaxError as e:
                 _abort(changes, f"apply中止(一個檔都沒寫)：改完的 {path} 有語法錯誤(第{e.lineno}行)：{e.msg}")
+            bad = _pyflakes_undefined(text, path)
+            if bad:
+                _abort(changes, f"apply中止(一個檔都沒寫)：改完的 {path} 有未定義名稱(用了沒匯入？)：{bad[:3]}")
     for path, text in texts.items():
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
-    if os.path.exists(PENDING):
-        os.remove(PENDING)   # 整批成功寫入：忘掉
+    clear_pending()   # 整批成功寫入：忘掉
     return len(changes)
 
 
 def selftest():
     """改寫工具自我驗證：第二處比對不到時第一個檔不被動到；結尾換行不一致時中止；正常時兩個檔都改到。"""
-    import os
     import tempfile
+    global PENDING
     d = tempfile.mkdtemp()
+    real_pending = PENDING
+    real_had = os.path.exists(real_pending)
+    real_content = open(real_pending, encoding="utf-8").read() if real_had else None
+    PENDING = os.path.join(d, ".apply_pending.json")   # 自我驗證期間不碰真的那份(r68)
+    try:
+        return _selftest_body(d)
+    finally:
+        PENDING = real_pending
+        now_had = os.path.exists(real_pending)
+        if now_had != real_had or (real_had and open(real_pending, encoding="utf-8").read() != real_content):
+            raise RuntimeError("自我驗證動到了真的待重跑檔")
+
+
+def _selftest_body(d):
     a, b = os.path.join(d, "a.txt"), os.path.join(d, "b.txt")
     def reset():
         for p in (a, b):
             with open(p, "w", encoding="utf-8") as f:
                 f.write("x\ny\n")
-        if os.path.exists(PENDING):
-            os.remove(PENDING)   # 前面故意中止的案例留下的待重跑批次，不能擋到後面的案例
+        clear_pending()   # 前面故意中止的案例留下的待重跑批次，不能擋到後面的案例
     def aborted(changes):
         try:
             apply(changes)
@@ -124,13 +163,18 @@ def selftest():
     with open(p, "w", encoding="utf-8") as f:
         f.write("x = (1\n     + 2)\n")
     r5 = aborted([(p, "     + 2)\n", "     2)\n")]) and open(p, encoding="utf-8").read() == "x = (1\n     + 2)\n"
-    os.remove(PENDING)
+    clear_pending()
+    # 用了沒匯入的名稱 → 中止、檔案沒被改動(r68)；pyflakes 沒裝時這一項當通過(有印警告)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    r5b = (_pyflakes_undefined("y = 1\n", p) is None) or (aborted([(p, "x = 1\n", "x = os.getcwd()\n")]) and open(p, encoding="utf-8").read() == "x = 1\n")
+    clear_pending()
     q = os.path.join(d, "e.py")
     src = "class A:\n    @property\n    def a(self):\n        return 1\n"
     with open(q, "w", encoding="utf-8") as f:
         f.write(src)
     r6 = aborted([(q, "    def a(self):\n", "    def b(self):\n        return 0\n\n    def a(self):\n")]) and open(q, encoding="utf-8").read() == src
-    os.remove(PENDING)
+    clear_pending()
     apply([(q, "        return 1\n", "        return 2\n")])     # 改被裝飾函式的內容：不能被誤擋
     r7 = "return 2" in open(q, encoding="utf-8").read()
     # 中止後重跑整批(r64/r65)：第二處對不到 → 改錨點只重跑第二處要被擋；帶整批(新字串一樣)就放行；成功後忘掉
@@ -140,8 +184,14 @@ def selftest():
     r9 = apply([(a, "x\n", "X\n"), (b, "y\n", "Z\n")]) == 2 and not os.path.exists(PENDING)   # 整批(改錨點、新字串不變)：放行、忘掉
     reset()
     r10 = apply([(a, "x\n", "Q\n")]) == 1   # 沒有待重跑的批次時，不受影響
+    reset()
+    aborted([(a, "不存在\n", "Z\n")])
+    r11 = os.path.exists(PENDING) and PENDING.startswith(d)   # 故意中止寫的是暫存那份(真的那份由 selftest 的 finally 確認沒動)
+    clear_pending()
+    r12 = not os.path.exists(PENDING)   # clear_pending() 之後消失
     return {"裝飾器後面插入新函式時中止": r6, "改被裝飾函式的內容不誤擋": r7,
             "中止後只重跑一部分被擋下": r8, "中止後重跑整批放行並忘掉": r9, "沒有待重跑批次時正常": r10,
+            "用了沒匯入的名稱時中止": r5b, "故意中止寫的是暫存那份": r11, "clear_pending後消失": r12,
             "第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4,
             "改完有語法錯誤時一個檔都不寫": r5}
 

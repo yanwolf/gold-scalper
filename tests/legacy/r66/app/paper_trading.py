@@ -1545,8 +1545,10 @@ class PaperTradingEngine:
                     # 這一側已經沒有部位：回應逾時但其實成交，或被交易所停損觸發
                     closed_externally = True
                     position["_closed_externally"] = True   # 給手動平倉的回應用：這次沒有送單(第8條r57)
+                    pre_gone = isinstance(result, dict) and result.get("code") == "PRE_GONE"
                     executed, execution_error = None, None
-                    skip_close_reason = ("平倉單回應失敗或逾時，但交易所這一側已經沒有部位"
+                    skip_close_reason = ("送單前確認：交易所這一側已經沒有這一筆(可能是停損觸發)，這次沒有送平倉單" if pre_gone else
+                                         "平倉單回應失敗或逾時，但交易所這一側已經沒有部位"
                                          "(可能其實已成交，或被交易所停損觸發)，視為已平倉")
                     # 出場價只用實際成交價(第8條r30)：查成交明細；查不到就記未知，不用偵測當下的標記價
                     st, px, fq, last_id, why = self._closing_fills(position, position.get("real_open_quantity") or 0.0)
@@ -1559,6 +1561,14 @@ class PaperTradingEngine:
                         # 使用者決定(2026-09-22)：查不到成交價時用推估值(偵測當下的價格)照算，標記為估算
                         position["_pnl_estimated"] = True
                         skip_close_reason += f"；出場成交價查不到({why})，損益用偵測當下的價格推估(估算)"
+                    # 結帳原因照實際情況寫(第8條r61)：通知、網頁成交紀錄用的都是它，不能只寫「交易所端部位已不在」
+                    notes = []
+                    if position.get("_reopened_detected"):
+                        notes.append("交易所上現在同一側那張是別的部位(均價不同)，沒有動它")
+                    if st != "ok":
+                        notes.append("出場價成交明細查不到，用偵測當下的價格推估")
+                    if notes:
+                        exit_reason = f"{exit_reason}（{'；'.join(notes)}）"
                 else:
                     # 還在、或查不到(查不到≠已經沒了，第2條)：保留部位，每輪重試
                     self._keep_after_failed_close(position, exit_price, exit_reason, execution_error,
@@ -1639,7 +1649,10 @@ class PaperTradingEngine:
                     action="close", label=self.label,
                     direction=position["direction"], price=exit_price,
                     exit_reason=exit_reason, pnl_points=closed_record["pnl_points"],
-                    executed=executed, execution_error=execution_error, skip_reason=skip_close_reason,
+                    executed=executed, execution_error=execution_error,
+                    # 交易所端已平掉的說明不能放進風控的欄位(通知會印成「已暫停真實下單」，第8條r61)
+                    skip_reason=None if closed_externally else skip_close_reason,
+                    exchange_note=skip_close_reason if closed_externally else None,
                     account=self.execution_account, slippage_note=slippage_note,
                     quantity=qty, real_pnl_usd=real_pnl_usd, stop_note=stop_note,
                     real_pnl_estimated=bool(position.get("usd_estimated")) and real_pnl_usd is not None,
