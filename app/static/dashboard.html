@@ -2226,9 +2226,15 @@ function renderTradeList(el, trades, settingsChangedAt){
     // 真實下單過的交易：優先顯示依真實成交價算的USDT，沒有就用點數×張數估算
     const usdPart = t.real_pnl_usd != null
       ? ` <span style="font-size:0.85em; opacity:.85;">(${t.real_pnl_usd >= 0 ? '+' : ''}${t.real_pnl_usd.toFixed(2)} U 實)</span>`
-      : (t.real_open_executed ? ` <span style="font-size:0.85em; opacity:.85;">(U 未知：成交價查不到)</span>` : '');
+      : (t.real_open_executed
+          // 成交價查不到：用推估值(點數×張數)，標「估」(使用者決定2026-09-22)
+          ? (t.real_pnl_usd_est != null
+              ? ` <span style="font-size:0.85em; opacity:.85;">(≈ ${t.real_pnl_usd_est >= 0 ? '+' : ''}${t.real_pnl_usd_est.toFixed(2)} U 估)</span>`
+              : ` <span style="font-size:0.85em; opacity:.85;">(U 未知)</span>`)
+          : '');
     // 損益未知(紀錄有欄位缺漏)不畫成0也不算虧損(第8條r27)；以前這裡對null呼叫toFixed，整份清單畫不出來
-    const pnlText = pnlKnown ? `${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}${usdPart}` : `未知${usdPart}`;
+    const estMark = t.pnl_estimated ? '≈' : '';   // 點數損益是推估的(出場成交價查不到，用偵測當下的價格)
+    const pnlText = pnlKnown ? `${estMark}${t.pnl_points >= 0 ? '+' : ''}${t.pnl_points.toFixed(2)}${usdPart}` : `未知${usdPart}`;
     // 停損出場：附上出場當下的停損位跟峰值，出場價離停損位很遠=價格跳空、停損位低於進場價=保本沒生效
     let stopInfo = '';
     if((t.exit_reason || '').includes('停損') && t.sl_price != null){
@@ -2565,7 +2571,7 @@ function renderPaperTrading(data, t){
   // 總損益的USDT只用真實成交價算的(第8條r28)；以前是「全部模擬點數×張數」，連沒真的下單的也算進去
   const ru = data.real_usd;
   const realUsdTag = (ru && (ru.known || ru.unknown))
-    ? ` <span style="font-size:0.85em; opacity:.85;">(實 ${ru.total >= 0 ? '+' : ''}${ru.total.toFixed(2)} U${ru.unknown ? `，另有 ${ru.unknown} 筆未知` : ''})</span>` : '';
+    ? ` <span style="font-size:0.85em; opacity:.85;">(${ru.total >= 0 ? '+' : ''}${ru.total.toFixed(2)} U${ru.estimated ? `，其中 ${ru.estimated} 筆估算` : ''}${ru.unknown ? `，另有 ${ru.unknown} 筆未知` : ''})</span>` : '';
   const unknownNote = data.unknown_pnl_trades ? ` <span style="font-size:0.8em; color:var(--muted);">(另有 ${data.unknown_pnl_trades} 筆損益未知)</span>` : '';
   t.paperTotalPnl.innerHTML = data.total_trades != null ? `${data.total_pnl_points.toFixed(2)}${realUsdTag}${unknownNote}` : '--';
   t.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');

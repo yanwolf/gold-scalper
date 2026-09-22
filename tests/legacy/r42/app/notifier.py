@@ -20,6 +20,7 @@ Telegram 通知模組。
 
 import os
 import logging
+from collections import deque
 from datetime import datetime, timezone
 
 import requests
@@ -32,7 +33,16 @@ DIRECTION_LABELS = {"bullish": "多單 ▲", "bearish": "空單 ▼"}
 class TelegramNotifier:
     def __init__(self):
         self._muted = False  # 暫停通知開關(記憶體狀態，服務重啟會重置回False)
+        self.errors = deque(maxlen=50)       # 推播自己的錯誤區(第8條r39/r40)
+        self._unconfigured_recorded = False  # 「沒設定」只記一次
         self._last_notified_at = None  # 最近一次成功發送通知的時間，給dashboard顯示用
+
+    def _record_error(self, kind, msg):
+        """
+        推播自己的錯誤區(第8條r39/r40)：送不出去的推播不能被吞掉，但也不能再用推播回報(會遞迴)。
+        只寫進這個清單(deque的append是原子的，不拿任何鎖)和日誌；/notify/status 與交易所自檢會列出來。
+        """
+        self.errors.append({"at": datetime.now(timezone.utc).isoformat(), "kind": kind, "msg": str(msg)[:300]})
 
     @property
     def is_enabled(self):
@@ -46,6 +56,7 @@ class TelegramNotifier:
     def status(self):
         return {
             "enabled": self.is_enabled,
+            "recent_errors": list(self.errors)[-10:],  # 推播自己的錯誤區(第8條r39/r40)
             "muted": self._muted,
             "last_notified_at": self._last_notified_at,
             "mode": "事件驅動(模擬單實際進場/出場時才通知)",
@@ -183,7 +194,13 @@ class TelegramNotifier:
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
         if not token or not chat_id:
+            # 沒設定不能靜靜return(第8條r40)：那次部署的所有告警都不會送出、也沒有任何紀錄。記一次(不是每則都記)
+            if not self._unconfigured_recorded:
+                self._unconfigured_recorded = True
+                logger.warning("Telegram 推播沒有設定(TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)，所有告警都不會送出")
+                self._record_error("未設定", "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 沒有設定，所有告警都不會送出")
             return False, "尚未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"
+        self._unconfigured_recorded = False
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
@@ -198,6 +215,7 @@ class TelegramNotifier:
             return True, None
         except Exception as e:
             logger.error(f"Telegram 訊息發送失敗: {e}")
+            self._record_error("送出失敗", f"{type(e).__name__}: {e}")  # 不能被吞掉，也不能再推播(第8條r39)
             return False, str(e)
 
     def send_test_message(self):

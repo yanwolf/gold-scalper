@@ -381,6 +381,17 @@ def _cast(key, raw_value):
     return caster(raw_value)
 
 
+_last_load_attempt = 0.0
+_load_fail_count = 0
+
+
+def settings_loaded():
+    """交易設定載入了沒(第8條r43)。沒有資料庫時一律視為已載入(用環境變數)。"""
+    from app import db
+    _load_from_db()
+    return _loaded_from_db or not db.is_enabled()
+
+
 def _load_from_db():
     """服務啟動後第一次呼叫get_settings()/update_settings()時，把資料庫裡存的值蓋過環境變數預設值。"""
     global _loaded_from_db, _last_changed_at
@@ -388,9 +399,36 @@ def _load_from_db():
         return
 
     from app import db
+    import time as _time
+    global _last_load_attempt, _load_fail_count
     migrated_engine_index = None
     if db.is_enabled():
-        stored = db.get_app_settings()
+        # 讀取失敗不能當成「讀到了空的」(第8條r43)：以前這裡照樣標記已載入，正式端就用環境變數預設值交易
+        # (引擎專屬覆寫全部不見)，而且下面的一次性遷移會把時間戳寫回資料庫、蓋掉原本的。
+        # 失敗就不標記已載入、不做遷移，照節奏推播，最多每15秒重試一次
+        if _time.time() - _last_load_attempt < 15:
+            return
+        _last_load_attempt = _time.time()
+        ok, stored = db.load_app_settings()
+        if not ok:
+            _load_fail_count += 1
+            try:
+                from app import alert_cadence
+                from app.notifier import notifier
+                if alert_cadence.should_alert(_load_fail_count):
+                    notifier.send_raw_message(
+                        f"⚠️ 讀不到交易設定(資料庫)(第 {_load_fail_count} 次)\n錯誤：{stored}\n"
+                        f"暫停開新倉、每15秒重試；不會用預設值交易")
+            except Exception:
+                pass
+            return
+        if _load_fail_count:
+            try:
+                from app.notifier import notifier
+                notifier.send_raw_message(f"✅ 交易設定已從資料庫載入(失敗 {_load_fail_count} 次後)")
+            except Exception:
+                pass
+            _load_fail_count = 0
         with _lock:
             for key, raw_value in stored.items():
                 if key not in FIELD_META:
@@ -493,6 +531,8 @@ def update_engine_overrides(engine_id, updates: dict):
     _load_from_db()
     from app import db
     now = datetime.now(timezone.utc).isoformat()
+    if db.is_enabled() and not _loaded_from_db:
+        raise SettingsValidationError("交易設定還沒從資料庫載入(讀取失敗)，現在存檔會蓋掉資料庫裡的設定，請稍後再試")
     _validate_all(updates, TRADING_RELEVANT_KEYS, allow_clear=True)  # 先全部驗證，有一個不合法就整批不套用
     applied, cleared = {}, []
     with _lock:
@@ -631,6 +671,8 @@ def update_settings(updates: dict):
 
     global _last_changed_at
 
+    if db.is_enabled() and not _loaded_from_db:
+        raise SettingsValidationError("交易設定還沒從資料庫載入(讀取失敗)，現在存檔會蓋掉資料庫裡的設定，請稍後再試")
     _validate_all(updates, FIELD_META)  # 先全部驗證，有一個不合法就整批不套用(以前是不合法的跳過、其他照套、回報成功)
     applied = {}
     with _lock:

@@ -343,6 +343,8 @@ class PaperTradingEngine:
         for r in rows:
             if r.get("symbol") != sym:
                 continue
+            # 標記價是整個幣的，數量0的列也有：部位已經平掉時推估出場價要用它，不能退到停損價
+            mark = mark or (float(r.get("markPrice") or 0) or None)
             try:
                 amt = float(r.get("positionAmt", 0) or 0)
             except (TypeError, ValueError):
@@ -678,8 +680,13 @@ class PaperTradingEngine:
                 db.update_paper_trade_fills(position.get("id"), position.get("real_open_order_id"), last_id)
                 partial_txt = f"這部分依成交明細 {fq}@{px}，損益 {pnl:+.2f} U"
             else:
-                position["partial_pnl_unknown"] = True
-                partial_txt = f"這部分損益未知({why or '成交明細數量對不上'})，以交易所成交明細為準，這筆的USDT總損益也會記為未知"
+                # 使用者決定(2026-09-22)：查不到成交明細時用標記價推估，標記為估算
+                ref = entry_ref if isinstance(entry_ref, (int, float)) else position["entry_price"]
+                px_est = mark or _latest_price() or ref
+                pnl = ((px_est - ref) if position["direction"] == "bullish" else (ref - px_est)) * reduced
+                position["partial_realized_usd"] = (position.get("partial_realized_usd") or 0.0) + pnl
+                position["usd_estimated"] = True
+                partial_txt = (f"這部分成交明細查不到({why or '數量對不上'})，用標記價 {px_est} 推估損益 {pnl:+.2f} U(估算)")
             position["real_open_quantity"] = round(qty, 6)
             db.update_paper_trade_real_open(position.get("id"), True, round(qty, 6))
             self._backstop_alert(
@@ -938,6 +945,9 @@ class PaperTradingEngine:
         if not self._seeded_from_db:
             # 持倉紀錄還沒載入：不知道有沒有部位，不能開新倉(第8條r37)
             return "state_not_loaded"
+        if not settings_module.settings_loaded():
+            # 交易設定還沒載入：會用預設值交易(引擎專屬覆寫不見)，不能開新倉(第8條r43)
+            return "settings_not_loaded"
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,
@@ -1274,9 +1284,6 @@ class PaperTradingEngine:
     def _safe_closed_record(self, position, exit_price, exit_reason, exit_time):
         """算平倉紀錄不能丟例外(第8條r24)：缺欄位時損益記為未知(None)，照樣結帳。
         交易所端平掉、成交明細又查不到時，出場價不知道，損益也記未知(第8條r30)。"""
-        if position.pop("_exit_unknown", False):
-            return {**position, "exit_price": exit_price, "exit_time": exit_time,
-                    "exit_reason": exit_reason, "pnl_points": None}
         try:
             return trading_core.close_position(position, exit_price, exit_reason, exit_time)
         except Exception as e:
@@ -1311,6 +1318,7 @@ class PaperTradingEngine:
         skip_close_reason = None
         exit_actual_price = None
         closed_externally = False
+        close_filled_qty = None
         if is_execution_engine and real_open is False:
             is_execution_engine = False
             skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
@@ -1335,6 +1343,7 @@ class PaperTradingEngine:
                     logger.info(f"同步平倉成功({self.label}): {result}")
                     actual_fill_price = execution_module.extract_fill_price(result) or self._fill_vwap_by_order(result)
                     exit_actual_price = actual_fill_price
+                    close_filled_qty = execution_module.extract_filled_qty(result)
                     quality = execution_module.analyze_execution_quality(
                         position["direction"], bid, ask, actual_fill_price, is_close=True,
                     ) if actual_fill_price else None
@@ -1374,6 +1383,23 @@ class PaperTradingEngine:
                     execution_error = str(e)
                     logger.error(f"同步平倉發生例外({self.label}): {e}")
 
+        # ---- 平倉只成交一部分：不能當成平掉(第15條r43/r44) ----
+        want_close = position.get("real_open_quantity") or 0.0
+        if is_execution_engine and executed and close_filled_qty is not None and close_filled_qty < want_close - 1e-9:
+            remaining = round(want_close - close_filled_qty, 6)
+            position.setdefault("close_orig_qty", want_close)
+            position["partial_close_filled"] = True   # 出場價之後用成交明細把各段加權，不能只用最後一張單
+            position["real_open_quantity"] = remaining
+            db.update_paper_trade_real_open(position.get("id"), True, remaining)
+            self._keep_after_failed_close(position, exit_price, exit_reason,
+                                          f"平倉只成交 {close_filled_qty}/{want_close}，剩 {remaining} 待平倉", remaining)
+            return
+        if position.get("partial_close_filled") and is_execution_engine and executed:
+            st, px, _, last_id, _ = self._closing_fills(position, position.get("close_orig_qty") or want_close)
+            if st == "ok":
+                exit_actual_price = px
+                position["real_qty_for_pnl"] = position.get("close_orig_qty")
+
         # ---- 平倉單送出後一定要看結果(第8條r12/r13) ----
         if is_execution_engine and not executed:
             ok_q, ex_qty = self._own_qty(position)
@@ -1410,8 +1436,9 @@ class PaperTradingEngine:
                         exit_price = px
                         position["fill_boundary_id"] = last_id
                     else:
-                        position["_exit_unknown"] = True
-                        skip_close_reason += f"；出場成交價未知({why})，損益記為未知"
+                        # 使用者決定(2026-09-22)：查不到成交價時用推估值(偵測當下的價格)照算，標記為估算
+                        position["_pnl_estimated"] = True
+                        skip_close_reason += f"；出場成交價查不到({why})，損益用偵測當下的價格推估(估算)"
                 else:
                     # 還在、或查不到(查不到≠已經沒了，第2條)：保留部位，每輪重試
                     self._keep_after_failed_close(position, exit_price, exit_reason, execution_error,
@@ -1427,8 +1454,10 @@ class PaperTradingEngine:
         position.pop("_closing", None)
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = self._safe_closed_record(position, exit_price, exit_reason, exit_time)
+        pnl_estimated = bool(position.pop("_pnl_estimated", False))
         self._safe("寫平倉紀錄", lambda: db.close_paper_trade(
-            position.get("id"), exit_price, exit_time, exit_reason, closed_record.get("pnl_points")))
+            position.get("id"), exit_price, exit_time, exit_reason, closed_record.get("pnl_points"),
+            pnl_estimated=pnl_estimated))
         self._closed_trades_memory.append(closed_record)
         with self._lock:
             if self._position is position:
@@ -1471,7 +1500,7 @@ class PaperTradingEngine:
                 real_pnl_usd = None
                 ea, xa = position.get("entry_actual_price"), exit_actual_price
                 if qty and ea and xa and (executed or backstop_triggered or closed_externally):
-                    real_qty = position.get("real_open_quantity") or qty
+                    real_qty = position.get("real_qty_for_pnl") or position.get("real_open_quantity") or qty
                     real_pnl_usd = ((xa - ea) if position["direction"] == "bullish" else (ea - xa)) * real_qty
                     # 期間有部分出場(App手動減碼/ADL)而那部分成交價不知道：整筆USDT損益記未知(第8條r28)
                     if position.get("partial_pnl_unknown"):
@@ -1493,6 +1522,7 @@ class PaperTradingEngine:
                     executed=executed, execution_error=execution_error, skip_reason=skip_close_reason,
                     account=self.execution_account, slippage_note=slippage_note,
                     quantity=qty, real_pnl_usd=real_pnl_usd, stop_note=stop_note,
+                    real_pnl_estimated=bool(position.get("usd_estimated")) and real_pnl_usd is not None,
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")

@@ -493,6 +493,7 @@ def update_engine_overrides(engine_id, updates: dict):
     _load_from_db()
     from app import db
     now = datetime.now(timezone.utc).isoformat()
+    _validate_all(updates, TRADING_RELEVANT_KEYS, allow_clear=True)  # 先全部驗證，有一個不合法就整批不套用
     applied, cleared = {}, []
     with _lock:
         current = _engine_overrides.setdefault(engine_id, {})
@@ -601,6 +602,25 @@ def get_last_changed_at(engine_id=None):
         return max(times) if times else None
 
 
+class SettingsValidationError(ValueError):
+    """有欄位的值不合法：整批都不套用(第8條r39/r40：不能一邊迴圈一邊套用、停在半套)。"""
+
+
+def _validate_all(updates, allowed_keys, allow_clear=False):
+    bad = []
+    for key, value in updates.items():
+        if key not in allowed_keys:
+            continue
+        if allow_clear and (value is None or value == ""):
+            continue
+        try:
+            _cast(key, value)
+        except (TypeError, ValueError):
+            bad.append(f"{key}={value!r}")
+    if bad:
+        raise SettingsValidationError(f"這些欄位的值不合法，整批都沒有套用：{', '.join(bad)}")
+
+
 def update_settings(updates: dict):
     """
     updates是 {key: new_value}(new_value可以是字串或數字，這裡會自動轉型別)。
@@ -611,6 +631,7 @@ def update_settings(updates: dict):
 
     global _last_changed_at
 
+    _validate_all(updates, FIELD_META)  # 先全部驗證，有一個不合法就整批不套用(以前是不合法的跳過、其他照套、回報成功)
     applied = {}
     with _lock:
         for key, value in updates.items():

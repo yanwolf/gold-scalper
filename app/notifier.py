@@ -81,7 +81,8 @@ class TelegramNotifier:
 
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
                             executed=None, execution_error=None, skip_reason=None, account="gold",
-                            slippage_note=None, quantity=None, real_pnl_usd=None, stop_note=None):
+                            slippage_note=None, quantity=None, real_pnl_usd=None, stop_note=None,
+                            real_pnl_estimated=False):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -159,10 +160,13 @@ class TelegramNotifier:
                 + (f"{stop_note}\n" if stop_note else "")
                 + (f"損益：{pnl_sign}{pnl_points:.2f} points" if pnl_points is not None else "損益：未知(平倉紀錄有欄位缺漏)")
                 # 只用真實成交價算的USDT(第8條r28)。查不到時寫未知——模擬點數×張數不是這張單的實際損益
-                + (f"（{quantity:g} 張，USDT 損益未知：成交價查不到，以交易所成交明細為準）" if quantity and real_pnl_usd is None else "")
+                # 真實成交價查不到：用模擬點數×張數推估，一定標「估算」(使用者決定2026-09-22)
+                + (f"（{quantity:g} 張 ≈ {'+' if pnl_points * quantity >= 0 else ''}{pnl_points * quantity:.2f} USDT，估算：成交價查不到，用模擬點數×張數）"
+                   if quantity and real_pnl_usd is None and pnl_points is not None else "")
+                + (f"（{quantity:g} 張，USDT 損益未知：連點數損益都沒有）" if quantity and real_pnl_usd is None and pnl_points is None else "")
                 + (f"（{quantity:g} 張 ≈ {'+' if real_pnl_usd >= 0 else ''}"
                    f"{real_pnl_usd:.2f} USDT"
-                   f"{'，依真實成交價' if real_pnl_usd is not None else ''}）" if quantity and real_pnl_usd is not None else "")
+                   f"{'，含估算' if real_pnl_estimated else '，依真實成交價'}）" if quantity and real_pnl_usd is not None else "")
                 + "\n\n"
                 f"{execution_note}"
             )

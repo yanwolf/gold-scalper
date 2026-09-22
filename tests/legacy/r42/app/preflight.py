@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-21r38"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-09-22r42"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -33,6 +33,17 @@ def accounts_to_check():
     return accounts or [execution_module.DEFAULT_ACCOUNT]
 
 
+def notify_check():
+    """推播狀態(第8條r40)：沒設定→warn；最近有送出失敗→fail，列出最後一筆。"""
+    from app.notifier import notifier
+    if not notifier.is_enabled:
+        return {"item": "Telegram 推播", "status": "warn", "msg": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 沒有設定，所有告警都不會送出"}
+    fails = [e for e in notifier.errors if e["kind"] == "送出失敗"]
+    if fails:
+        return {"item": "Telegram 推播", "status": "fail", "msg": f"最近 {len(fails)} 次送出失敗，最後一次：{fails[-1]['msg']}"}
+    return {"item": "Telegram 推播", "status": "ok", "msg": "已設定，最近沒有送出失敗"}
+
+
 def check(account=None, symbol=None):
     """
     對「一個帳戶」跑完整自檢，回傳[(項目, 狀態, 說明), ...]。
@@ -41,7 +52,7 @@ def check(account=None, symbol=None):
     """
     account = account or execution_module.DEFAULT_ACCOUNT
     symbol = symbol or execution_module.DEFAULT_SYMBOL
-    out = []
+    out = [notify_check()]
 
     def add(name, st, msg=""):
         out.append({"item": name, "status": st, "msg": str(msg)[:200]})

@@ -1075,10 +1075,11 @@ def save_app_settings(updates):
                         (key, str(value)),
                     )
             conn.commit()
+            _db_write_ok("寫入設定")
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        logger.error(f"寫入設定失敗: {e}")
+        _db_write_error("寫入設定", e)
 
 
 def delete_app_settings(keys):

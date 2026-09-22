@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-22r42"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-09-22r46"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():

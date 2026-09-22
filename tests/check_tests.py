@@ -31,6 +31,10 @@ def classify(call):
         return "neg"
     if name in ("assertEqual", "assertIs") and len(call.args) >= 2 and _is_empty_literal(call.args[1]):
         return "neg"
+    # 第25種(r44)：assertTrue(all(...)) 對空清單成立——程式什麼都沒做、清單是空的也會通過，算否定句
+    if name == "assertTrue" and call.args and isinstance(call.args[0], ast.Call) and \
+            isinstance(call.args[0].func, ast.Name) and call.args[0].func.id == "all":
+        return "neg"
     return "pos"
 
 
@@ -69,6 +73,8 @@ SELFTEST = [  # (測試主體, 預期是否被報出)
     ("pass", True),
     ("self.assertEqual(c, []); self.assertNotIn(a, b)", True),
     ("with self.assertRaises(E):\n            f()", False),
+    ("self.assertTrue(all(x > 0 for x in xs))", True),       # 第25種：空清單時也成立
+    ("self.assertEqual(len(xs), 2)\n        self.assertTrue(all(x > 0 for x in xs))", False),
 ]
 
 

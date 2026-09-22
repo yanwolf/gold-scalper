@@ -340,7 +340,10 @@ async def settings_import(payload: dict = Body(...)):
     if pos and not payload.get("force"):
         return {"success": False, "error": "目標引擎目前有未平倉部位，等平倉後再匯入(或帶 force=true 強制)"}
     before = {k: settings_module.get_settings(engine_id=engine_id).get(k) for k in ps["params"]}
-    applied, cleared = settings_module.update_engine_overrides(engine_id, ps["params"])
+    try:
+        applied, cleared = settings_module.update_engine_overrides(engine_id, ps["params"])
+    except settings_module.SettingsValidationError as e:
+        return {"success": False, "error": str(e)}
     after = {k: settings_module.get_settings(engine_id=engine_id).get(k) for k in ps["params"]}
     diff = {k: {"before": before[k], "after": after[k]} for k in ps["params"] if before[k] != after[k]}
     db.insert_settings_audit("import", engine_id=engine_id, version=ps.get("version"),
@@ -476,7 +479,10 @@ async def update_settings(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     values = payload.get("values", {})
-    updated = settings_module.update_settings(values)
+    try:
+        updated = settings_module.update_settings(values)
+    except settings_module.SettingsValidationError as e:
+        return {"success": False, "error": str(e)}
     return {"success": True, "values": updated}
 
 
@@ -513,7 +519,10 @@ async def update_engine_settings(engine_id: str, payload: dict = Body(...)):
         return {"success": False, "error": error}
     if engine_id not in PAPER_TRADING_ENGINES:
         return {"success": False, "error": f"沒有engine_id={engine_id}的追蹤引擎"}
-    applied, cleared = settings_module.update_engine_overrides(engine_id, payload.get("values", {}))
+    try:
+        applied, cleared = settings_module.update_engine_overrides(engine_id, payload.get("values", {}))
+    except settings_module.SettingsValidationError as e:
+        return {"success": False, "error": str(e)}
     return {
         "success": True, "applied": applied, "cleared": cleared,
         "overrides": settings_module.get_engine_overrides(engine_id),
@@ -740,6 +749,12 @@ async def execution_test_order(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     account = payload.get("account", "gold")
+    # 持倉紀錄沒載入時手動下單也要擋(第8條r39)：「沒載入不開倉」寫在引擎裡，這支是直接送單、不經過引擎。
+    # (手動測試平倉不擋：那是減少風險的動作)
+    not_loaded = [e.label for e in PAPER_TRADING_ENGINES.values()
+                  if getattr(e, "execution_account", None) == account and not getattr(e, "_seeded_from_db", True)]
+    if not_loaded:
+        return {"success": False, "error": f"帳戶 {account} 的引擎({', '.join(not_loaded)})持倉紀錄還沒從資料庫載入，暫停手動下單"}
     # 正式環境要多帶confirm_live=true才放行(dashboard會先跳紅字確認框再帶上)：
     # 接正式金鑰後必須用程式自己的路徑打一張最小單驗證，但不能讓人手滑點到
     if not execution_module.status(account=account)["testnet"] and not payload.get("confirm_live"):

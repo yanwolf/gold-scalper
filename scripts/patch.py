@@ -33,6 +33,15 @@ def apply(changes):
             with open(path, encoding="utf-8") as f:
                 texts[path] = f.read()
         n = texts[path].count(old)
+        # 裝飾器檢查(r41 gold-scalper踩到)：錨點緊接在 @裝飾器 後面、替換內容又多插入 def/class，
+        # 裝飾器就套到新插入的那個函式上——語法合法、編譯檢查抓不到
+        pos = texts[path].find(old)
+        if pos > 0 and n >= 1:
+            prev = texts[path][:pos].rstrip("\n").splitlines()[-1:] if texts[path][:pos].endswith("\n") else []
+            added = (new.count("def ") + new.count("class ")) - (old.count("def ") + old.count("class "))
+            if prev and prev[0].strip().startswith("@") and added > 0:
+                sys.exit(f"apply中止(一個檔都沒寫)：第{i + 1}處 {path} 錨點緊接在裝飾器 {prev[0].strip()} 後面，"
+                         f"又插入新的 def/class——裝飾器會套到新函式上；錨點改選在裝飾器之前")
         if n != count:
             sys.exit(f"apply中止(一個檔都沒寫)：第{i + 1}處 {path} 預期命中{count}次，實際{n}次：{old[:80]!r}")
         texts[path] = texts[path].replace(old, new)
@@ -80,7 +89,15 @@ def selftest():
     with open(p, "w", encoding="utf-8") as f:
         f.write("x = (1\n     + 2)\n")
     r5 = aborted([(p, "     + 2)\n", "     2)\n")]) and open(p, encoding="utf-8").read() == "x = (1\n     + 2)\n"
-    return {"第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4,
+    q = os.path.join(d, "e.py")
+    src = "class A:\n    @property\n    def a(self):\n        return 1\n"
+    with open(q, "w", encoding="utf-8") as f:
+        f.write(src)
+    r6 = aborted([(q, "    def a(self):\n", "    def b(self):\n        return 0\n\n    def a(self):\n")]) and open(q, encoding="utf-8").read() == src
+    apply([(q, "        return 1\n", "        return 2\n")])     # 改被裝飾函式的內容：不能被誤擋
+    r7 = "return 2" in open(q, encoding="utf-8").read()
+    return {"裝飾器後面插入新函式時中止": r6, "改被裝飾函式的內容不誤擋": r7,
+            "第二處對不到時第一個檔不動": r1, "結尾換行不一致時中止": r2, "正常時兩個檔都改到": r3, "exact讀出原文含縮排與換行": r4,
             "改完有語法錯誤時一個檔都不寫": r5}
 
 

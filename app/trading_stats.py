@@ -16,9 +16,14 @@ def real_usd_summary(trades):
     real_pnl_usd。缺成交價的真實單記「未知」另外計數；純模擬單不算(那不是真錢)。
     以前網頁的總損益USDT是「全部模擬點數×張數」，連沒真的下過單的交易都算進去。
     """
-    known = [t["real_pnl_usd"] for t in trades if t.get("real_open_executed") and isinstance(t.get("real_pnl_usd"), (int, float))]
-    unknown = sum(1 for t in trades if t.get("real_open_executed") and not isinstance(t.get("real_pnl_usd"), (int, float)))
-    return {"total": round(sum(known), 2), "known": len(known), "unknown": unknown}
+    # 使用者決定(2026-09-22)：真實成交價查不到時用推估值(點數×張數)照算，但分開計數、網頁標「估」
+    num = lambda v: isinstance(v, (int, float))
+    real = [t for t in trades if t.get("real_open_executed")]
+    known = [t["real_pnl_usd"] for t in real if num(t.get("real_pnl_usd"))]
+    est = [t["real_pnl_usd_est"] for t in real if not num(t.get("real_pnl_usd")) and num(t.get("real_pnl_usd_est"))]
+    unknown = len(real) - len(known) - len(est)
+    return {"total": round(sum(known) + sum(est), 2), "known": len(known), "estimated": len(est),
+            "estimated_total": round(sum(est), 2), "unknown": unknown}
 
 
 def compute_stats(trades, spread_cost_points=0.0):

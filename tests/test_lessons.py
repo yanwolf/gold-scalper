@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r40 第1、2、3、7、8、14條的每一個檢查項目。
+涵蓋 r7→r44 第1、2、3、7、8、14、15條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -43,7 +43,28 @@ def one(alerts, title):
     return got[0]
 
 
+import copy as _copy
+import importlib as _importlib
+_STATE_MODULES = ("app.db", "app.execution", "app.main", "app.notifier", "app.settings", "app.risk_guard", "app.preflight")
+# 匯入時把每個模組層級(底線開頭)的 dict／list／set 存一份初始值，_reset_module_state 一律還原(用法第5點r44)：
+# 不用記得「新增的狀態要加進重設」——r38、r41 都漏過
+_STATE_SNAPSHOT = []
+for _mn in _STATE_MODULES:
+    _mod = _importlib.import_module(_mn)
+    for _k, _v in list(vars(_mod).items()):
+        if _k.startswith("_") and not _k.startswith("__") and isinstance(_v, (dict, list, set)):
+            _STATE_SNAPSHOT.append((_mod, _k, _copy.deepcopy(_v)))
+
+
 def _reset_module_state():
+    for _mod, _k, _init in _STATE_SNAPSHOT:
+        cur = getattr(_mod, _k)
+        cur.clear()
+        (cur.update(_copy.deepcopy(_init)) if isinstance(cur, (dict, set)) else cur.extend(_copy.deepcopy(_init)))
+    _reset_named_state()
+
+
+def _reset_named_state():
     """
     模組層級、會被測試改到的狀態(第14種)。gold-scalper 沒有狀態檔(狀態都在資料庫，測試時資料庫是關的)，
     所以沒有「前一個情境留在磁碟上」的問題(r40)；要重設的是記憶體裡的這些。在舊版程式上重跑時不存在的就略過。
@@ -55,6 +76,10 @@ def _reset_module_state():
             getattr(obj, attr).clear()
     if hasattr(N, "_unconfigured_recorded"):
         N._unconfigured_recorded = False
+    S = pt.settings_module
+    for k, v in (("_load_fail_count", 0), ("_last_load_attempt", 0.0)):
+        if hasattr(S, k):
+            setattr(S, k, v)
 
 
 def _engine():
@@ -261,12 +286,13 @@ class ExecHarness(unittest.TestCase):
         self.eng = _engine()
         self.notes = []
         self.dbclose = []
+        self.dbclose_kw = []
         st = _exec_settings(self.eng)
         self.ps = [
             mock.patch.object(self.eng, "_is_execution_engine", return_value=True),
             mock.patch.object(pt.settings_module, "get_settings", return_value=st),
             mock.patch.object(pt.notifier_module.notifier, "notify_trade_event", side_effect=lambda **k: self.notes.append(k)),
-            mock.patch.object(pt.db, "close_paper_trade", side_effect=lambda *a, **k: self.dbclose.append(a)),
+            mock.patch.object(pt.db, "close_paper_trade", side_effect=lambda *a, **k: (self.dbclose.append(a), self.dbclose_kw.append(k))),
             mock.patch.object(ex, "current_hedge_mode", return_value=False),
             mock.patch.object(ex, "round_price", lambda p, *a, **k: p),
             # 成交明細預設「查不到」，要用的情境自己換(不打網路)
@@ -934,8 +960,8 @@ class NotifierFormat(unittest.TestCase):
         self.assertIn("損益：未知", sent[0])
 
     # 放在這個不mock通知的情境：ExecHarness在setUp裡把notify_trade_event整個mock掉，格式化根本不會執行
-    # 8c：估算不能把未知包裝成已知(第8條r28)
-    def test_t8c_close_notice_does_not_estimate_usd_from_paper_points(self):
+    # 使用者決定(2026-09-22)：成交價查不到時用推估值，但一定要標示「估算」(不能混成已知)
+    def test_t8c_close_notice_estimates_usd_and_labels_it(self):
         from app.notifier import notifier as N, TelegramNotifier
         sent = []
         with mock.patch.object(TelegramNotifier, "is_enabled", new_callable=mock.PropertyMock, return_value=True), \
@@ -945,8 +971,9 @@ class NotifierFormat(unittest.TestCase):
                                  pnl_points=-2.0, executed=True, quantity=0.1, real_pnl_usd=None)
         self.assertEqual(len(sent), 1, "前提：通知真的組出來、送出了")
         self.assertIn("-2.00 points", sent[0], "前提：模擬點數照常顯示")
-        self.assertNotIn("-0.20 USDT", sent[0], "真實成交價查不到，不能用模擬點數×張數估出一個USDT")
-        self.assertIn("USDT 損益未知", sent[0])
+        self.assertIn("≈ -0.20 USDT", sent[0], "查不到成交價：用模擬點數×張數推估")
+        self.assertIn("估算", sent[0], "一定要標示是估算，不能混成依真實成交價")
+        self.assertNotIn("依真實成交價", sent[0])
 
 
 
@@ -974,7 +1001,7 @@ class Lesson28(ExecHarness):
         self.assertEqual(n, 1, "最新那筆損益未知，不能算成一筆虧損")
         self.assertEqual(unknown, 1)
 
-    def test_t8c_partial_reduction_pnl_is_unknown_not_mark_estimate(self):
+    def test_t8c_partial_reduction_without_fills_is_estimated_and_labeled(self):
         pos = _pos(real_open_quantity=0.2, entry_actual_price=4391.0, real_open_baseline=0.0)
         self.eng._position = pos
         # 明寫「成交明細查不到」(不依賴共用框架的預設值：預設改了這項就會莫名失敗或空跑)
@@ -983,18 +1010,19 @@ class Lesson28(ExecHarness):
             status = self.eng._check_exchange_quantity(pos)
         self.assertEqual(status, "reduced", "前提：偵測到數量減少")
         self.assertIn("成交明細查不到", one(self.eng.alerts, "交易所部位數量減少"), "前提：未知的原因是查不到成交明細(第16種)")
-        self.assertTrue(pos.get("partial_pnl_unknown"), "減少那部分的成交價不知道，損益要記未知")
-        a = one(self.eng.alerts, "交易所部位數量減少")
-        self.assertNotIn("估算損益", a, "不能用標記價估")
-        self.assertIn("損益未知", a)
+        self.assertTrue(pos.get("usd_estimated"), "減少那部分的成交價不知道：用標記價推估，標記為估算")
+        self.assertAlmostEqual(pos.get("partial_realized_usd") or 0, (4396.0 - 4391.0) * 0.1, places=4)
+        self.assertIn("估算", one(self.eng.alerts, "交易所部位數量減少"))
 
-    def test_t8c_real_usd_summary_uses_only_actual_fills(self):
+    def test_t8c_real_usd_summary_includes_labeled_estimates(self):
         from app import trading_stats as TS
         trades = [{"real_open_executed": True, "real_pnl_usd": 1.5},
-                  {"real_open_executed": True, "real_pnl_usd": None, "pnl_points": 30.0},  # 缺成交價：未知
+                  {"real_open_executed": True, "real_pnl_usd": None, "real_pnl_usd_est": 3.0, "pnl_points": 30.0},  # 缺成交價：推估
+                  {"real_open_executed": True, "real_pnl_usd": None, "real_pnl_usd_est": None, "pnl_points": None},  # 連點數都沒有：未知
                   {"real_open_executed": False, "real_pnl_usd": None, "pnl_points": 99.0}]  # 純模擬：不算
         s = TS.real_usd_summary(trades)
-        self.assertEqual((s["total"], s["known"], s["unknown"]), (1.5, 1, 1))
+        self.assertIn("estimated", s, "前提：統計有「估算」這個分類(在舊版上是斷言失敗、不是崩掉)")
+        self.assertEqual((s.get("total"), s.get("known"), s.get("estimated"), s.get("unknown")), (4.5, 1, 1, 1), s)
 
 
 # ------------------------------------------------------------------ r29 → r31
@@ -1056,8 +1084,10 @@ class Lesson31(ExecHarness):
         self.assertEqual(status, "gone")
         self.assertTrue(ut.called, "前提：真的去查了成交明細、查不到")
         self.assertEqual((len(self.dbclose), len(self.notes) > 0), (1, True), "前提：結帳了、通知有送出")  # 先確認有東西才索引(用法第5點r34：突變下要明確失敗、不是測試本身崩掉)
-        self.assertIsNone(self.dbclose[0][4], "查不到成交明細：損益記未知，不用標記價算")
-        self.assertIsNone(self.notes[-1].get("real_pnl_usd"))
+        self.assertAlmostEqual(self.dbclose[0][4], 4395.0 - 4390.0, places=4, msg="查不到成交明細：用偵測當下的標記價推估")
+        self.assertEqual(len(self.dbclose_kw), 1, "前提：結帳的參數有記到")
+        self.assertTrue(self.dbclose_kw[0].get("pnl_estimated"), "並標記為估算")
+        self.assertIsNone(self.notes[-1].get("real_pnl_usd"), "真實損益不是已知的")
 
     def test_t8a_baseline_means_unknown_even_with_fills(self):
         pos = self._pos(real_open_baseline=0.3)
@@ -1070,7 +1100,8 @@ class Lesson31(ExecHarness):
             status = self.eng._check_exchange_quantity(pos)
         self.assertEqual(status, "gone", "前提：扣基準後判定自己的已平掉")
         self.assertEqual(len(self.dbclose), 1, "前提：結帳了")  # 先確認有東西才索引(用法第5點r34：突變下要明確失敗、不是測試本身崩掉)
-        self.assertIsNone(self.dbclose[0][4], "同側有別人的部位：成交明細分不出哪幾筆是自己的，記未知")
+        self.assertEqual(len(self.dbclose_kw), 1, "前提：結帳的參數有記到")
+        self.assertTrue(self.dbclose_kw[0].get("pnl_estimated"), "同側有別人的部位：成交明細分不出來，損益是推估的")
 
     def test_t8b_partial_then_close_boundary_by_id(self):
         """部分出場採用了id105；最後出場只看105之後的(界線用id，不用時間——106與105同一毫秒)。"""
@@ -1494,6 +1525,166 @@ class LiveAckResponse(ExecHarness):
         self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
         self.assertAlmostEqual(self.notes[-1].get("real_pnl_usd") or 0, (4380.2 - 4373.5) * 0.1, places=4,
                                msg="平倉回應沒有均價：用這張單號的成交明細算出真實損益")
+
+
+# ------------------------------------------------------------------ r42 → r44 ＋ 實盤 2026-09-22
+def _sqlite_pool():
+    """用sqlite真的執行SQL(%s換成?)：驗證的是SQL本身，不是mock的回傳值。"""
+    import sqlite3
+    from datetime import datetime as _dt
+    # 時間欄位要跟PostgreSQL一樣回datetime(不是字串)：程式會呼叫.isoformat()，模擬環境不能比真的寬鬆(r31退化值)
+    sqlite3.register_converter("TIMESTAMP", lambda b: _dt.fromisoformat(b.decode()))
+    conn = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+    cols = ["id INTEGER PRIMARY KEY", "status TEXT", "engine_id TEXT", "direction TEXT", "entry_price REAL", "entry_time TIMESTAMP",
+            "exit_price REAL", "exit_time TIMESTAMP", "exit_reason TEXT", "pnl_points REAL", "pnl_estimated INTEGER",
+            "entry_expected_price REAL", "entry_actual_price REAL", "entry_slippage_points REAL", "entry_spread_points REAL",
+            "exit_expected_price REAL", "exit_actual_price REAL", "exit_slippage_points REAL", "exit_spread_points REAL",
+            "entry_book_stale INTEGER", "exit_book_stale INTEGER", "real_open_executed INTEGER", "real_open_quantity REAL",
+            "sl_price REAL", "peak_price REAL", "trailing_active INTEGER", "chan_reason TEXT", "profile_reason TEXT"]
+    conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
+    class Cur:
+        def __init__(s): s.c = conn.cursor()
+        def __enter__(s): return s
+        def __exit__(s, *a): return False
+        def execute(s, sql, params=()): s.c.execute(sql.replace("%s", "?"), params)
+        def fetchall(s): return s.c.fetchall()
+        def fetchone(s): return s.c.fetchone()
+    class C:
+        def cursor(s): return Cur()
+        def commit(s): conn.commit()
+    class Pool:
+        def getconn(s): return C()
+        def putconn(s, c): pass
+    return Pool(), conn
+
+
+class Lesson44(ExecHarness):
+    # r43：設定讀不到不能靜靜回到預設(正式端的專屬覆寫會全部不見)
+    def test_r43_settings_read_failure_is_not_defaults(self):
+        S = pt.settings_module
+        self.assertTrue(hasattr(S, "settings_loaded"), "前提：程式有「設定載入了沒」這個狀態")
+        class Down:
+            def getconn(s): raise RuntimeError("inj-settings-db")
+            def putconn(s, c): pass
+        pushed = []
+        with mock.patch.object(S, "_loaded_from_db", False), mock.patch.object(S, "_last_load_attempt", 0.0, create=True), \
+             mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", Down(), create=True), \
+             mock.patch.object(pt.db, "save_app_settings") as save, \
+             mock.patch.object(pt.notifier_module.notifier, "send_raw_message", side_effect=pushed.append):
+            S.get_settings()
+            loaded = S.settings_loaded()
+            opened = self.eng._open_position({"direction": "bullish", "bid": 1, "ask": 1, "chan": {"reason": "t"},
+                                              "profile": {"reason": "t"}}, 4390.0, 10.0)
+        self.assertIs(loaded, False, "讀不到就是還沒載入，不能當成讀到了空的")
+        self.assertEqual(save.call_count, 0, "讀取失敗期間不能把遷移用的時間戳寫回資料庫(會蓋掉原本的)")
+        self.assertEqual(opened, "settings_not_loaded", "設定沒載入前不能開新倉(會用預設值交易)")
+        self.assertIn("inj-settings-db", one(pushed, "讀不到交易設定"))
+
+    # r44：網頁送來的表單格式錯，不能當成空表單
+    def test_r44_bad_form_is_rejected_not_treated_as_empty(self):
+        import asyncio
+        import app.main as m
+        with mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)) as vp:
+            r1 = asyncio.run(m.update_settings({"password": "x", "values": "paper_sl_points=8"}))
+            r2 = asyncio.run(m.update_settings({"password": "x", "values": {}}))
+            r3 = asyncio.run(m.settings_import({"password": "x", "param_set": {"format": "gold-scalper-param-set/1",
+                                                "engine_id": self.eng.engine_id, "params": {}}, "force": True}))
+        self.assertEqual(vp.call_count, 3, "前提：三次都通過了密碼檢查")
+        for r in (r1, r2, r3):
+            self.assertIs(r.get("success"), False, r)
+
+    # r43/r44 第15條：平倉部分成交不能當成平掉
+    def test_r44_partial_close_fill_is_not_closed(self):
+        pos = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, real_open_baseline=0.0, backstop_algo_id="B1")
+        with mock.patch.object(ex, "close_position", return_value=(True, {"orderId": 5, "status": "FILLED", "executedQty": "0.040", "avgPrice": "4380.0"})) as cp, \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.06))), \
+             mock.patch.object(self.eng, "_cancel_backstop") as cb:
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、成交了一部分")
+        self.assertEqual(self.dbclose, [], "只成交0.04/0.1：不能結帳")
+        self.assertFalse(cb.called, "不能撤交易所停損")
+        self.assertTrue(pos.get("pending_close"), "剩下的記待平倉、每輪重試")
+        self.assertAlmostEqual(pos.get("real_open_quantity"), 0.06, places=6)
+
+    # r43/r44 第15條：交易所明確說沒成交(EXPIRED 0)就是沒成交，不是結果不明
+    def test_r44_expired_zero_is_not_filled(self):
+        expired = {"orderId": 9, "status": "EXPIRED", "executedQty": "0.000", "avgPrice": "0.00"}
+        with mock.patch.object(ex, "_signed_request", return_value=(True, expired)) as sr, \
+             mock.patch.object(ex, "round_quantity", return_value=(0.1, None)), mock.patch("time.sleep"):
+            ok, res = ex.place_market_order("BUY", 0.1, account="gold", position_side="LONG")
+        self.assertEqual(sr.call_count, 1, "前提：送出一張單；已經是最終狀態就不用再查")
+        self.assertFalse(ok)
+        self.assertFalse(ex.is_ambiguous_result(res), "交易所明確說沒成交，不用再等3分鐘確認")
+
+    # r43/r44 第15條：卡在NEW的單要撤掉，再查一次拿最終成交量
+    def test_r44_stuck_new_is_cancelled_then_final_state_used(self):
+        new = {"orderId": 11, "status": "NEW", "executedQty": "0.000"}
+        final = {"orderId": 11, "status": "CANCELED", "executedQty": "0.040", "avgPrice": "4373.6"}
+        calls = []
+        def fake(method, path, params=None, account=None, return_status=False):
+            calls.append(method)
+            r = new if method in ("POST", "GET") and calls.count("DELETE") == 0 else final
+            return (True, r, 200) if return_status else (True, r)
+        with mock.patch.object(ex, "_signed_request", side_effect=fake), \
+             mock.patch.object(ex, "round_quantity", return_value=(0.1, None)), mock.patch("time.sleep"):
+            ok, res = ex.place_market_order("BUY", 0.1, account="gold", position_side="LONG")
+        self.assertIn("DELETE", calls, "查幾次仍是NEW：撤掉那張單")
+        self.assertTrue(ok, "撤單後查到成交了0.04：算成交")
+        self.assertEqual(ex.extract_filled_qty(res), 0.04, "數量用最終成交量")
+
+
+class RealSqlDb(unittest.TestCase):
+    """不mock資料庫、用sqlite真的執行SQL：ExecHarness把close_paper_trade整個mock掉，放在那裡測不到SQL(第20種)。"""
+    def setUp(self):
+        self.eng = _engine()
+
+    # 實盤：r25起「先寫出場成交價、最後才結帳」，結帳把成交價覆寫成空的——網頁因此寫「成交價查不到」
+    def test_live_close_record_does_not_wipe_exit_fill(self):
+        pool, conn = _sqlite_pool()
+        conn.execute("INSERT INTO paper_trades (id, status, engine_id, direction, entry_price, entry_time, entry_actual_price, "
+                     "real_open_executed, real_open_quantity) VALUES (1,'open','e','bullish',4354.51,'2026-09-22T02:01:18+00:00',4354.51,1,0.1)")
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            pt.db.update_paper_trade_exit_execution(1, 4350.64, 4350.64, 0.0, 0.01)   # 平倉單成交(先)
+            pt.db.close_paper_trade(1, 4350.65, "2026-09-22T02:45:56+00:00", "訊號反轉", -3.86)  # 結帳(後)
+            rows = pt.db.get_closed_paper_trades(limit=5, engine_id="e")
+        row = conn.execute("SELECT exit_actual_price, status FROM paper_trades WHERE id=1").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual(row[1], "closed", "前提：結帳真的執行了(不是被框架mock掉)")
+        self.assertEqual(row[0], 4350.64, "結帳不能把已經寫進去的出場成交價清掉")
+        self.assertEqual(len(rows), 1, "前提：讀得到這筆")
+        self.assertEqual(rows[0].get("real_pnl_usd"), -0.39, "網頁跟Telegram一樣是-0.39(依真實成交價)")
+
+    def test_web_list_gets_labeled_estimate_when_fill_missing(self):
+        pool, conn = _sqlite_pool()
+        conn.execute("INSERT INTO paper_trades (id, status, engine_id, direction, entry_price, entry_time, exit_price, exit_time, "
+                     "pnl_points, real_open_executed, real_open_quantity) VALUES (2,'closed','e','bullish',4354.60,'2026-09-22T00:40:00+00:00',4362.74,'2026-09-22T00:54:55+00:00',8.15,1,0.1)")
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            rows = pt.db.get_closed_paper_trades(limit=5, engine_id="e")
+        self.assertEqual(len(rows), 1, "前提：讀得到這筆")
+        self.assertIsNone(rows[0].get("real_pnl_usd"), "前提：沒有真實成交價")
+        self.assertEqual(rows[0].get("real_pnl_usd_est"), 0.82, "推估值＝點數×張數(8.15×0.1，跟真實損益一樣四捨五入到2位)")
+
+
+
+class FrameworkState(unittest.TestCase):
+    """用法第5點r44：框架的重設改成自動比對，不靠記得。"""
+    def test_reset_restores_every_module_level_container(self):
+        import importlib
+        names = []
+        for mod_name in ("app.db", "app.execution", "app.main", "app.notifier", "app.settings", "app.risk_guard", "app.preflight"):
+            mod = importlib.import_module(mod_name)
+            for k, v in vars(mod).items():
+                if k.startswith("_") and not k.startswith("__") and isinstance(v, (dict, list, set)):
+                    names.append((mod, k))
+        self.assertGreater(len(names), 5, "前提：真的掃到了模組層級的狀態")
+        for mod, k in names:
+            v = getattr(mod, k)
+            v["__probe__"] = 1 if isinstance(v, dict) else None
+            if isinstance(v, list): v.append("__probe__")
+            if isinstance(v, set): v.add("__probe__")
+        _reset_module_state()
+        dirty = [f"{mod.__name__}.{k}" for mod, k in names if "__probe__" in (getattr(mod, k) if not isinstance(getattr(mod, k), dict) else getattr(mod, k).keys())]
+        self.assertEqual(dirty, [], "框架重設沒有還原這些模組層級狀態")
 
 
 class StaticChecks(unittest.TestCase):
