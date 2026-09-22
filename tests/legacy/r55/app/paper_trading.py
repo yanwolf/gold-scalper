@@ -49,6 +49,21 @@ OPEN_PENDING_SECONDS = 180  # 開倉回應不明時，保留待確認的期限(�
 OP_LOCK_WAIT = 10.0   # 網頁操作等引擎操作鎖的上限(秒)，等不到就回「背景正在處理」(第8條r48)
 
 
+def _same_entry(recorded, exchange):
+    """
+    帳上成交價跟交易所這一側的均價是不是同一筆(第8條r54)。比不了(任一邊缺)回None。
+    交易所端平掉、同一檔又被別人／App同方向開了新部位時，數量可能一樣，但均價不會一樣。
+    限制：剛好同價重開、或本來就有基準部位(均價是合併的)時比對不出來。
+    """
+    try:
+        a, b = float(recorded), float(exchange)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or b <= 0:
+        return None
+    return abs(a - b) <= max(0.02, a * 2e-6)
+
+
 def _engine_op(web=False):
     """
     引擎操作鎖(第8條r48)：會動部位、又會查交易所的步驟(對帳、數量比對、停損守衛、掛停損、認領、重試平倉、平倉、開倉、
@@ -190,6 +205,8 @@ class PaperTradingEngine:
         不重查——交易所剛成交時偶爾還沒反映，重查拿到0會誤判成部位不在而不掛停損(第2條r21/r22)。
         回傳這一輪的結果：skip / aligned / unknown(查不到) / gone(確認沒了) / placed / failed / exit
         """
+        if position is not self._position:
+            return "stale"  # 拿到鎖之後確認傳進來的就是帳上那一筆(第8條r53)，不是就不動
         if not position.get("real_open_executed") or not position.get("real_open_quantity"):
             return "skip"
         if position.get("_closing"):
@@ -390,10 +407,18 @@ class PaperTradingEngine:
 
     def _own_qty(self, position):
         """交易所這一側扣掉基準後，屬於這筆單的數量：(ok, 數量)。第3條r16：基準要跟著部位走完。"""
-        ok, qty, _, _ = self._side_qty(position["direction"])
+        ok, qty, entry, _ = self._side_qty(position["direction"])
         if not ok:
             return False, 0.0
-        return True, max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))
+        base = position.get("real_open_baseline", 0.0) or 0.0
+        own = max(0.0, qty - base)
+        if own > 1e-9 and base <= 1e-9 and _same_entry(position.get("entry_actual_price"), entry) is False:
+            # 交易所這一側的均價跟帳上成交價不同：原本那筆已經在交易所端平掉，現在這張是別人／App開的(第8條r54)。
+            # 當成「沒了」：不掛停損、不送平倉單(會把別人的部位平掉)，照成交明細結帳
+            logger.warning(f"交易所這一側的均價 {entry} 跟帳上成交價 {position.get('entry_actual_price')} 不同({self.label})，"
+                           f"原本那筆已經沒了、這是別的部位")
+            return True, 0.0
+        return True, own
 
     POSITION_STEPS = ("開倉確認", "平倉重試", "停損對齊", "數量比對", "停損守衛", "每輪維護", "快速停損出場", "平倉收尾")
 
@@ -466,6 +491,8 @@ class PaperTradingEngine:
           - 連續3輪確認不在 → 清掉紀錄，交給_sync_backstop當場補掛
             (補掛遇-2021價格已穿過停損 → 直接出場，第8條r16)
         """
+        if pos is not self._position:
+            return "stale"  # 第8條r53
         algo_id = pos.get("backstop_algo_id")
         if not algo_id or not pos.get("real_open_executed"):
             return "skip"
@@ -686,11 +713,16 @@ class PaperTradingEngine:
           - 變少 → 更新帳上數量、通知；減少那部分的成交價不知道，損益記未知(第8條r28，不用標記價估)
           - 連續3輪都是0 → 部位已不在交易所(手動平倉或停損觸發)，走平倉流程確認
         """
+        if position is not self._position:
+            return "stale"  # 第8條r53
         if position.get("pending_close") or position.get("_closing") or position.get("real_open_pending_until"):
             return "skip"
-        ok, qty, _, mark = self._side_qty(position["direction"])
+        ok, qty, entry_x, mark = self._side_qty(position["direction"])
         if not ok:
             return "unknown"
+        if (position.get("real_open_baseline") or 0) <= 1e-9 and qty > 1e-9 and \
+                _same_entry(position.get("entry_actual_price"), entry_x) is False:
+            qty = 0.0  # 均價不同：原本那筆已經沒了、這是別的部位(第8條r54)，走「部位不在」那條路
         qty = max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))  # 扣基準(第3條r16)
         recorded = position.get("real_open_quantity") or 0.0
         if qty <= 1e-9:
@@ -983,6 +1015,10 @@ class PaperTradingEngine:
         if not settings_module.settings_loaded():
             # 交易設定還沒載入：會用預設值交易(引擎專屬覆寫不見)，不能開新倉(第8條r43)
             return "settings_not_loaded"
+        if self._position is not None:
+            # 拿到引擎鎖之後再檢查一次(第8條r50/r51)：鎖只讓兩次開倉排隊，第二次等到鎖之後照樣會送單、
+            # 記帳時把原本那筆蓋掉(停損、停利從此沒人管)。呼叫端事先看過沒部位不夠
+            return "already_has_position"
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,
@@ -1364,7 +1400,11 @@ class PaperTradingEngine:
         if is_execution_engine:
             filled = False
             try:
-                success, result = execution_module.close_position(
+                # 送單前確認交易所上還有這一筆(第8條r54)：原本那筆在交易所端平掉、又被別人同方向開了新部位時，
+                # 照帳上數量送平倉單會把別人的部位平掉。確認到沒了就不送，交給下面「確認平掉」那條路照成交明細結帳
+                ok_pre, own_pre = self._own_qty(position)
+                success, result = (False, {"code": "PRE_GONE", "msg": "送單前確認：交易所這一側已經沒有這一筆，不送平倉單"}) \
+                    if (ok_pre and own_pre <= 1e-9) else execution_module.close_position(
                     direction=position["direction"],
                     symbol=self.execution_symbol,
                     account=self.execution_account,

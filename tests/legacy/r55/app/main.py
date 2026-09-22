@@ -113,6 +113,7 @@ def _reconcile_with_exchange_on_startup():
                 lines.append(f"{engine.label}: 查不到部位資料(回傳空清單)，這次無法對帳，請手動確認")
                 continue
             long_qty = short_qty = 0.0
+            long_entry = short_entry = None
             for row in info if isinstance(info, list) else []:
                 try:
                     amt = float(row.get("positionAmt", 0))
@@ -121,15 +122,24 @@ def _reconcile_with_exchange_on_startup():
                 side = row.get("positionSide", "BOTH")
                 if side == "LONG" or (side == "BOTH" and amt > 0):
                     long_qty += abs(amt)
+                    long_entry = row.get("entryPrice")
                 elif side == "SHORT" or (side == "BOTH" and amt < 0):
                     short_qty += abs(amt)
+                    short_entry = row.get("entryPrice")
             has_db = bool(db_pos and db_pos.get("real_open_executed"))
             if has_db:
                 my_side_long = db_pos.get("direction") == "bullish"
                 # 扣掉送單前就有的部位(基準，第3條r16)，剩下的才是自己的
                 my_qty = max(0.0, (long_qty if my_side_long else short_qty) - float(db_pos.get("real_open_baseline") or 0))
                 other_qty = short_qty if my_side_long else long_qty
-                if my_qty > 1e-9:
+                from app.paper_trading import _same_entry
+                ex_entry = long_entry if my_side_long else short_entry
+                if my_qty > 1e-9 and float(db_pos.get("real_open_baseline") or 0) <= 1e-9 and \
+                        _same_entry(db_pos.get("entry_actual_price"), ex_entry) is False:
+                    # 均價不同：原本那筆可能已在交易所端平掉，這是別人／App開的部位(第8條r54)
+                    lines.append(f"{engine.label}: 對帳不一致 — 交易所這一側的均價 {ex_entry} 跟帳上成交價 "
+                                 f"{db_pos.get('entry_actual_price')} 不同，原本那筆可能已被平掉、這是別的部位，請手動確認")
+                elif my_qty > 1e-9:
                     lines.append(f"{engine.label}: 對帳一致(有{'多' if my_side_long else '空'}單 {my_qty})")
                 else:
                     lines.append(
@@ -225,6 +235,33 @@ async def control_resume(payload: dict = Body(...)):
 # 沒有推播。包一層：回錯誤給網頁、照第8條節奏推播、恢復時通知。引擎的平倉(強制平倉)另外有
 # 自己的外層包裝，結帳前出錯會記待平倉。
 _web_trade_errors = {}
+
+
+def hold_account_engines(fn):
+    """
+    網頁手動測試下單(第8條r50/r51)：送單前把同一個帳戶每個引擎的操作鎖都拿到，一直拿到送單結束——
+    引擎不能在「檢查有沒有部位」與「送出」之間自己開倉。等不到回「背景正在處理」。
+    有沒有部位的檢查在函式裡、通過密碼之後做(鎖已經拿著)。
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        from app import paper_trading as _pt
+        payload = kwargs.get("payload", args[0] if args else {}) or {}
+        account = payload.get("account", "gold") if isinstance(payload, dict) else "gold"
+        held = []
+        try:
+            for e in PAPER_TRADING_ENGINES.values():
+                lk = getattr(e, "_op_lock", None)
+                if getattr(e, "execution_account", None) != account or lk is None:
+                    continue
+                if not lk.acquire(timeout=_pt.OP_LOCK_WAIT):
+                    return {"success": False, "error": f"引擎 {e.label} 背景正在處理(查交易所中)，請幾秒後再試"}
+                held.append(lk)
+            return await fn(*args, **kwargs)
+        finally:
+            for lk in held:
+                lk.release()
+    return wrapper
 
 
 def guard_trade(op):
@@ -489,6 +526,32 @@ async def update_settings(payload: dict = Body(...)):
     return {"success": True, "values": updated}
 
 
+@app.post("/settings/readiness")
+async def update_readiness_settings(payload: dict = Body(...)):
+    """
+    只改達標門檻(正式端也開放)。正式端的 POST /settings 整個擋掉(交易參數唯讀，只能匯入參數集)，
+    而參數集不帶達標門檻，以前正式端完全沒有地方改。這支只收那四個欄位，多帶任何其他欄位就整批拒絕。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    values = payload.get("values")
+    if not isinstance(values, dict) or not values:
+        return {"success": False, "error": "values 必須是非空的 {欄位: 值}，這次沒有改任何設定"}
+    extra = sorted(k for k in values if k not in settings_module.READINESS_KEYS)
+    if extra:
+        return {"success": False, "error": f"這支只能改達標門檻，以下欄位不接受(整批沒有套用)：{', '.join(extra)}"}
+    try:
+        updated = settings_module.update_settings(values)
+    except settings_module.SettingsValidationError as e:
+        return {"success": False, "error": str(e)}
+    try:
+        db.insert_settings_audit("readiness_update", detail={k: updated.get(k) for k in values})
+    except Exception as e:
+        logger.error(f"寫入審計紀錄失敗(達標門檻): {e}")
+    return {"success": True, "values": updated}
+
+
 @app.get("/settings/engine/{engine_id}")
 async def get_engine_settings(engine_id: str):
     """
@@ -734,6 +797,7 @@ async def execution_set_leverage(payload: dict = Body(...)):
 
 @app.post("/execution/test-order")
 @guard_trade("手動測試下單")
+@hold_account_engines
 async def execution_test_order(payload: dict = Body(...)):
     """
     手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
@@ -754,6 +818,12 @@ async def execution_test_order(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     account = payload.get("account", "gold")
+    # 引擎有部位時不能手動再開(第8條r50/r51)：交易所上會多一張程式不知道的部位，之後的數量比對、平倉都會亂。
+    # 同帳戶引擎的操作鎖已經由 hold_account_engines 拿著，這裡看到的狀態在送單前不會變
+    has_pos = [e.label for e in PAPER_TRADING_ENGINES.values()
+               if getattr(e, "execution_account", None) == account and getattr(e, "_position", None) is not None]
+    if has_pos:
+        return {"success": False, "error": f"帳戶 {account} 的引擎({', '.join(has_pos)})目前有部位，手動測試下單會多一張程式不知道的部位，已擋下"}
     # 持倉紀錄沒載入時手動下單也要擋(第8條r39)：「沒載入不開倉」寫在引擎裡，這支是直接送單、不經過引擎。
     # (手動測試平倉不擋：那是減少風險的動作)
     not_loaded = [e.label for e in PAPER_TRADING_ENGINES.values()

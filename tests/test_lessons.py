@@ -596,6 +596,7 @@ class Lesson16(ExecHarness):
                                 "chan": {"reason": "t"}, "profile": {"reason": "t"}}, 4390.0, 10.0)
         self.assertTrue(gp.called, "前提：真的查了基準")
         self.assertEqual(op.call_count, 0, "基準查不到不能當成0繼續送")
+        self.assertIsNotNone(eng._position, "前提：帳面部位有開(沒開成時要是斷言失敗、不是測試崩掉)")
         self.assertIs(eng._position.get("real_open_executed"), False)
 
     # 3b：基準跟著部位走完——數量比對、平倉確認、平倉數量都要扣
@@ -1198,6 +1199,7 @@ class Lesson34(ExecHarness):
             eng._open_position({"direction": "bullish", "bid": 4389.9, "ask": 4390.0,
                                 "chan": {"reason": "t"}, "profile": {"reason": "t"}}, 4390.0, 10.0)
         self.assertEqual(op.call_count, 1, "前提：開倉單送出並成交")
+        self.assertIsNotNone(eng._position, "前提：部位真的開起來了(沒開成時要是斷言失敗、不是測試崩掉)")
         self.assertEqual(eng._position.get("fill_boundary_id"), 202, "界線＝開倉那張單最後一筆成交的id")
         self.assertEqual(saved and saved[-1][1:], (9001, 202), "開倉單號與界線要存進資料庫(重啟後還在)")
 
@@ -1931,9 +1933,14 @@ class Lesson54(ExecHarness):
     def _other_rows(self):
         return (True, _rows(0.1, entry=self.OTHER))   # 交易所這一側：別人的0.1張，均價4400
 
+    # 原本那筆的平倉成交(第二個證據，r56)：開倉那筆101、界線101之後有一筆SELL 0.1
+    CLOSED = (True, _fills((101, 9001, "BUY", 0.1, 4391.2, 0.0, 1000), (150, 9100, "SELL", 0.1, 4380.0, -1.12, 2000)))
+    NOT_CLOSED = (True, _fills((101, 9001, "BUY", 0.1, 4391.2, 0.0, 1000)))
+
     # 守衛補掛／掛停損
-    def _sync(self, pos):
+    def _sync(self, pos, fills=None):
         with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()) as gp, \
+             mock.patch.object(ex, "get_user_trades", return_value=fills or self.CLOSED, create=True), \
              mock.patch.object(ex, "place_algo_stop", return_value=(True, "S", False)) as pl:
             st = self.eng._sync_backstop(pos)
         return st, gp, pl
@@ -1949,11 +1956,11 @@ class Lesson54(ExecHarness):
         self.assertEqual(pl.call_count, 1, "對照組：沒有成交價可比對時，停損就掛到別人的部位上了")
 
     # 出場(背景判斷)、待平倉重試、網頁手動平倉：都走平倉
-    def _close(self, pos, via):
-        fills = (True, _fills((101, 9001, "BUY", 0.1, 4391.2, 0.0, 1000), (150, 9100, "SELL", 0.1, 4380.0, -1.12, 2000)))
+    def _close(self, pos, via, fills=None):
+        fills = fills or self.CLOSED
         from app.binance_client import binance_streamer
         with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()), \
-             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True), \
+             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True) as self.fills_mock, \
              mock.patch.object(binance_streamer, "get_recent_trades", return_value=[{"price": 4401.0}]), \
              mock.patch.object(pt, "_latest_price", return_value=4401.0), \
              mock.patch.object(ex, "close_position", return_value=(True, {"executedQty": "0.100", "avgPrice": "4401"})) as cp, \
@@ -1965,7 +1972,7 @@ class Lesson54(ExecHarness):
                 pos["pending_close"] = {"price": 4401.0, "reason": "觸及停損"}
                 self.eng._retry_pending_close()
             else:
-                self.eng.force_close()
+                self.manual_result = self.eng.force_close()
         return cp
 
     def test_r54_exit_does_not_close_other_position(self):
@@ -1986,10 +1993,11 @@ class Lesson54(ExecHarness):
     # 數量比對(對帳)
     def test_r54_quantity_check_treats_other_position_as_gone(self):
         pos = self._pos()
-        with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()) as gp:
+        with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()) as gp, \
+             mock.patch.object(ex, "get_user_trades", return_value=self.CLOSED, create=True):
             st = self.eng._check_exchange_quantity(pos)
         self.assertTrue(gp.called, "前提：真的查了交易所")
-        self.assertEqual(st, "gone_pending", "均價不同：原本那筆已經沒了(連續確認後結帳)，不是「數量沒變」")
+        self.assertEqual(st, "gone_pending", "均價不同、查到平倉成交：原本那筆已經沒了(連續確認後結帳)，不是「數量沒變」")
 
     def test_r54_control_quantity_check_same_when_price_unknown(self):
         pos = self._pos(entry_actual=None)
@@ -2004,6 +2012,7 @@ class Lesson54(ExecHarness):
         eng._position = self._pos()
         got = []
         with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()) as gp, \
+             mock.patch.object(ex, "get_user_trades", return_value=self.CLOSED, create=True), \
              mock.patch.object(ex, "usdt_balance_line", return_value=None), mock.patch("time.sleep"), \
              mock.patch.dict(m.PAPER_TRADING_ENGINES, {"x": eng}, clear=True), \
              mock.patch.object(eng, "_is_execution_engine", return_value=True), \
@@ -2011,8 +2020,58 @@ class Lesson54(ExecHarness):
             m._reconcile_with_exchange_on_startup()
         self.assertTrue(gp.called, "前提：真的查了交易所")
         self.assertGreater(len(got), 0, "前提：對帳訊息有寫出來")
-        self.assertIn("均價", got[-1], got[-1])
+        self.assertIn("平倉成交", got[-1], got[-1])
         self.assertNotIn("對帳一致", got[-1])
+
+    # ---- r56/r57：均價有出入但「沒有平倉成交」＝同一筆，照常管理；成交明細查不到＝判斷不了 ----
+    def test_r56_price_differs_but_never_closed_is_same_position(self):
+        st, _gp, pl = self._sync(self._pos(), fills=self.NOT_CLOSED)
+        self.assertEqual((st, pl.call_count), ("placed", 1), "沒有平倉成交：同一筆(記法不同)，停損照掛——不能撤掉還在場部位的保護")
+        pos = self._pos()
+        with mock.patch.object(ex, "get_position_info", return_value=self._other_rows()), \
+             mock.patch.object(ex, "get_user_trades", return_value=self.NOT_CLOSED, create=True):
+            self.assertEqual(self.eng._check_exchange_quantity(pos), "same", "數量比對：同一筆、數量沒變，不結帳")
+
+    def test_r57_manual_close_sends_order_when_never_closed(self):
+        self.dbclose.clear()
+        cp = self._close(self._pos(), "manual", fills=self.NOT_CLOSED)
+        self.assertTrue(self.fills_mock.called,
+                        "前提：送單前真的比對了均價、查了成交明細(判定是同一筆)——不是因為部位查不到才照送(第16種)")
+        self.assertEqual(cp.call_count, 1, "均價有出入但沒有平倉成交：手動平倉要真的送單(r57：不能回「已平倉」卻沒送)")
+        self.assertEqual(len(self.manual_result), 2, "前提：手動平倉真的有回傳(成功與否, 訊息)")
+        self.assertIs(self.manual_result[0], True, self.manual_result)
+        self.assertIn("已以", self.manual_result[1])
+
+    def test_r57_manual_close_says_no_order_when_already_closed(self):
+        cp = self._close(self._pos(), "manual")
+        self.assertEqual(cp.call_count, 0, "前提：交易所上是別人的部位、沒有送單")
+        self.assertEqual(len(self.manual_result), 2, "前提：手動平倉真的有回傳(成功與否, 訊息)")
+        self.assertIn("這次沒有送平倉單", self.manual_result[1], "回應要講明沒有送單，不能讓人以為是這次平掉的")
+
+    def test_r56_fills_unknown_means_no_order_no_settle(self):
+        unknown = (False, "Read timed out")
+        st, _gp, pl = self._sync(self._pos(), fills=unknown)
+        self.assertEqual((st, pl.call_count), ("unknown", 0), "判斷不了：不掛")
+        for via in ("exit", "manual"):
+            with self.subTest(via=via):
+                self.dbclose.clear()
+                pos = self._pos()
+                cp = self._close(pos, via, fills=unknown)
+                self.assertEqual(cp.call_count, 0, f"{via}：判斷不了，這輪不送任何單")
+                self.assertEqual(self.dbclose, [], f"{via}：也不結帳")
+                self.assertIs(self.eng._position, pos, f"{via}：部位留在帳上、記待平倉")
+
+    def test_r57_preflight_lists_mismatched_positions(self):
+        from app import preflight as pf
+        self._pos()
+        with mock.patch.dict(pt.PAPER_TRADING_ENGINES, {"x": self.eng}, clear=True), \
+             mock.patch.object(ex, "get_position_info", return_value=self._other_rows()) as gp, \
+             mock.patch.object(ex, "get_user_trades", return_value=self.NOT_CLOSED, create=True):
+            self.assertTrue(hasattr(pf, "entry_price_check"), "前提：自檢有這一項")
+            item = pf.entry_price_check(self.eng.execution_account)
+        self.assertTrue(gp.called, "前提：真的查了交易所")
+        self.assertEqual(item["status"], "warn", item)
+        self.assertIn("沒有平倉成交 → 視為同一筆", item["msg"])
 
     # r53：傳進來的部位不是帳上那一筆就不動
     def test_r53_stale_position_object_is_not_acted_on(self):

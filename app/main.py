@@ -132,13 +132,17 @@ def _reconcile_with_exchange_on_startup():
                 # 扣掉送單前就有的部位(基準，第3條r16)，剩下的才是自己的
                 my_qty = max(0.0, (long_qty if my_side_long else short_qty) - float(db_pos.get("real_open_baseline") or 0))
                 other_qty = short_qty if my_side_long else long_qty
-                from app.paper_trading import _same_entry
                 ex_entry = long_entry if my_side_long else short_entry
-                if my_qty > 1e-9 and float(db_pos.get("real_open_baseline") or 0) <= 1e-9 and \
-                        _same_entry(db_pos.get("entry_actual_price"), ex_entry) is False:
-                    # 均價不同：原本那筆可能已在交易所端平掉，這是別人／App開的部位(第8條r54)
-                    lines.append(f"{engine.label}: 對帳不一致 — 交易所這一側的均價 {ex_entry} 跟帳上成交價 "
-                                 f"{db_pos.get('entry_actual_price')} 不同，原本那筆可能已被平掉、這是別的部位，請手動確認")
+                reopened = (engine._reopened(db_pos, ex_entry)
+                            if my_qty > 1e-9 and float(db_pos.get("real_open_baseline") or 0) <= 1e-9 and hasattr(engine, "_reopened")
+                            else False)
+                if reopened is True:
+                    # 兩個證據(第8條r56)：均價不同，而且查到原本那筆的平倉成交
+                    lines.append(f"{engine.label}: 對帳不一致 — 交易所這一側均價 {ex_entry}、帳上成交價 {db_pos.get('entry_actual_price')}，"
+                                 f"而且查到原本那筆的平倉成交：原本那筆已經平掉、交易所上是別的部位，請手動確認")
+                elif reopened is None:
+                    lines.append(f"{engine.label}: 對帳無法確認 — 交易所這一側均價 {ex_entry} 跟帳上成交價 {db_pos.get('entry_actual_price')} "
+                                 f"不同，成交明細查不到，判斷不了是不是原本那筆；這段期間不送任何單、不結帳，請手動確認")
                 elif my_qty > 1e-9:
                     lines.append(f"{engine.label}: 對帳一致(有{'多' if my_side_long else '空'}單 {my_qty})")
                 else:
