@@ -2049,6 +2049,36 @@ class Lesson54(ExecHarness):
         self.assertIn("這次沒有送平倉單", self.manual_result[1], "回應要講明沒有送單，不能讓人以為是這次平掉的")
         self.assertIn("別的部位", self.manual_result[1], "平掉後被別人重開：要講交易所上現在那張沒有動它(r59)")
 
+    # r61：對帳(數量比對連3輪判定部位不在)替原本那筆結帳時，結帳原因與通知照實際情況寫
+    def _reconcile_close(self, rows, fills):
+        pos = self._pos()
+        pos["gone_checks"] = 2
+        with mock.patch.object(ex, "get_position_info", return_value=rows) as gp, \
+             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True), \
+             mock.patch.object(pt, "_latest_price", return_value=4401.0), \
+             mock.patch.object(ex, "close_position") as cp, \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            st = self.eng._check_exchange_quantity(pos)
+        return st, gp, cp
+
+    def test_r61_reconcile_reason_says_other_position_untouched(self):
+        st, gp, cp = self._reconcile_close(self._other_rows(), self.CLOSED)
+        self.assertEqual(st, "gone", "前提：對帳判定原本那筆已經沒了、結帳")
+        self.assertEqual((cp.call_count, len(self.dbclose), len(self.notes) > 0), (0, 1, True), "前提：沒送單、結了帳、有發通知")
+        reason = self.dbclose[0][3]
+        self.assertIn("別的部位", reason, "結帳原因要寫明交易所上現在那張是別的部位")
+        self.assertIn("沒有動它", reason)
+        note = str(self.notes[-1].get("exchange_note") or "")
+        self.assertIn("這次沒有送平倉單", note, "通知要講明沒有送單")
+        self.assertIsNone(self.notes[-1].get("skip_reason"), "不能放進風控的欄位(通知會印成「已暫停真實下單」)")
+
+    def test_r61_reconcile_reason_says_estimated_when_no_fills(self):
+        st, gp, cp = self._reconcile_close((True, _rows(0)), (False, "Read timed out"))
+        self.assertEqual(st, "gone", "前提：交易所這一側沒有部位、對帳結帳")
+        self.assertEqual(len(self.dbclose), 1, "前提：結了帳")
+        self.assertIn("推估", self.dbclose[0][3], "出場價查不到：結帳原因寫明是推估的")
+        self.assertNotIn("別的部位", self.dbclose[0][3], "沒有重開：不能說有別的部位")
+
     # r59：手動平倉遇到「停損觸發、沒有重開」——交易所這一側已經沒有部位
     def _manual_close_flat(self, fills):
         pos = self._pos()
@@ -2193,6 +2223,23 @@ class WebBodies(unittest.TestCase):
         self.assertGreater(len(codes), 10, "前提：真的打了這些端點")
         self.assertEqual({k: v for k, v in codes.items() if v != 422}, {}, "不是物件、或沒帶內容：要在進程式之前就被擋下")
         self.assertEqual((us.call_count, ueo.call_count, vp.call_count), (0, 0, 0), "一次都沒有進到程式")
+
+
+class NotifierExchangeClose(unittest.TestCase):
+    """放在不 mock 通知的情境：ExecHarness 把 notify_trade_event 整個 mock 掉(第20種，這是第四次)。"""
+    def test_r61_notice_for_exchange_close_is_not_breaker_wording(self):
+        from app.notifier import notifier as N, TelegramNotifier
+        sent = []
+        with mock.patch.object(TelegramNotifier, "is_enabled", new_callable=mock.PropertyMock, return_value=True), \
+             mock.patch.object(TelegramNotifier, "is_muted", new_callable=mock.PropertyMock, return_value=False), \
+             mock.patch.object(N, "_send_telegram_message", side_effect=lambda t: sent.append(t) or (True, None)):
+            self.assertIn("exchange_note", N.notify_trade_event.__code__.co_varnames, "前提：通知有「交易所端已平倉」這個欄位")
+            N.notify_trade_event(action="close", label="15分K", direction="bullish", price=4380.0, exit_reason="交易所端部位已不在",
+                                 pnl_points=-10.0, executed=None, quantity=0.1,
+                                 exchange_note="送單前確認：交易所這一側已經沒有這一筆，這次沒有送平倉單")
+        self.assertEqual(len(sent), 1, "前提：通知真的組出來、送出了")
+        self.assertIn("這次沒有送平倉單", sent[0])
+        self.assertNotIn("已暫停真實下單", sent[0], "交易所端已平倉不是風控暫停")
 
 
 class StaticChecks(unittest.TestCase):

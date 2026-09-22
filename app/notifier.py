@@ -82,7 +82,7 @@ class TelegramNotifier:
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
                             executed=None, execution_error=None, skip_reason=None, account="gold",
                             slippage_note=None, quantity=None, real_pnl_usd=None, stop_note=None,
-                            real_pnl_estimated=False):
+                            real_pnl_estimated=False, exchange_note=None):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -127,6 +127,9 @@ class TelegramNotifier:
         elif executed is False:
             error_snippet = str(execution_error)[:200] if execution_error else "未知原因"
             execution_note = f"（同步下單失敗，僅記錄模擬單）\n失敗原因：{error_snippet}"
+        elif exchange_note:
+            # 交易所端已經平掉(停損觸發／被別人重開)：這次沒有送平倉單，不是風控暫停(第8條r61)
+            execution_note = f"（交易所端已平倉）\n{exchange_note}"
         elif skip_reason:
             execution_note = f"（已暫停真實下單，僅記錄模擬單）\n原因：{skip_reason}"
         else:

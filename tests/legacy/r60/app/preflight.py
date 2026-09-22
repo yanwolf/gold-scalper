@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-22r55"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-09-22r60"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -44,6 +44,34 @@ def notify_check():
     return {"item": "Telegram 推播", "status": "ok", "msg": "已設定，最近沒有送出失敗"}
 
 
+def entry_price_check(account):
+    """
+    帳上成交價 vs 交易所均價(第8條r56/r57)：列出對不上的持倉、有沒有平倉成交、會怎麼處理。
+    兩個證據的版本部署時不會誤判；這一項用來事後確認。
+    """
+    from app import paper_trading as pt
+    lines, worst = [], "ok"
+    for eng in pt.PAPER_TRADING_ENGINES.values():
+        pos = getattr(eng, "_position", None)
+        if getattr(eng, "execution_account", None) != account or not pos or not pos.get("real_open_executed"):
+            continue
+        ok, qty, entry, _ = eng._side_qty(pos["direction"])
+        if not ok:
+            lines.append(f"{eng.label}：查不到交易所部位")
+            worst = "warn"
+            continue
+        if pt._same_entry(pos.get("entry_actual_price"), entry) is not False:
+            continue
+        r = eng._reopened(pos, entry)
+        how = {True: "查到原本那筆的平倉成交 → 視為已平掉(照成交明細結帳，不動交易所上的部位)",
+               False: "沒有平倉成交 → 視為同一筆，照常管理",
+               None: "成交明細查不到 → 判斷不了，這段期間不送單、不結帳"}[r]
+        lines.append(f"{eng.label}：帳上成交價 {pos.get('entry_actual_price')}、交易所均價 {entry}；{how}")
+        worst = "warn"
+    return {"item": "帳上成交價 vs 交易所均價", "status": worst,
+            "msg": "；".join(lines) if lines else "持倉的帳上成交價都跟交易所均價一致(或沒有實單持倉)"}
+
+
 def check(account=None, symbol=None):
     """
     對「一個帳戶」跑完整自檢，回傳[(項目, 狀態, 說明), ...]。
@@ -53,6 +81,10 @@ def check(account=None, symbol=None):
     account = account or execution_module.DEFAULT_ACCOUNT
     symbol = symbol or execution_module.DEFAULT_SYMBOL
     out = [notify_check()]
+    try:
+        out.append(entry_price_check(account))
+    except Exception as e:
+        out.append({"item": "帳上成交價 vs 交易所均價", "status": "warn", "msg": f"檢查失敗：{type(e).__name__}: {e}"})
 
     def add(name, st, msg=""):
         out.append({"item": name, "status": st, "msg": str(msg)[:200]})

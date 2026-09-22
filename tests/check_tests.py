@@ -57,6 +57,27 @@ def scan(source):
     return out
 
 
+# 第20種(r63，四次了)：ExecHarness 在 setUp 把這些 mock 掉，放在它底下的測試碰不到真的實作
+HARNESS_MOCKED = ("notify_trade_event(", "_send_telegram_message", "_sqlite_pool(")
+
+
+def harness_problems(source):
+    """繼承 ExecHarness 的測試類別裡，不能呼叫它 mock 掉的東西(通知格式、真的 SQL)，要放在不 mock 的情境。"""
+    out = []
+    for cls in ast.parse(source).body:
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        if not any(isinstance(b, ast.Name) and b.id == "ExecHarness" for b in cls.bases):
+            continue
+        for fn in cls.body:
+            if isinstance(fn, ast.FunctionDef):
+                seg = ast.get_source_segment(source, fn) or ""
+                for k in HARNESS_MOCKED:
+                    if k in seg:
+                        out.append(f"{cls.name}.{fn.name}：在 ExecHarness 底下用到 {k.rstrip('(')}(它被框架 mock 掉了，第20種)")
+    return out
+
+
 def problems(source):
     return [f"{k}：正向 {p}、否定句 {n} —— 沒有正向斷言，程式什麼都沒做也會通過"
             for k, (p, n) in scan(source).items() if p == 0]
@@ -83,6 +104,21 @@ class TestChecker(unittest.TestCase):
         for body, flagged in SELFTEST:
             src = f"class C:\n    def test_x(self):\n        {body}\n"
             self.assertEqual(bool(problems(src)), flagged, body)
+
+    def test_harness_selftest(self):
+        bad = "class ExecHarness: pass\nclass A(ExecHarness):\n    def test_x(self):\n        N.notify_trade_event(action=1)\n"
+        ok = "class ExecHarness: pass\nclass B(unittest.TestCase):\n    def test_x(self):\n        N.notify_trade_event(action=1)\n"
+        ok2 = "class ExecHarness: pass\nclass A(ExecHarness):\n    def test_x(self):\n        self.notes[-1]\n"
+        self.assertEqual(len(harness_problems(bad)), 1, "ExecHarness 底下呼叫通知格式：要報出")
+        self.assertEqual(harness_problems(ok), [], "不 mock 的情境：可以")
+        self.assertEqual(harness_problems(ok2), [], "只讀框架收集到的通知參數：可以")
+
+    def test_no_harness_mocked_calls_in_harness_tests(self):
+        path = os.path.join(os.path.dirname(__file__), "test_lessons.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        self.assertGreater(src.count("(ExecHarness)"), 10, "前提：真的掃到了繼承 ExecHarness 的類別")
+        self.assertEqual(harness_problems(src), [])
 
     def test_lessons_tests_all_have_a_positive_assertion(self):
         path = os.path.join(os.path.dirname(__file__), "test_lessons.py")
