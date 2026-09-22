@@ -113,6 +113,7 @@ def _reconcile_with_exchange_on_startup():
                 lines.append(f"{engine.label}: 查不到部位資料(回傳空清單)，這次無法對帳，請手動確認")
                 continue
             long_qty = short_qty = 0.0
+            long_entry = short_entry = None
             for row in info if isinstance(info, list) else []:
                 try:
                     amt = float(row.get("positionAmt", 0))
@@ -121,15 +122,24 @@ def _reconcile_with_exchange_on_startup():
                 side = row.get("positionSide", "BOTH")
                 if side == "LONG" or (side == "BOTH" and amt > 0):
                     long_qty += abs(amt)
+                    long_entry = row.get("entryPrice")
                 elif side == "SHORT" or (side == "BOTH" and amt < 0):
                     short_qty += abs(amt)
+                    short_entry = row.get("entryPrice")
             has_db = bool(db_pos and db_pos.get("real_open_executed"))
             if has_db:
                 my_side_long = db_pos.get("direction") == "bullish"
                 # 扣掉送單前就有的部位(基準，第3條r16)，剩下的才是自己的
                 my_qty = max(0.0, (long_qty if my_side_long else short_qty) - float(db_pos.get("real_open_baseline") or 0))
                 other_qty = short_qty if my_side_long else long_qty
-                if my_qty > 1e-9:
+                from app.paper_trading import _same_entry
+                ex_entry = long_entry if my_side_long else short_entry
+                if my_qty > 1e-9 and float(db_pos.get("real_open_baseline") or 0) <= 1e-9 and \
+                        _same_entry(db_pos.get("entry_actual_price"), ex_entry) is False:
+                    # 均價不同：原本那筆可能已在交易所端平掉，這是別人／App開的部位(第8條r54)
+                    lines.append(f"{engine.label}: 對帳不一致 — 交易所這一側的均價 {ex_entry} 跟帳上成交價 "
+                                 f"{db_pos.get('entry_actual_price')} 不同，原本那筆可能已被平掉、這是別的部位，請手動確認")
+                elif my_qty > 1e-9:
                     lines.append(f"{engine.label}: 對帳一致(有{'多' if my_side_long else '空'}單 {my_qty})")
                 else:
                     lines.append(
@@ -513,6 +523,32 @@ async def update_settings(payload: dict = Body(...)):
         updated = settings_module.update_settings(values)
     except settings_module.SettingsValidationError as e:
         return {"success": False, "error": str(e)}
+    return {"success": True, "values": updated}
+
+
+@app.post("/settings/readiness")
+async def update_readiness_settings(payload: dict = Body(...)):
+    """
+    只改達標門檻(正式端也開放)。正式端的 POST /settings 整個擋掉(交易參數唯讀，只能匯入參數集)，
+    而參數集不帶達標門檻，以前正式端完全沒有地方改。這支只收那四個欄位，多帶任何其他欄位就整批拒絕。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    values = payload.get("values")
+    if not isinstance(values, dict) or not values:
+        return {"success": False, "error": "values 必須是非空的 {欄位: 值}，這次沒有改任何設定"}
+    extra = sorted(k for k in values if k not in settings_module.READINESS_KEYS)
+    if extra:
+        return {"success": False, "error": f"這支只能改達標門檻，以下欄位不接受(整批沒有套用)：{', '.join(extra)}"}
+    try:
+        updated = settings_module.update_settings(values)
+    except settings_module.SettingsValidationError as e:
+        return {"success": False, "error": str(e)}
+    try:
+        db.insert_settings_audit("readiness_update", detail={k: updated.get(k) for k in values})
+    except Exception as e:
+        logger.error(f"寫入審計紀錄失敗(達標門檻): {e}")
     return {"success": True, "values": updated}
 
 

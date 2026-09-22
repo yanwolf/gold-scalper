@@ -2713,9 +2713,11 @@ async function loadAppRole(){
     document.querySelector('.tab-btn[data-tab="tabTools"]').style.display = 'none';
     document.getElementById('controlPanel').style.display = '';
     document.getElementById('exportParamSetBtn').style.display = 'none';
-    // 設定分頁改成唯讀說明
+    // 設定分頁：交易參數唯讀(只能匯入參數集)，只開放達標門檻這一組
+    SETTINGS_READINESS_ONLY = true;
     const locked = document.getElementById('settingsLockedView');
-    if(locked) locked.innerHTML = '<div style="font-size:12px; color:#fca5a5;">正式端參數唯讀。要改參數請在 lab 端驗證後用「匯出參數集」，再到主畫面「匯入參數集」。</div>';
+    if(locked) locked.insertAdjacentHTML('afterbegin', '<div style="font-size:12px; color:var(--muted); margin-bottom:8px;">正式端交易參數唯讀：要改請在 lab 端驗證後用「匯出參數集」，再到主畫面「匯入參數集」。達標門檻不在參數集裡，可以在這裡直接改。</div>');
+    if(els.settingsUnlockBtn) els.settingsUnlockBtn.textContent = '🔒 輸入密碼以編輯達標門檻';
     const toggle = document.getElementById('engineParamsToggle');
     if(toggle) toggle.style.display = 'none';
   }
@@ -3198,13 +3200,17 @@ const SETTINGS_GROUPS = [
   { title: '達標門檻', keys: ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'], collapsed: true },
 ];
 
+// 正式端只開放達標門檻(交易參數唯讀、只能匯入參數集；門檻不在參數集裡，要能在正式端直接改)
+const READINESS_KEYS = ['readiness_min_trades', 'readiness_min_win_rate', 'readiness_min_profit_factor', 'readiness_max_drawdown_points'];
+let SETTINGS_READINESS_ONLY = false;
+
 function renderSettingsForm(values, meta){
   settingsMeta = meta;
   const groupedKeys = new Set(SETTINGS_GROUPS.flatMap(g => g.keys));
   const ungroupedKeys = Object.keys(meta).filter(k => !groupedKeys.has(k));
-  const groups = ungroupedKeys.length > 0
-    ? [...SETTINGS_GROUPS, { title: '其他', keys: ungroupedKeys }]
-    : SETTINGS_GROUPS;
+  const groups = SETTINGS_READINESS_ONLY
+    ? [{ title: '達標門檻（正式端只能改這一組）', keys: READINESS_KEYS, collapsed: false }]
+    : (ungroupedKeys.length > 0 ? [...SETTINGS_GROUPS, { title: '其他', keys: ungroupedKeys }] : SETTINGS_GROUPS);
 
   const fieldHtml = (key) => {
     const m = meta[key];
@@ -3270,10 +3276,10 @@ async function fetchSettingsView(){
 }
 
 async function saveSettings(){
+  // 只送畫面上真的有顯示的欄位(正式端只顯示達標門檻；以前是把 settingsMeta 裡每個欄位都送出去)
   const values = {};
-  Object.keys(settingsMeta).forEach(key => {
-    const input = document.getElementById(`setting-${key}`);
-    if(input) values[key] = parseFloat(input.value);
+  els.settingsForm.querySelectorAll('input[data-key]').forEach(input => {
+    values[input.dataset.key] = parseFloat(input.value);
   });
 
   const saveBtn = document.getElementById('settingsSaveBtn');
@@ -3281,7 +3287,7 @@ async function saveSettings(){
   showSettingsResult('儲存中...', false);
 
   try{
-    const res = await fetch('/settings', {
+    const res = await fetch(SETTINGS_READINESS_ONLY ? '/settings/readiness' : '/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: settingsPassword, values }),

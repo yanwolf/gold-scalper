@@ -21,6 +21,22 @@ import tests.test_lessons as T
 
 # 突變下仍通過、且確實經過被突變查詢的項目：{測試: (類別, 被引用的測試, 說明)}
 EXEMPT = {
+    "Lesson19.test_t8c_step_error_recovers_and_is_cleared_at_position_end": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson22.test_t8c_error_after_close_confirmed_is_not_restored": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson22.test_t8c_exit_price_none_still_closes": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson25.test_t8a_cleanup_error_after_record_does_not_stop_other_cleanup": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson25.test_t8a_record_is_written_before_cleanup_and_pnl_error_does_not_block": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson44.test_r44_partial_close_fill_is_not_closed": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "LiveAckResponse.test_close_fill_price_from_trades_when_response_lacks_it": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
+    "Lesson54.test_r54_control_exit_closes_other_position_when_price_unknown": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
+        "這項本身就是對照組：均價比對失效時必須出事；突變讓部位查詢查不到，同樣會送單"),
     # 目前沒有。r22 對照時原本列了 3 項，檢查器報出它們在突變下其實已經會失敗(前提斷言「真的查了部位」
     # 抓到了突變)，屬於過期豁免，已刪除。
 }

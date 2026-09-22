@@ -25,6 +25,17 @@ from app import settings as settings_module
 logger = logging.getLogger("risk_guard")
 
 
+def _one_r(engine, trade):
+    """一次完整停損的點數：設定的停損點數與那筆「進場到停損價」的距離取較大者(保守)。"""
+    s = settings_module.get_settings(engine_id=engine.engine_id)
+    base = float(s.get("paper_sl_points") or 0)
+    try:
+        dist = abs(float(trade.get("entry_price")) - float(trade.get("sl_price")))
+    except (TypeError, ValueError):
+        dist = 0.0
+    return max(base, dist)
+
+
 def get_daily_pnl_usd(engine, quantity):
     """
     這個引擎今天(UTC日)已平倉損益，換算成美元(乘以quantity)。
@@ -46,9 +57,14 @@ def get_daily_pnl_usd(engine, quantity):
             exit_dt = datetime.fromisoformat(exit_time_str)
         except ValueError:
             continue
-        if exit_dt.date() == today and isinstance(t.get("pnl_points"), (int, float)):
-            # 損益未知的不加(不當成0)，筆數另外由get_unknown_pnl_count回報(第8條r27)
-            daily_pnl_points += t["pnl_points"]
+        if exit_dt.date() != today:
+            continue
+        if isinstance(t.get("pnl_points"), (int, float)):
+            daily_pnl_points += t["pnl_points"]   # 推估的損益(r45 pnl_estimated)是數字，照樣算進來
+        else:
+            # 損益未知：斷路器當成一次完整停損(-1R，第8條r50)——只會更早停、不會更晚。
+            # 以前是不加：成交價都查不到的那天，每日虧損上限永遠不會觸發
+            daily_pnl_points -= _one_r(engine, t)
 
     return daily_pnl_points * quantity
 
@@ -67,7 +83,8 @@ def get_consecutive_losses(engine):
     for t in trades:
         pnl = t.get("pnl_points")
         if pnl is None:
-            continue  # 損益未知：不算虧損、也不打斷連續虧損(第8條r27)，筆數另外回報
+            count += 1  # 損益未知：斷路器當成一次虧損(第8條r50)，只會更早停
+            continue
         if pnl <= 0:
             count += 1
         else:
@@ -184,7 +201,43 @@ def get_manual_halt():
     return dict(_manual_halt)
 
 
+_history_fail = {"n": 0}
+
+
+def _history_read_failed(err):
+    _history_fail["n"] += 1
+    n = _history_fail["n"]
+    try:
+        from app import alert_cadence
+        from app.notifier import notifier
+        if alert_cadence.should_alert(n):
+            notifier.send_raw_message(f"⚠️ 風控讀不到平倉紀錄(資料庫)(第 {n} 次)\n錯誤：{err}\n暫停真實下單(模擬單照常)，每次要下單時重試")
+    except Exception:
+        pass
+
+
+def _history_read_ok():
+    n = _history_fail["n"]
+    _history_fail["n"] = 0
+    if n:
+        try:
+            from app.notifier import notifier
+            notifier.send_raw_message(f"✅ 風控讀得到平倉紀錄了(失敗 {n} 次後)，恢復真實下單")
+        except Exception:
+            pass
+
+
 def check(engine, quantity, sl_points=None, bid=None, ask=None):
+    """風控檢查(見 _check_inner)。擋下的是每日虧損／連續虧損、而裡面含損益未知的筆數時，講明(第8條r50)。"""
+    allowed, reason, kind = _check_inner(engine, quantity, sl_points=sl_points, bid=bid, ask=ask)
+    if not allowed and kind in ("daily_loss", "consecutive_loss"):
+        n = get_unknown_pnl_count(engine)
+        if n:
+            reason = f"{reason}(含 {n} 筆損益未知，各以一次完整停損計)"
+    return allowed, reason, kind
+
+
+def _check_inner(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
     回傳 (allowed: bool, reason: str|None, reason_type: str|None)。allowed=False
@@ -205,6 +258,14 @@ def check(engine, quantity, sl_points=None, bid=None, ask=None):
     放大(execution_max_spread_points設定)，比sl_points那組更直接、即時。
     兩者都不提供的話都不會做對應的檢查(向後相容既有呼叫方式)。
     """
+    # 讀不到平倉紀錄就不知道今天虧多少、連虧幾筆(第8條r47)：以前讀取失敗被當成「沒有交易」，
+    # 斷路器永遠不會觸發。讀不到就暫停真實下單、照節奏推播、恢復通知
+    if db.is_enabled():
+        ok_hist, hist_err = db.load_closed_paper_trades(limit=1, engine_id=engine.engine_id)
+        if not ok_hist:
+            _history_read_failed(hist_err)
+            return False, f"讀不到平倉紀錄(資料庫)，不知道今天虧多少、連虧幾筆，暫停真實下單：{hist_err}", "history_unreadable"
+        _history_read_ok()
     if _manual_halt["active"]:
         return False, f"手動緊急停止中({_manual_halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"
 

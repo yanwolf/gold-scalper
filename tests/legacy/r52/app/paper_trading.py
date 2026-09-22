@@ -16,6 +16,7 @@
 """
 
 import os
+import functools
 import threading
 import time
 import logging
@@ -45,6 +46,33 @@ MAX_MEMORY_TRADES = 500  # 沒有資料庫時，最多在記憶體保留這麼�
 
 
 OPEN_PENDING_SECONDS = 180  # 開倉回應不明時，保留待確認的期限(第3條，r13)
+OP_LOCK_WAIT = 10.0   # 網頁操作等引擎操作鎖的上限(秒)，等不到就回「背景正在處理」(第8條r48)
+
+
+def _engine_op(web=False):
+    """
+    引擎操作鎖(第8條r48)：會動部位、又會查交易所的步驟(對帳、數量比對、停損守衛、掛停損、認領、重試平倉、平倉、開倉、
+    手動平倉)共用一把可重入鎖。背景流程查交易所的幾秒之間，網頁手動平倉不能同時進來改部位。
+    鎖加在函式本身(不是加在背景迴圈的某一個呼叫端，否則直接呼叫這些函式時照樣交錯)。
+    web=True：網頁那邊等鎖有上限，拿不到就回「背景正在處理」，不讓請求一直掛著。
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            if web:
+                if not self._op_lock.acquire(timeout=OP_LOCK_WAIT):
+                    return False, f"背景正在處理這個部位(查交易所中)，{OP_LOCK_WAIT:.0f} 秒內等不到，請稍後再試"
+            else:
+                self._op_lock.acquire()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                self._op_lock.release()
+        wrapper._engine_op = True
+        return wrapper
+    return deco
+
+
 QTY_CHECK_EVERY_TICKS = 4
 FILL_PAGE_SIZE = 1000      # 成交明細每頁筆數(幣安上限1000)
 FILL_MAX_PAGES = 10        # 界線之後超過這麼多頁就當成沒拿完、記未知(第8條r37)   # 每4輪(約60秒)比對一次交易所數量(第8條減碼偵測；第6條限流)
@@ -86,6 +114,7 @@ class PaperTradingEngine:
 
         # 可重入(第8條r37)：存檔/讀檔失敗的推播路徑若回頭拿同一把鎖，不可重入的Lock會讓整支程式卡住
         self._lock = threading.RLock()
+        self._op_lock = threading.RLock()  # 引擎操作鎖(第8條r48)，見 _engine_op
         self._position = None
         self._closed_trades_memory = deque(maxlen=MAX_MEMORY_TRADES)
         self._thread = None
@@ -145,6 +174,7 @@ class PaperTradingEngine:
         """移動停損更新時：一樣交給_sync_backstop(它會比對想要的價位跟實際掛著的)。"""
         self._sync_backstop(position)
 
+    @_engine_op()
     def _sync_backstop(self, position, known_qty=None):
         """
         讓交易所的backstop停損單對齊「目前想要的停損價」(程式內sl_price)。
@@ -427,6 +457,7 @@ class PaperTradingEngine:
             if self._position is pos and not pos.get("_closing"):
                 self._run_step("停損守衛", self._check_backstop_present, pos)
 
+    @_engine_op()
     def _check_backstop_present(self, pos):
         """
         停損守衛(第2條、第1條r15/r16)：交易所停損單還在嗎？App手動撤掉、或其他原因消失時，
@@ -569,6 +600,7 @@ class PaperTradingEngine:
         vwap = sum(float(t["price"]) * float(t["qty"]) for t in take) / q
         return "ok", round(vwap, 6), round(q, 6), int(take[-1]["id"]), ""
 
+    @_engine_op()
     def _resolve_open_pending(self, position):
         """
         開倉回應不明(逾時/5xx)時保留的pending(第3條r12/r13)。每輪查一次：
@@ -635,6 +667,7 @@ class PaperTradingEngine:
             )
         logger.error(f"平倉未確認成交({self.label}, 第{n}次)，保留部位每輪重試: {error}")
 
+    @_engine_op()
     def _retry_pending_close(self):
         position = self._position
         if not position or not position.get("pending_close"):
@@ -645,6 +678,7 @@ class PaperTradingEngine:
         self._close_position(position, _latest_price() or pc.get("price"), pc.get("reason", "待平倉重試"))
         return "closed" if self._position is not position else "still_pending"
 
+    @_engine_op()
     def _check_exchange_quantity(self, position):
         """
         比對交易所數量與帳上數量(第8條r12/r13)：沒有交易所停利單也要做——App手動減碼、
@@ -941,6 +975,7 @@ class PaperTradingEngine:
         self._run_step("讀取持倉紀錄", self._load_state)
         return self._seeded_from_db
 
+    @_engine_op()
     def _open_position(self, signal_result, current_price, sl_points):
         if not self._seeded_from_db:
             # 持倉紀錄還沒載入：不知道有沒有部位，不能開新倉(第8條r37)
@@ -948,6 +983,10 @@ class PaperTradingEngine:
         if not settings_module.settings_loaded():
             # 交易設定還沒載入：會用預設值交易(引擎專屬覆寫不見)，不能開新倉(第8條r43)
             return "settings_not_loaded"
+        if self._position is not None:
+            # 拿到引擎鎖之後再檢查一次(第8條r50/r51)：鎖只讓兩次開倉排隊，第二次等到鎖之後照樣會送單、
+            # 記帳時把原本那筆蓋掉(停損、停利從此沒人管)。呼叫端事先看過沒部位不夠
+            return "already_has_position"
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,
@@ -1215,6 +1254,7 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
+    @_engine_op(web=True)
     def force_close(self, reason="手動緊急平倉"):
         """
         正式端控制面板用：不等訊號、不等停損，立刻以最新成交價把這個引擎的部位平掉
@@ -1238,6 +1278,7 @@ class PaperTradingEngine:
             return False, "平倉單沒有確認成交，已保留部位與交易所停損，系統每輪自動重試並會發Telegram"
         return True, f"已以 {price} 平倉({reason})"
 
+    @_engine_op()
     def _close_position(self, position, exit_price, exit_reason, bid=None, ask=None, book_stale=None):
         """
         平倉的外層保護(第8條r22「except 不能把已經做完的動作當成沒做」)。以「帳上紀錄結掉」為界：

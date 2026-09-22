@@ -661,10 +661,10 @@ def get_open_paper_trade(engine_id="chan_profile_60"):
     return pos if ok else None
 
 
-def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
+def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
     """撈最近N筆已平倉的模擬單(限定某個引擎)，由新到舊排序，給績效統計用。"""
     if not _enabled:
-        return []
+        return True, []
 
     try:
         conn = _pool.getconn()
@@ -691,7 +691,7 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
         finally:
             _pool.putconn(conn)
 
-        return [
+        return True, [
             {
                 "direction": r[0], "entry_price": r[1],
                 "entry_time": r[2].isoformat() if r[2] else None,
@@ -723,8 +723,16 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
             for r in rows
         ]
     except Exception as e:
+        # 讀取失敗≠沒有交易(第8條r47)：以前回[]，風控就當成「今天沒虧、沒連虧」，斷路器永遠不會觸發
         logger.error(f"讀取模擬單歷史失敗: {e}")
-        return []
+        return False, f"{type(e).__name__}: {e}"
+
+
+def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
+    """舊介面：讀不到時回[]——分不出「讀取失敗」與「沒有交易」。需要分辨的地方(風控)用 load_closed_paper_trades。"""
+    ok, rows = load_closed_paper_trades(limit=limit, engine_id=engine_id)
+    return rows if ok else []
+
 
 
 def update_paper_trade_real_open(trade_id, executed, quantity=None):
