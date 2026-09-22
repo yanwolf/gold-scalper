@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r44 第1、2、3、7、8、14、15條的每一個檢查項目。
+涵蓋 r7→r48 第1、2、3、7、8、14、15條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -45,7 +45,10 @@ def one(alerts, title):
 
 import copy as _copy
 import importlib as _importlib
-_STATE_MODULES = ("app.db", "app.execution", "app.main", "app.notifier", "app.settings", "app.risk_guard", "app.preflight")
+import pkgutil as _pkgutil
+import app as _app_pkg
+# app/ 底下所有模組都納入(r48：沒列進清單的模組就不會被還原——不靠列舉)
+_STATE_MODULES = tuple(f"app.{m.name}" for m in _pkgutil.iter_modules(_app_pkg.__path__))
 # 匯入時把每個模組層級(底線開頭)的 dict／list／set 存一份初始值，_reset_module_state 一律還原(用法第5點r44)：
 # 不用記得「新增的狀態要加進重設」——r38、r41 都漏過
 _STATE_SNAPSHOT = []
@@ -1671,7 +1674,7 @@ class FrameworkState(unittest.TestCase):
     def test_reset_restores_every_module_level_container(self):
         import importlib
         names = []
-        for mod_name in ("app.db", "app.execution", "app.main", "app.notifier", "app.settings", "app.risk_guard", "app.preflight"):
+        for mod_name in _STATE_MODULES:
             mod = importlib.import_module(mod_name)
             for k, v in vars(mod).items():
                 if k.startswith("_") and not k.startswith("__") and isinstance(v, (dict, list, set)):
@@ -1685,6 +1688,85 @@ class FrameworkState(unittest.TestCase):
         _reset_module_state()
         dirty = [f"{mod.__name__}.{k}" for mod, k in names if "__probe__" in (getattr(mod, k) if not isinstance(getattr(mod, k), dict) else getattr(mod, k).keys())]
         self.assertEqual(dirty, [], "框架重設沒有還原這些模組層級狀態")
+
+
+# ------------------------------------------------------------------ r46 → r48
+class Lesson48(ExecHarness):
+    # 8b：風控讀不到平倉紀錄，不能當成「沒有交易」(斷路器永遠不會觸發)
+    def test_r47_risk_guard_read_failure_blocks_real_orders(self):
+        from app import risk_guard as RG
+        class Down:
+            def getconn(s): raise RuntimeError("inj-risk-read")
+            def putconn(s, c): pass
+        pushed = []
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", Down(), create=True), \
+             mock.patch.object(pt.notifier_module.notifier, "send_raw_message", side_effect=pushed.append):
+            allowed, reason, kind = RG.check(self.eng, 0.1, sl_points=10.0, bid=4390.0, ask=4390.1)
+        self.assertIs(allowed, False, "讀不到平倉紀錄：不知道今天虧多少、連虧幾筆，不能放行真實下單")
+        self.assertIn("讀不到", str(reason))
+        self.assertIn("inj-risk-read", one(pushed, "風控讀不到平倉紀錄"))
+
+    # 8c：背景流程查交易所的幾秒之間，網頁手動平倉不能同時進來
+    def test_r48_manual_close_waits_for_background_step(self):
+        import threading
+        eng = self.eng
+        self.assertTrue(hasattr(pt, "OP_LOCK_WAIT"), "前提：程式有「引擎操作鎖」(在舊版上是斷言失敗、不是崩掉)")
+        pos = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, real_open_baseline=0.0, backstop_algo_id="B1")
+        eng._position = pos
+        in_query, release, order = threading.Event(), threading.Event(), []
+        def slow_rows(*a, **k):
+            order.append("背景查交易所")
+            in_query.set()
+            release.wait(3)
+            return True, _rows(0.1)
+        def background():
+            with mock.patch.object(ex, "get_position_info", side_effect=slow_rows):
+                eng._check_exchange_quantity(pos)
+            order.append("背景完成")
+        bg = threading.Thread(target=background, daemon=True)
+        with mock.patch.object(pt, "OP_LOCK_WAIT", 0.3, create=True), \
+             mock.patch.object(pt, "_latest_price", return_value=4380.0), \
+             mock.patch.object(ex, "close_position", return_value=(True, {"executedQty": "0.100", "avgPrice": "4380"})) as cp, \
+             mock.patch.object(eng, "_cancel_backstop", return_value=False):
+            bg.start()
+            self.assertTrue(in_query.wait(2), "前提：背景那條真的停在查交易所")
+            ok, msg = eng.force_close()
+            order.append("手動平倉回應")
+            release.set()
+            bg.join(3)
+        self.assertEqual(cp.call_count, 0, "背景還在處理時，手動平倉不能同時送單")
+        self.assertIs(ok, False)
+        self.assertIn("背景正在處理", msg, "等不到鎖要回講明，不能讓請求一直掛著")
+        self.assertEqual(order, ["背景查交易所", "手動平倉回應", "背景完成"], order)
+        self.assertIs(eng._position, pos, "部位還在，沒被動到")
+
+    def test_r48_lock_is_on_the_functions_not_a_caller(self):
+        """鎖加在函式本身(裝飾器)，不是只加在背景迴圈的某一個呼叫端(r48 pump-dump-hunter 第一次就只加在呼叫端)。"""
+        names = ["_check_exchange_quantity", "_check_backstop_present", "_sync_backstop", "_resolve_open_pending",
+                 "_retry_pending_close", "force_close", "_close_position", "_open_position"]
+        unlocked = [n for n in names if not getattr(getattr(pt.PaperTradingEngine, n), "_engine_op", False)]
+        self.assertTrue(hasattr(pt, "OP_LOCK_WAIT"), "前提：程式有「引擎操作鎖」")
+        self.assertEqual(unlocked, [], "這些會動部位、又會查交易所的函式沒有套引擎鎖")
+
+
+class WebBodies(unittest.TestCase):
+    """8a：真的打端點，確認不是物件的請求內容進不到程式(不只看型別宣告)。"""
+    def test_r47_non_object_bodies_are_rejected_before_code(self):
+        from fastapi.testclient import TestClient
+        import app.main as m
+        c = TestClient(m.app)
+        with mock.patch.object(m.settings_module, "update_settings") as us, \
+             mock.patch.object(m.settings_module, "update_engine_overrides") as ueo, \
+             mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)) as vp:
+            codes = {}
+            for path in ("/settings", "/settings/import", "/control/flatten", "/execution/test-order"):
+                for body in ("null", "[]", '"x"'):
+                    r = c.post(path, content=body, headers={"content-type": "application/json"})
+                    codes[(path, body)] = r.status_code
+                codes[(path, "(沒帶)")] = c.post(path).status_code
+        self.assertGreater(len(codes), 10, "前提：真的打了這些端點")
+        self.assertEqual({k: v for k, v in codes.items() if v != 422}, {}, "不是物件、或沒帶內容：要在進程式之前就被擋下")
+        self.assertEqual((us.call_count, ueo.call_count, vp.call_count), (0, 0, 0), "一次都沒有進到程式")
 
 
 class StaticChecks(unittest.TestCase):

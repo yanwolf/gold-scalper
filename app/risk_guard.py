@@ -184,6 +184,32 @@ def get_manual_halt():
     return dict(_manual_halt)
 
 
+_history_fail = {"n": 0}
+
+
+def _history_read_failed(err):
+    _history_fail["n"] += 1
+    n = _history_fail["n"]
+    try:
+        from app import alert_cadence
+        from app.notifier import notifier
+        if alert_cadence.should_alert(n):
+            notifier.send_raw_message(f"⚠️ 風控讀不到平倉紀錄(資料庫)(第 {n} 次)\n錯誤：{err}\n暫停真實下單(模擬單照常)，每次要下單時重試")
+    except Exception:
+        pass
+
+
+def _history_read_ok():
+    n = _history_fail["n"]
+    _history_fail["n"] = 0
+    if n:
+        try:
+            from app.notifier import notifier
+            notifier.send_raw_message(f"✅ 風控讀得到平倉紀錄了(失敗 {n} 次後)，恢復真實下單")
+        except Exception:
+            pass
+
+
 def check(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
@@ -205,6 +231,14 @@ def check(engine, quantity, sl_points=None, bid=None, ask=None):
     放大(execution_max_spread_points設定)，比sl_points那組更直接、即時。
     兩者都不提供的話都不會做對應的檢查(向後相容既有呼叫方式)。
     """
+    # 讀不到平倉紀錄就不知道今天虧多少、連虧幾筆(第8條r47)：以前讀取失敗被當成「沒有交易」，
+    # 斷路器永遠不會觸發。讀不到就暫停真實下單、照節奏推播、恢復通知
+    if db.is_enabled():
+        ok_hist, hist_err = db.load_closed_paper_trades(limit=1, engine_id=engine.engine_id)
+        if not ok_hist:
+            _history_read_failed(hist_err)
+            return False, f"讀不到平倉紀錄(資料庫)，不知道今天虧多少、連虧幾筆，暫停真實下單：{hist_err}", "history_unreadable"
+        _history_read_ok()
     if _manual_halt["active"]:
         return False, f"手動緊急停止中({_manual_halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"
 

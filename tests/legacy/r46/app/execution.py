@@ -702,7 +702,21 @@ def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
 # 「結果不明」的送單回應(BINANCE_LESSONS.md第3條，r12)：網路逾時、連線中斷(回傳字串)、
 # 幣安的未知錯誤/逾時碼。這些情況單可能其實已經成交，不能當成送單失敗。
 # 只有交易所明確拒絕(4xx帶其他錯誤碼)才是確定沒成交。
-AMBIGUOUS_CODES = (-1000, -1001, -1006, -1007)
+AMBIGUOUS_CODES = (-1000, -1001, -1006, -1007, "UNCONFIRMED")
+FINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH")
+ORDER_CONFIRM_POLLS = 5          # 送單後沒確認成交時，最多再查幾次訂單
+ORDER_CONFIRM_INTERVAL = 0.3     # 每次間隔(秒)
+
+
+def extract_filled_qty(order_result):
+    """訂單回應裡交易所確認的成交量(executedQty)；沒有或格式不對回None。"""
+    if not isinstance(order_result, dict):
+        return None
+    try:
+        q = float(order_result.get("executedQty") or 0)
+    except (TypeError, ValueError):
+        return None
+    return q if q > 0 else None
 
 
 def is_ambiguous_result(result):
@@ -789,6 +803,9 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
         "side": side,
         "type": "MARKET",
         "quantity": quantity,
+        # 幣安期貨下單預設回應是ACK：只回「收到了」(status NEW、executedQty 0、沒有avgPrice)。
+        # 實盤2026-09-22 00:00開倉就是這樣——程式當成已成交、但沒有成交價。要求RESULT，回應直接帶成交結果
+        "newOrderRespType": "RESULT",
     }
     if position_side:
         params["positionSide"] = position_side
@@ -808,6 +825,32 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     # 會誤判成「幣安沒有回傳成交價」而完全無法計算。這裡在偵測到avgPrice缺失
     # 時，短暫等待後重新查詢一次訂單狀態，拿確認後的實際成交價，只重試一次
     # (不無限重試，避免真的有問題時卡住整個下單流程太久)(修正記錄見README)。
+    # 沒確認成交(ACK或撮合回填慢)：多查幾次訂單。還是沒確認就不能回報成功——平倉時「成功」代表
+    # 會直接撤交易所停損、結帳。改回「結果不明」，交給呼叫端查部位確認(開倉：看得到就認領；平倉：確認沒了才結帳)
+    # 不是最終狀態(NEW、部分成交)：多查幾次；還不是就撤掉那張單再查一次拿最終成交量(第15條r43/r44：
+    # 卡在NEW放著不管，之後才成交的數量沒人知道，平倉單還會跟下一輪重試的平倉單重疊)
+    if success and isinstance(result, dict) and result.get("orderId") and result.get("status") not in FINAL_ORDER_STATES:
+        oid = result["orderId"]
+        for _ in range(ORDER_CONFIRM_POLLS):
+            time.sleep(ORDER_CONFIRM_INTERVAL)
+            ok_s, polled = get_order_status(symbol, oid, account=account)
+            if ok_s and isinstance(polled, dict):
+                result = polled
+                if polled.get("status") in FINAL_ORDER_STATES:
+                    break
+        if result.get("status") not in FINAL_ORDER_STATES:
+            logger.error(f"訂單{oid}查{ORDER_CONFIRM_POLLS}次仍是{result.get('status')}，撤單後再查一次")
+            _signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": oid}, account=account)
+            ok_s, polled = get_order_status(symbol, oid, account=account)
+            if ok_s and isinstance(polled, dict) and polled.get("status") in FINAL_ORDER_STATES:
+                result = polled
+            else:
+                return False, {"code": "UNCONFIRMED", "msg": f"送出後查不到最終狀態、撤單後也查不到，結果不明",
+                               "orderId": oid, "last": result}
+    # 最終狀態而成交0(EXPIRED、CANCELED、REJECTED)：交易所明確說沒成交，不是結果不明(第15條r43)
+    if success and isinstance(result, dict) and result.get("status") in FINAL_ORDER_STATES and extract_filled_qty(result) is None:
+        return False, {"code": "NOT_FILLED", "msg": f"訂單最終狀態{result.get('status')}、成交0", "orderId": result.get("orderId")}
+
     if success and extract_fill_price(result) is None and isinstance(result, dict) and result.get("orderId"):
         logger.warning(f"訂單{result.get('orderId')}的avgPrice尚未填入(狀態:{result.get('status')})，0.5秒後重新查詢一次")
         time.sleep(0.5)

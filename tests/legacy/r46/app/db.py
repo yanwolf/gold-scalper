@@ -222,6 +222,11 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS fill_boundary_id BIGINT;
                 """)
+                # 損益是推估的(成交價查不到時用偵測當下的價格；使用者決定2026-09-22：用推估值、標示、照算)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS pnl_estimated BOOLEAN;
+                """)
                 cur.execute("""
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS backstop_used_legacy BOOLEAN;
@@ -529,7 +534,7 @@ def update_paper_trade_backstop(trade_id, backstop_algo_id, backstop_used_legacy
 
 def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points,
                        exit_expected_price=None, exit_actual_price=None,
-                       exit_slippage_points=None, exit_spread_points=None):
+                       exit_slippage_points=None, exit_spread_points=None, pnl_estimated=False):
     """
     把一筆開倉中的模擬單標記為已平倉。trade_id是None時(該筆單沒有db id)直接跳過。
     exit_expected_price等四個欄位是平倉時的滑價/價差資料，用法跟
@@ -547,13 +552,17 @@ def close_paper_trade(trade_id, exit_price, exit_time, exit_reason, pnl_points,
                     """
                     UPDATE paper_trades
                     SET status = 'closed', exit_price = %s, exit_time = %s,
-                        exit_reason = %s, pnl_points = %s,
-                        exit_expected_price = %s, exit_actual_price = %s,
-                        exit_slippage_points = %s, exit_spread_points = %s
+                        exit_reason = %s, pnl_points = %s, pnl_estimated = %s,
+                        exit_expected_price = COALESCE(%s, exit_expected_price),
+                        exit_actual_price = COALESCE(%s, exit_actual_price),
+                        exit_slippage_points = COALESCE(%s, exit_slippage_points),
+                        exit_spread_points = COALESCE(%s, exit_spread_points)
                     WHERE id = %s;
                     """,
+                    # COALESCE(實盤2026-09-22)：r25起平倉流程是「先送平倉單、寫出場成交價，最後才結帳」，
+                    # 這裡以前無條件覆寫，沒傳值就把剛寫進去的成交價與滑點清成空的——網頁因此寫「成交價查不到」
                     (
-                        exit_price, exit_time, exit_reason, pnl_points,
+                        exit_price, exit_time, exit_reason, pnl_points, bool(pnl_estimated),
                         exit_expected_price, exit_actual_price, exit_slippage_points, exit_spread_points,
                         trade_id,
                     ),
@@ -670,7 +679,7 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                            entry_book_stale, exit_book_stale,
                            real_open_executed, real_open_quantity,
                            entry_actual_price, exit_actual_price,
-                           sl_price, peak_price, trailing_active
+                           sl_price, peak_price, trailing_active, pnl_estimated
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -703,6 +712,12 @@ def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                 "real_pnl_usd": (
                     round(((r[18] - r[17]) if r[0] == "bullish" else (r[17] - r[18])) * (r[16] or 0), 2)
                     if r[15] and r[17] and r[18] and r[16] else None
+                ),
+                "pnl_estimated": bool(r[22]),
+                # 真實成交價缺漏時的推估值(使用者決定2026-09-22)：點數×張數，網頁標「估」、照算、分開計數
+                "real_pnl_usd_est": (
+                    round(r[6] * r[16], 2)
+                    if r[15] and r[16] and isinstance(r[6], (int, float)) and not (r[17] and r[18]) else None
                 ),
             }
             for r in rows
@@ -774,8 +789,10 @@ def update_paper_trade_exit_execution(trade_id, expected_price, actual_price, sl
                 cur.execute(
                     """
                     UPDATE paper_trades
-                    SET exit_expected_price = %s, exit_actual_price = %s,
-                        exit_slippage_points = %s, exit_spread_points = %s,
+                    SET exit_expected_price = COALESCE(%s, exit_expected_price),
+                        exit_actual_price = COALESCE(%s, exit_actual_price),
+                        exit_slippage_points = COALESCE(%s, exit_slippage_points),
+                        exit_spread_points = COALESCE(%s, exit_spread_points),
                         exit_book_stale = %s
                     WHERE id = %s;
                     """,
@@ -1033,6 +1050,24 @@ def get_slippage_stats_by_hour(engine_id="chan_profile_60"):
 # ---------------------------------------------------------------------------
 # 執行期可調整設定(app_settings) 持久化函式
 # ---------------------------------------------------------------------------
+
+def load_app_settings():
+    """讀全部設定：(ok, {key: value})。讀取失敗≠沒有設定(第8條r43)。沒有資料庫時(True, {})。"""
+    if not _enabled:
+        return True, {}
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value FROM app_settings;")
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return True, {r[0]: r[1] for r in rows}
+    except Exception as e:
+        logger.error(f"讀取設定失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
 
 def get_app_settings():
     """回傳目前資料庫裡存的所有設定，格式 {key: value(字串)}。沒有資料庫時回傳空dict。"""
