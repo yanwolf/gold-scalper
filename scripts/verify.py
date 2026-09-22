@@ -35,7 +35,7 @@ else:
          f"金絲雀{'有' if 'undefined_canary_name' in canary else '沒有'}報出、掃到main.py已知誤報、問題 {len(bad)} 項 {bad[:3]}")
 
 # 2. 行為測試＋測試靜態檢查：要全部通過、數量達標
-r = run([PY, "-m", "unittest", "tests.test_lessons", "tests.check_tests", "tests.check_indexing"])
+r = run([PY, "-m", "unittest", "tests.test_lessons", "tests.check_tests", "tests.check_indexing", "tests.check_newapi"])
 ran = next((int(l.split()[1]) for l in r.stderr.splitlines() if l.startswith("Ran ")), 0)
 step("行為測試＋靜態檢查", r.returncode == 0 and ran >= 60, f"執行 {ran} 項，{'全部通過' if r.returncode == 0 else r.stderr.strip().splitlines()[-1]}")
 
