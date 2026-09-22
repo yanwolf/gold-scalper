@@ -227,6 +227,33 @@ async def control_resume(payload: dict = Body(...)):
 _web_trade_errors = {}
 
 
+def hold_account_engines(fn):
+    """
+    網頁手動測試下單(第8條r50/r51)：送單前把同一個帳戶每個引擎的操作鎖都拿到，一直拿到送單結束——
+    引擎不能在「檢查有沒有部位」與「送出」之間自己開倉。等不到回「背景正在處理」。
+    有沒有部位的檢查在函式裡、通過密碼之後做(鎖已經拿著)。
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        from app import paper_trading as _pt
+        payload = kwargs.get("payload", args[0] if args else {}) or {}
+        account = payload.get("account", "gold") if isinstance(payload, dict) else "gold"
+        held = []
+        try:
+            for e in PAPER_TRADING_ENGINES.values():
+                lk = getattr(e, "_op_lock", None)
+                if getattr(e, "execution_account", None) != account or lk is None:
+                    continue
+                if not lk.acquire(timeout=_pt.OP_LOCK_WAIT):
+                    return {"success": False, "error": f"引擎 {e.label} 背景正在處理(查交易所中)，請幾秒後再試"}
+                held.append(lk)
+            return await fn(*args, **kwargs)
+        finally:
+            for lk in held:
+                lk.release()
+    return wrapper
+
+
 def guard_trade(op):
     def deco(fn):
         @functools.wraps(fn)
@@ -734,6 +761,7 @@ async def execution_set_leverage(payload: dict = Body(...)):
 
 @app.post("/execution/test-order")
 @guard_trade("手動測試下單")
+@hold_account_engines
 async def execution_test_order(payload: dict = Body(...)):
     """
     手動測試下單：payload格式 {"password": "...", "direction": "bullish"/"bearish",
@@ -754,6 +782,12 @@ async def execution_test_order(payload: dict = Body(...)):
         return {"success": False, "error": error}
 
     account = payload.get("account", "gold")
+    # 引擎有部位時不能手動再開(第8條r50/r51)：交易所上會多一張程式不知道的部位，之後的數量比對、平倉都會亂。
+    # 同帳戶引擎的操作鎖已經由 hold_account_engines 拿著，這裡看到的狀態在送單前不會變
+    has_pos = [e.label for e in PAPER_TRADING_ENGINES.values()
+               if getattr(e, "execution_account", None) == account and getattr(e, "_position", None) is not None]
+    if has_pos:
+        return {"success": False, "error": f"帳戶 {account} 的引擎({', '.join(has_pos)})目前有部位，手動測試下單會多一張程式不知道的部位，已擋下"}
     # 持倉紀錄沒載入時手動下單也要擋(第8條r39)：「沒載入不開倉」寫在引擎裡，這支是直接送單、不經過引擎。
     # (手動測試平倉不擋：那是減少風險的動作)
     not_loaded = [e.label for e in PAPER_TRADING_ENGINES.values()

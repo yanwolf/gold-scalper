@@ -1,6 +1,6 @@
 """
 BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程式上跑、確認會失敗，再修改到全部通過)。
-涵蓋 r7→r48 第1、2、3、7、8、14、15條的每一個檢查項目。
+涵蓋 r7→r51 第1、2、3、7、8、14、15條的每一個檢查項目。
 
 斷言分類(用法第5點r19)：
   正向斷言(「有送單」「數量＝0.05」「有告警」)——程式什麼都沒做會失敗，不會空跑。
@@ -992,7 +992,8 @@ class Lesson28(ExecHarness):
         self.assertEqual(st["win_rate"], 50.0, "1勝1負；損益未知那筆不能算成虧損拉低勝率")
         self.assertEqual(st.get("unknown_pnl_trades"), 1, "損益未知的筆數要另外計")
 
-    def test_t8b_risk_guard_unknown_pnl_not_counted_as_loss(self):
+    def test_t8b_risk_guard_unknown_pnl_counted_as_loss_and_reported(self):
+        """r29 原本是「未知不算虧損、另外計數」；r50 起斷路器把未知當成一次虧損(只會更早停)，筆數照樣回報。"""
         from app import risk_guard as RG
         class Eng:
             _closed_trades_memory = [{"exit_time": "2026-09-21T01:00:00+00:00", "pnl_points": -1.0},
@@ -1001,7 +1002,7 @@ class Lesson28(ExecHarness):
         with mock.patch.object(RG.db, "is_enabled", return_value=False):
             n = RG.get_consecutive_losses(Eng())
             unknown = RG.get_unknown_pnl_count(Eng())
-        self.assertEqual(n, 1, "最新那筆損益未知，不能算成一筆虧損")
+        self.assertEqual(n, 2, "最新那筆損益未知：斷路器當成一次虧損(r50)，連續虧損2筆")
         self.assertEqual(unknown, 1)
 
     def test_t8c_partial_reduction_without_fills_is_estimated_and_labeled(self):
@@ -1747,6 +1748,153 @@ class Lesson48(ExecHarness):
         unlocked = [n for n in names if not getattr(getattr(pt.PaperTradingEngine, n), "_engine_op", False)]
         self.assertTrue(hasattr(pt, "OP_LOCK_WAIT"), "前提：程式有「引擎操作鎖」")
         self.assertEqual(unlocked, [], "這些會動部位、又會查交易所的函式沒有套引擎鎖")
+
+
+class NoLock:
+    """什麼都不擋的假鎖(對照組用，r50/r51)：同樣的情境換上它必須出事，才證明原本不出事是鎖擋下的。"""
+    def acquire(self, *a, **k): return True
+    def release(self): pass
+
+
+class Lesson51(ExecHarness):
+    def _signal(self):
+        return {"direction": "bullish", "bid": 4389.9, "ask": 4390.0, "chan": {"reason": "t"}, "profile": {"reason": "t"}}
+
+    def _open_patches(self, open_side_effect, rows_side_effect):
+        return [mock.patch.object(pt.risk_guard, "check", return_value=(True, None, None)),
+                mock.patch.object(ex, "resolve_position_mode", return_value=(False, None)),
+                mock.patch.object(ex, "set_margin_type", return_value=(True, {})),
+                mock.patch.object(ex, "set_leverage", return_value=(True, {})),
+                mock.patch.object(ex, "open_position", side_effect=open_side_effect),
+                mock.patch.object(ex, "get_position_info", side_effect=rows_side_effect),
+                mock.patch.object(self.eng, "_sync_backstop")]
+
+    # 8a：開倉函式本身、拿到鎖之後，再檢查一次「已經有部位」
+    def test_r51_open_rechecks_existing_position_inside(self):
+        eng = self.eng
+        existing = _pos(real_open_quantity=0.1, real_open_executed=True)
+        eng._position = existing
+        ps = self._open_patches(lambda **k: (True, {"avgPrice": "4390", "executedQty": "0.100", "orderId": 1}),
+                                lambda *a, **k: (True, _rows(0)))
+        for p in ps: p.start()
+        try:
+            res = eng._open_position(self._signal(), 4390.0, 10.0)
+            sent = ex.open_position.call_count
+        finally:
+            for p in ps: p.stop()
+        self.assertIs(eng._position, existing, "原本那筆不能被蓋掉(停損、停利會沒人管)")
+        self.assertEqual(sent, 0, "已經有部位：不能再送進場單")
+        self.assertEqual(res, "already_has_position")
+
+    def _race_two_opens(self):
+        """
+        兩條執行緒同時開倉：第一條停在「寫資料庫」(再檢查之後、記上部位之前的那一步 I/O)，第二條同時進來。
+        回傳送出的進場單數。停在查交易所沒有用——那時部位已經記上了，再檢查自己就擋得住，證明不了鎖。
+        """
+        import threading
+        eng = self.eng
+        eng._position = None
+        in_query, release, sent = threading.Event(), threading.Event(), []
+        def slow_insert(position):
+            if not in_query.is_set():
+                in_query.set()
+                release.wait(2)
+            return None
+        def rows(*a, **k):
+            return True, _rows(0)
+        def fake_open(**k):
+            sent.append(1)
+            return True, {"avgPrice": "4390", "executedQty": "0.100", "orderId": len(sent)}
+        ps = self._open_patches(fake_open, rows) + [mock.patch.object(pt.db, "insert_open_paper_trade", side_effect=slow_insert)]
+        for p in ps: p.start()
+        try:
+            t1 = threading.Thread(target=lambda: eng._open_position(self._signal(), 4390.0, 10.0), daemon=True)
+            t1.start()
+            self.assertTrue(in_query.wait(2), "前提：第一條真的停在寫資料庫(再檢查之後、記上部位之前)")
+            t2 = threading.Thread(target=lambda: eng._open_position(self._signal(), 4390.0, 10.0), daemon=True)
+            t2.start()
+            t2.join(0.5)
+            release.set()
+            t1.join(3); t2.join(3)
+        finally:
+            for p in ps: p.stop()
+        return len(sent)
+
+    def test_r51_two_concurrent_opens_send_one_order(self):
+        self.assertTrue(hasattr(self.eng, "_op_lock"), "前提：程式有引擎操作鎖(在舊版上是斷言失敗、不是崩掉)")
+        self.assertEqual(self._race_two_opens(), 1, "同時開同一個引擎：只能送一張進場單")
+
+    def test_r51_control_without_lock_two_orders_are_sent(self):
+        """對照組：換上什麼都不擋的假鎖，同樣的情境必須送出兩張——證明上一項是鎖擋下的，不是剛好沒交錯。"""
+        self.assertTrue(hasattr(self.eng, "_op_lock"), "前提：程式有引擎操作鎖")
+        with mock.patch.object(self.eng, "_op_lock", NoLock()):
+            self.assertEqual(self._race_two_opens(), 2, "沒有鎖時兩條都送了單：這個情境真的會交錯")
+
+    def test_r51_control_manual_close_without_lock_sends_during_background(self):
+        """r48 手動平倉那項的對照組：沒有鎖時，背景查交易所期間手動平倉會同時送單。"""
+        import threading
+        eng = self.eng
+        self.assertTrue(hasattr(eng, "_op_lock"), "前提：程式有引擎操作鎖")
+        pos = _pos(real_open_quantity=0.1, entry_actual_price=4391.0, real_open_baseline=0.0, backstop_algo_id="B1")
+        eng._position = pos
+        in_query, release = threading.Event(), threading.Event()
+        def slow_rows(*a, **k):
+            in_query.set(); release.wait(2)
+            return True, _rows(0.1)
+        def background():
+            with mock.patch.object(ex, "get_position_info", side_effect=slow_rows):
+                eng._check_exchange_quantity(pos)
+        from app.binance_client import binance_streamer
+        with mock.patch.object(eng, "_op_lock", NoLock()), \
+             mock.patch.object(pt, "_latest_price", return_value=4380.0), \
+             mock.patch.object(binance_streamer, "get_recent_trades", return_value=[{"price": 4380.0}]), \
+             mock.patch.object(ex, "close_position", return_value=(True, {"executedQty": "0.100", "avgPrice": "4380"})) as cp, \
+             mock.patch.object(eng, "_cancel_backstop", return_value=False):
+            bg = threading.Thread(target=background, daemon=True)
+            bg.start()
+            self.assertTrue(in_query.wait(2), "前提：背景那條真的停在查交易所")
+            eng.force_close()
+            sent_during = cp.call_count
+            release.set(); bg.join(3)
+        self.assertEqual(sent_during, 1, "沒有鎖時，背景還在查交易所、手動平倉就送出了：r48那項確實是鎖擋下的")
+
+    # 8a：網頁手動測試下單也要看引擎有沒有部位(拿到引擎鎖之後)
+    def test_r51_manual_test_order_blocked_when_engine_has_position(self):
+        import asyncio
+        import app.main as m
+        eng = self.eng
+        eng._position = _pos(real_open_quantity=0.1, real_open_executed=True)
+        with mock.patch.object(m.settings_module, "verify_password", return_value=(True, None)) as vp, \
+             mock.patch.object(ex, "open_position", return_value=(True, {"avgPrice": "4391", "executedQty": "0.100"})) as op:
+            res = asyncio.run(m.execution_test_order({"password": "x", "direction": "bullish", "quantity": 0.1,
+                                                     "account": eng.execution_account, "confirm_live": True}))
+        self.assertTrue(vp.called, "前提：通過了密碼檢查，擋下的是部位這一關")
+        self.assertEqual(op.call_count, 0, "引擎有部位時手動下單會多一張程式不知道的部位")
+        self.assertIn("部位", str(res.get("error")), res)
+
+    # 8b：斷路器把每筆損益未知當成一次完整停損(-1R)，只會更早停
+    def test_r50_breaker_counts_unknown_pnl_as_full_stop(self):
+        from app import risk_guard as RG
+        today = datetime_now_iso()
+        eng = self.eng
+        eng._closed_trades_memory.clear()
+        eng._closed_trades_memory.extend([
+            {"exit_time": today, "pnl_points": -1.0, "entry_price": 4390.0, "sl_price": 4380.0},
+            {"exit_time": today, "pnl_points": None, "entry_price": 4390.0, "sl_price": 4360.0},   # 未知：停損距離30
+        ])
+        st = dict(pt.settings_module.get_settings(engine_id=eng.engine_id))
+        st.update(paper_sl_points=8.0)
+        with mock.patch.object(RG.db, "is_enabled", return_value=False), \
+             mock.patch.object(RG.settings_module, "get_settings", return_value=st):
+            daily = RG.get_daily_pnl_usd(eng, 0.1)
+            streak = RG.get_consecutive_losses(eng)
+        self.assertAlmostEqual(daily, (-1.0 - 30.0) * 0.1, places=6, msg="未知那筆以一次停損(停損距離30)計")
+        self.assertEqual(streak, 2, "未知那筆算一次虧損，連續虧損2筆")
+
+
+def datetime_now_iso():
+    from datetime import datetime as _d, timezone as _tz
+    return _d.now(_tz.utc).isoformat()
 
 
 class WebBodies(unittest.TestCase):

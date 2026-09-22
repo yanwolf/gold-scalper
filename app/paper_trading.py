@@ -983,6 +983,10 @@ class PaperTradingEngine:
         if not settings_module.settings_loaded():
             # 交易設定還沒載入：會用預設值交易(引擎專屬覆寫不見)，不能開新倉(第8條r43)
             return "settings_not_loaded"
+        if self._position is not None:
+            # 拿到引擎鎖之後再檢查一次(第8條r50/r51)：鎖只讓兩次開倉排隊，第二次等到鎖之後照樣會送單、
+            # 記帳時把原本那筆蓋掉(停損、停利從此沒人管)。呼叫端事先看過沒部位不夠
+            return "already_has_position"
         position = trading_core.open_position(
             direction=signal_result["direction"],
             current_price=current_price,

@@ -327,7 +327,7 @@ async def settings_import(payload: dict = Body(...)):
     if not ok:
         return {"success": False, "error": error}
     ps = payload.get("param_set") or {}
-    if ps.get("format") != "gold-scalper-param-set/1" or not isinstance(ps.get("params"), dict):
+    if not isinstance(ps, dict) or ps.get("format") != "gold-scalper-param-set/1" or not isinstance(ps.get("params"), dict) or not ps.get("params"):
         return {"success": False, "error": "參數集格式不正確(需要 format=gold-scalper-param-set/1 和 params)"}
     engine_id = payload.get("engine_id") or ps.get("engine_id")
     engine = PAPER_TRADING_ENGINES.get(engine_id)
@@ -478,7 +478,10 @@ async def update_settings(payload: dict = Body(...)):
     if not ok:
         return {"success": False, "error": error}
 
-    values = payload.get("values", {})
+    values = payload.get("values")
+    if not isinstance(values, dict) or not values:
+        # 格式錯或空的不能當成「沒有要改的」照樣回成功(第8條r44)
+        return {"success": False, "error": "values 必須是非空的 {欄位: 值}，這次沒有改任何設定"}
     try:
         updated = settings_module.update_settings(values)
     except settings_module.SettingsValidationError as e:
@@ -519,6 +522,8 @@ async def update_engine_settings(engine_id: str, payload: dict = Body(...)):
         return {"success": False, "error": error}
     if engine_id not in PAPER_TRADING_ENGINES:
         return {"success": False, "error": f"沒有engine_id={engine_id}的追蹤引擎"}
+    if not isinstance(payload.get("values"), dict) or not payload.get("values"):
+        return {"success": False, "error": "values 必須是非空的 {欄位: 值}，這次沒有改任何設定"}
     try:
         applied, cleared = settings_module.update_engine_overrides(engine_id, payload.get("values", {}))
     except settings_module.SettingsValidationError as e:

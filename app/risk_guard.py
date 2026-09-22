@@ -25,6 +25,17 @@ from app import settings as settings_module
 logger = logging.getLogger("risk_guard")
 
 
+def _one_r(engine, trade):
+    """一次完整停損的點數：設定的停損點數與那筆「進場到停損價」的距離取較大者(保守)。"""
+    s = settings_module.get_settings(engine_id=engine.engine_id)
+    base = float(s.get("paper_sl_points") or 0)
+    try:
+        dist = abs(float(trade.get("entry_price")) - float(trade.get("sl_price")))
+    except (TypeError, ValueError):
+        dist = 0.0
+    return max(base, dist)
+
+
 def get_daily_pnl_usd(engine, quantity):
     """
     這個引擎今天(UTC日)已平倉損益，換算成美元(乘以quantity)。
@@ -46,9 +57,14 @@ def get_daily_pnl_usd(engine, quantity):
             exit_dt = datetime.fromisoformat(exit_time_str)
         except ValueError:
             continue
-        if exit_dt.date() == today and isinstance(t.get("pnl_points"), (int, float)):
-            # 損益未知的不加(不當成0)，筆數另外由get_unknown_pnl_count回報(第8條r27)
-            daily_pnl_points += t["pnl_points"]
+        if exit_dt.date() != today:
+            continue
+        if isinstance(t.get("pnl_points"), (int, float)):
+            daily_pnl_points += t["pnl_points"]   # 推估的損益(r45 pnl_estimated)是數字，照樣算進來
+        else:
+            # 損益未知：斷路器當成一次完整停損(-1R，第8條r50)——只會更早停、不會更晚。
+            # 以前是不加：成交價都查不到的那天，每日虧損上限永遠不會觸發
+            daily_pnl_points -= _one_r(engine, t)
 
     return daily_pnl_points * quantity
 
@@ -67,7 +83,8 @@ def get_consecutive_losses(engine):
     for t in trades:
         pnl = t.get("pnl_points")
         if pnl is None:
-            continue  # 損益未知：不算虧損、也不打斷連續虧損(第8條r27)，筆數另外回報
+            count += 1  # 損益未知：斷路器當成一次虧損(第8條r50)，只會更早停
+            continue
         if pnl <= 0:
             count += 1
         else:
@@ -211,6 +228,16 @@ def _history_read_ok():
 
 
 def check(engine, quantity, sl_points=None, bid=None, ask=None):
+    """風控檢查(見 _check_inner)。擋下的是每日虧損／連續虧損、而裡面含損益未知的筆數時，講明(第8條r50)。"""
+    allowed, reason, kind = _check_inner(engine, quantity, sl_points=sl_points, bid=bid, ask=ask)
+    if not allowed and kind in ("daily_loss", "consecutive_loss"):
+        n = get_unknown_pnl_count(engine)
+        if n:
+            reason = f"{reason}(含 {n} 筆損益未知，各以一次完整停損計)"
+    return allowed, reason, kind
+
+
+def _check_inner(engine, quantity, sl_points=None, bid=None, ask=None):
     """
     檢查這個引擎目前能不能送出新的真實開倉單。
     回傳 (allowed: bool, reason: str|None, reason_type: str|None)。allowed=False
