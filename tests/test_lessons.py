@@ -2047,6 +2047,61 @@ class Lesson54(ExecHarness):
         self.assertEqual(cp.call_count, 0, "前提：交易所上是別人的部位、沒有送單")
         self.assertEqual(len(self.manual_result), 2, "前提：手動平倉真的有回傳(成功與否, 訊息)")
         self.assertIn("這次沒有送平倉單", self.manual_result[1], "回應要講明沒有送單，不能讓人以為是這次平掉的")
+        self.assertIn("別的部位", self.manual_result[1], "平掉後被別人重開：要講交易所上現在那張沒有動它(r59)")
+
+    # r59：手動平倉遇到「停損觸發、沒有重開」——交易所這一側已經沒有部位
+    def _manual_close_flat(self, fills):
+        pos = self._pos()
+        from app.binance_client import binance_streamer
+        with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))), \
+             mock.patch.object(ex, "get_user_trades", return_value=fills, create=True), \
+             mock.patch.object(binance_streamer, "get_recent_trades", return_value=[{"price": 4379.0}]), \
+             mock.patch.object(pt, "_latest_price", return_value=4379.0), \
+             mock.patch.object(ex, "close_position", return_value=(False, "目前沒有未平倉部位可以平")) as cp, \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            res = self.eng.force_close()
+        return cp, res
+
+    def test_r59_manual_close_after_stop_triggered_without_reopen(self):
+        cp, res = self._manual_close_flat(self.CLOSED)
+        self.assertEqual(cp.call_count, 0, "前提：交易所這一側已經沒有部位，送單前確認就知道，不送單")
+        self.assertEqual(len(res), 2, "前提：手動平倉真的有回傳")
+        self.assertIn("這次沒有送平倉單", res[1])
+        self.assertIn("查到平倉成交", res[1])
+        self.assertNotIn("別的部位", res[1], "沒有重開：不能說交易所上有別的部位")
+
+    def test_r59_manual_close_message_does_not_claim_fills_when_unknown(self):
+        cp, res = self._manual_close_flat((False, "Read timed out"))
+        self.assertEqual(cp.call_count, 0, "前提：沒有送單")
+        self.assertEqual(len(res), 2, "前提：手動平倉真的有回傳")
+        self.assertNotIn("查到平倉成交", res[1], "成交明細查不到：不能寫查到了")
+        self.assertIn("推估", res[1])
+
+    # r59：「查不到」要直接驗證——部位正常在帳上，只在那一步讓查詢查不到，照 gold-scalper 自己的設計
+    def test_r59_close_presend_query_failure_still_sends(self):
+        """gold-scalper 平倉送單前「部位查不到」是照送(r55，跟以前一樣)；「均價不同、成交明細查不到」才不送(r56，另有測試)。"""
+        pos = self._pos()
+        self.assertIs(self.eng._position, pos, "前提：部位正常在帳上")
+        self.assertTrue(self.eng._try_claim_close(pos), "前提：出場判斷認領了部位")
+        with mock.patch.object(ex, "get_position_info", return_value=(False, "Read timed out")) as gp, \
+             mock.patch.object(ex, "close_position", return_value=(True, {"executedQty": "0.100", "avgPrice": "4380"})) as cp, \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            self.eng._close_position(pos, 4380.0, "觸及停損")
+        self.assertEqual(gp.call_count, 1, "前提：送單前真的查了、查不到(只在平倉這一步)")
+        self.assertEqual(cp.call_count, 1, "查不到：照送(不能因為查詢失敗就不平，停損要執行)")
+        self.assertEqual(len(self.dbclose), 1, "平倉成交後結帳")
+
+    def test_r59_quantity_check_query_failure_does_nothing(self):
+        pos = self._pos()
+        self.assertIs(self.eng._position, pos, "前提：部位正常在帳上")
+        with mock.patch.object(ex, "get_position_info", return_value=(False, "Read timed out")) as gp, \
+             mock.patch.object(pt.db, "update_paper_trade_real_open") as upd:
+            st = self.eng._check_exchange_quantity(pos)
+        self.assertEqual(gp.call_count, 1, "前提：數量比對這一步真的查了、查不到")
+        self.assertEqual(st, "unknown")
+        self.assertFalse(upd.called, "查不到：不改帳上數量")
+        self.assertIsNone(pos.get("gone_checks"), "也不算成一次「部位不在」")
+        self.assertIs(self.eng._position, pos, "部位留在帳上")
 
     def test_r56_fills_unknown_means_no_order_no_settle(self):
         unknown = (False, "Read timed out")

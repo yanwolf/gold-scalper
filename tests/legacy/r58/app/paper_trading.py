@@ -49,6 +49,21 @@ OPEN_PENDING_SECONDS = 180  # 開倉回應不明時，保留待確認的期限(�
 OP_LOCK_WAIT = 10.0   # 網頁操作等引擎操作鎖的上限(秒)，等不到就回「背景正在處理」(第8條r48)
 
 
+def _same_entry(recorded, exchange):
+    """
+    帳上成交價跟交易所這一側的均價是不是同一筆(第8條r54)。比不了(任一邊缺)回None。
+    交易所端平掉、同一檔又被別人／App同方向開了新部位時，數量可能一樣，但均價不會一樣。
+    限制：剛好同價重開、或本來就有基準部位(均價是合併的)時比對不出來。
+    """
+    try:
+        a, b = float(recorded), float(exchange)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or b <= 0:
+        return None
+    return abs(a - b) <= max(0.02, a * 2e-6)
+
+
 def _engine_op(web=False):
     """
     引擎操作鎖(第8條r48)：會動部位、又會查交易所的步驟(對帳、數量比對、停損守衛、掛停損、認領、重試平倉、平倉、開倉、
@@ -190,6 +205,8 @@ class PaperTradingEngine:
         不重查——交易所剛成交時偶爾還沒反映，重查拿到0會誤判成部位不在而不掛停損(第2條r21/r22)。
         回傳這一輪的結果：skip / aligned / unknown(查不到) / gone(確認沒了) / placed / failed / exit
         """
+        if position is not self._position:
+            return "stale"  # 拿到鎖之後確認傳進來的就是帳上那一筆(第8條r53)，不是就不動
         if not position.get("real_open_executed") or not position.get("real_open_quantity"):
             return "skip"
         if position.get("_closing"):
@@ -388,12 +405,45 @@ class PaperTradingEngine:
                 mark = float(r.get("markPrice") or 0) or mark
         return True, qty, entry, mark
 
+    def _reopened(self, position, exchange_entry):
+        """
+        交易所上這一側的部位還是不是帳上那一筆(第8條r54/r56)。兩個證據才判定「原本那筆沒了、這是別人的」：
+        均價跟帳上成交價不同，**而且**成交明細裡查到原本那筆的平倉成交、湊滿帳上數量。
+        均價有出入的原因不只是重開(舊版記法不同、回應沒均價、認領時的值)——只看均價，部署新版的那一刻
+        這些實單持倉都會被判成已平倉：結帳、撤停損，交易所上的部位變成裸倉(r56)。
+        回傳 True=重開(原本那筆沒了)、False=同一筆、None=判斷不了(均價不同但成交明細查不到)
+        """
+        if _same_entry(position.get("entry_actual_price"), exchange_entry) is not False:
+            return False
+        want = position.get("real_open_quantity") or 0.0
+        st, _px, fq, _last, why = self._closing_fills(position, want)
+        if st == "ok" and fq >= want - 1e-9:
+            return True
+        if st == "unknown":
+            logger.warning(f"均價跟帳上不同、成交明細查不到({self.label}: {why})，判斷不了是不是原本那筆")
+            return None
+        return False  # 均價有出入但沒有平倉成交：同一筆(從沒被平過)，照常管理
+
     def _own_qty(self, position):
         """交易所這一側扣掉基準後，屬於這筆單的數量：(ok, 數量)。第3條r16：基準要跟著部位走完。"""
-        ok, qty, _, _ = self._side_qty(position["direction"])
+        position.pop("_identity_undetermined", None)
+        ok, qty, entry, _ = self._side_qty(position["direction"])
         if not ok:
             return False, 0.0
-        return True, max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))
+        base = position.get("real_open_baseline", 0.0) or 0.0
+        own = max(0.0, qty - base)
+        if own > 1e-9 and base <= 1e-9:
+            r = self._reopened(position, entry)
+            if r is True:
+                # 原本那筆已經在交易所端平掉，現在這張是別人／App開的(第8條r54/r56)：當成「沒了」——
+                # 不掛停損、不送平倉單(會把別人的部位平掉)，照成交明細結帳
+                logger.warning(f"交易所這一側均價 {entry}、帳上成交價 {position.get('entry_actual_price')}，而且查到原本那筆的平倉成交"
+                               f"({self.label})：原本那筆已經沒了、這是別的部位")
+                return True, 0.0
+            if r is None:
+                position["_identity_undetermined"] = True   # 判斷不了：這輪不送任何單、不結帳
+                return False, 0.0
+        return True, own
 
     POSITION_STEPS = ("開倉確認", "平倉重試", "停損對齊", "數量比對", "停損守衛", "每輪維護", "快速停損出場", "平倉收尾")
 
@@ -466,6 +516,8 @@ class PaperTradingEngine:
           - 連續3輪確認不在 → 清掉紀錄，交給_sync_backstop當場補掛
             (補掛遇-2021價格已穿過停損 → 直接出場，第8條r16)
         """
+        if pos is not self._position:
+            return "stale"  # 第8條r53
         algo_id = pos.get("backstop_algo_id")
         if not algo_id or not pos.get("real_open_executed"):
             return "skip"
@@ -686,11 +738,19 @@ class PaperTradingEngine:
           - 變少 → 更新帳上數量、通知；減少那部分的成交價不知道，損益記未知(第8條r28，不用標記價估)
           - 連續3輪都是0 → 部位已不在交易所(手動平倉或停損觸發)，走平倉流程確認
         """
+        if position is not self._position:
+            return "stale"  # 第8條r53
         if position.get("pending_close") or position.get("_closing") or position.get("real_open_pending_until"):
             return "skip"
-        ok, qty, _, mark = self._side_qty(position["direction"])
+        ok, qty, entry_x, mark = self._side_qty(position["direction"])
         if not ok:
             return "unknown"
+        if (position.get("real_open_baseline") or 0) <= 1e-9 and qty > 1e-9:
+            r = self._reopened(position, entry_x)   # 兩個證據(第8條r56)
+            if r is None:
+                return "unknown"   # 判斷不了：這輪不動
+            if r is True:
+                qty = 0.0          # 原本那筆已經沒了、這是別的部位：走「部位不在」那條路
         qty = max(0.0, qty - (position.get("real_open_baseline", 0.0) or 0.0))  # 扣基準(第3條r16)
         recorded = position.get("real_open_quantity") or 0.0
         if qty <= 1e-9:
@@ -1276,6 +1336,9 @@ class PaperTradingEngine:
         if self._position is position:
             # 平倉單沒確認成交：部位與交易所停損都保留，每輪重試(第8條r13)
             return False, "平倉單沒有確認成交，已保留部位與交易所停損，系統每輪自動重試並會發Telegram"
+        if position.get("_closed_externally"):
+            # 不能回「已平倉」讓人以為是這次按的平倉平掉的(第8條r57)：這次沒有送單
+            return True, "交易所上這筆已經平掉(成交明細查到平倉成交)，照成交明細結帳；這次沒有送平倉單"
         return True, f"已以 {price} 平倉({reason})"
 
     @_engine_op()
@@ -1368,7 +1431,14 @@ class PaperTradingEngine:
         if is_execution_engine:
             filled = False
             try:
-                success, result = execution_module.close_position(
+                # 送單前確認交易所上還有這一筆(第8條r54)：原本那筆在交易所端平掉、又被別人同方向開了新部位時，
+                # 照帳上數量送平倉單會把別人的部位平掉。確認到沒了就不送，交給下面「確認平掉」那條路照成交明細結帳
+                ok_pre, own_pre = self._own_qty(position)
+                undetermined = position.pop("_identity_undetermined", False)
+                success, result = (False, {"code": "PRE_GONE", "msg": "送單前確認：交易所這一側已經沒有這一筆，不送平倉單"}) \
+                    if (ok_pre and own_pre <= 1e-9) else \
+                    (False, {"code": "UNDETERMINED", "msg": "均價跟帳上不同、成交明細查不到，判斷不了交易所上是不是原本那筆，這輪不送單"}) \
+                    if undetermined else execution_module.close_position(
                     direction=position["direction"],
                     symbol=self.execution_symbol,
                     account=self.execution_account,
@@ -1467,6 +1537,7 @@ class PaperTradingEngine:
                 if ok_q and ex_qty <= 1e-9:
                     # 這一側已經沒有部位：回應逾時但其實成交，或被交易所停損觸發
                     closed_externally = True
+                    position["_closed_externally"] = True   # 給手動平倉的回應用：這次沒有送單(第8條r57)
                     executed, execution_error = None, None
                     skip_close_reason = ("平倉單回應失敗或逾時，但交易所這一側已經沒有部位"
                                          "(可能其實已成交，或被交易所停損觸發)，視為已平倉")

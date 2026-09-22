@@ -435,6 +435,7 @@ class PaperTradingEngine:
         if own > 1e-9 and base <= 1e-9:
             r = self._reopened(position, entry)
             if r is True:
+                position["_reopened_detected"] = True   # 給手動平倉的回應用：交易所上現在那張是別的部位(r59)
                 # 原本那筆已經在交易所端平掉，現在這張是別人／App開的(第8條r54/r56)：當成「沒了」——
                 # 不掛停損、不送平倉單(會把別人的部位平掉)，照成交明細結帳
                 logger.warning(f"交易所這一側均價 {entry}、帳上成交價 {position.get('entry_actual_price')}，而且查到原本那筆的平倉成交"
@@ -1337,8 +1338,14 @@ class PaperTradingEngine:
             # 平倉單沒確認成交：部位與交易所停損都保留，每輪重試(第8條r13)
             return False, "平倉單沒有確認成交，已保留部位與交易所停損，系統每輪自動重試並會發Telegram"
         if position.get("_closed_externally"):
-            # 不能回「已平倉」讓人以為是這次按的平倉平掉的(第8條r57)：這次沒有送單
-            return True, "交易所上這筆已經平掉(成交明細查到平倉成交)，照成交明細結帳；這次沒有送平倉單"
+            # 不能回「已平倉」讓人以為是這次按的平倉平掉的(第8條r57/r58)：這次沒有送單。
+            # 兩種情況分開講(r59)：停損觸發、沒重開 vs 平掉後被別人重開；成交明細查不到時不能寫「查到平倉成交」
+            how = ("成交明細查到平倉成交，照成交明細結帳" if position.get("_exit_from_fills")
+                   else "成交明細查不到，出場價用偵測當下的價格推估(估算)")
+            msg = f"交易所上這筆已經平掉(可能是停損觸發)，{how}；這次沒有送平倉單"
+            if position.get("_reopened_detected"):
+                msg += "。交易所上現在那張是別的部位(均價不同)，沒有動它"
+            return True, msg
         return True, f"已以 {price} 平倉({reason})"
 
     @_engine_op()
@@ -1543,6 +1550,7 @@ class PaperTradingEngine:
                                          "(可能其實已成交，或被交易所停損觸發)，視為已平倉")
                     # 出場價只用實際成交價(第8條r30)：查成交明細；查不到就記未知，不用偵測當下的標記價
                     st, px, fq, last_id, why = self._closing_fills(position, position.get("real_open_quantity") or 0.0)
+                    position["_exit_from_fills"] = (st == "ok")   # 給手動平倉的回應用
                     if st == "ok":
                         exit_actual_price = px
                         exit_price = px

@@ -642,6 +642,11 @@ def get_last_changed_at(engine_id=None):
         return max(times) if times else None
 
 
+# 達標門檻：只影響「績效達不達標」的判斷、不影響下單。正式端的交易參數唯讀(只能匯入參數集)，
+# 但參數集不帶這組，所以正式端要能直接改這四個(2026-09-22 使用者決定：門檻在正式網手動改、不跟lab同步)
+READINESS_KEYS = ("readiness_min_trades", "readiness_min_win_rate", "readiness_min_profit_factor", "readiness_max_drawdown_points")
+
+
 class SettingsValidationError(ValueError):
     """有欄位的值不合法：整批都不套用(第8條r39/r40：不能一邊迴圈一邊套用、停在半套)。"""
 
