@@ -91,6 +91,14 @@ def _engine_op(web=False):
 QTY_CHECK_EVERY_TICKS = 4
 FILL_PAGE_SIZE = 1000      # 成交明細每頁筆數(幣安上限1000)
 FILL_MAX_PAGES = 10        # 界線之後超過這麼多頁就當成沒拿完、記未知(第8條r37)   # 每4輪(約60秒)比對一次交易所數量(第8條減碼偵測；第6條限流)
+# 成交價背景補登(第15條r71)：送單當下訂單回應、查訂單、成交明細都拿不到均價時，隔這些秒數各再查一次(累計約2分多)。
+# 實盤2026-09-25：回應FILLED卻沒有avgPrice，1秒內的兩次補救都落空，其實幾秒後成交明細就查得到了
+FILL_BACKFILL_DELAYS = (3, 10, 30, 90)
+
+
+def _start_backfill_thread(fn):
+    """背景補登用的執行緒(測試會把它換掉、收下fn自己跑，不會在測試結束後還去打網路)。"""
+    threading.Thread(target=fn, daemon=True, name="fill-backfill").start()
 
 
 def _latest_price():
@@ -563,9 +571,10 @@ class PaperTradingEngine:
             own_rows = [t for t in trades if not latest and oid is not None and str(t.get("orderId")) == str(oid)]
             own = [int(t["id"]) for t in own_rows]
             if own_rows and not isinstance(position.get("entry_actual_price"), (int, float)):
-                # 回應沒有均價(ACK或回填慢)：用這張開倉單的成交明細算加權均價(實際成交價，不是估算)
+                # 回應沒有均價(ACK或回填慢)：用這張開倉單的成交明細算加權均價(實際成交價，不是估算)。
+                # 成交明細只出現一部分時不算(r71)，交給背景補登
                 q = sum(float(t["qty"]) for t in own_rows)
-                if q > 0:
+                if q > 0 and q >= (position.get("real_open_quantity") or 0) - 1e-9:
                     position["entry_actual_price"] = round(sum(float(t["price"]) * float(t["qty"]) for t in own_rows) / q, 6)
             boundary = max(own) if own else (max(ids) if ids else None)
             if boundary is None:
@@ -576,7 +585,11 @@ class PaperTradingEngine:
             logger.error(f"記錄成交明細界線失敗({self.label})，平倉時出場價會記未知: {e}")
 
     def _fill_vwap_by_order(self, order_result):
-        """回應裡沒有均價時，用這張單號在成交明細裡的成交算加權均價；查不到回None(記未知，不估算)。"""
+        """
+        回應裡沒有均價時，用這張單號在成交明細裡的成交算加權均價；查不到回None(記未知，不估算)。
+        成交明細是非同步寫入的(第15條r71)：剛成交時可能只出現其中幾筆。加總數量不到這張單的成交量(executedQty)時
+        不能拿來當均價——只會是前半段的價格——回None，交給背景補登之後再查。
+        """
         try:
             oid = order_result.get("orderId") if isinstance(order_result, dict) else None
             if oid is None:
@@ -584,10 +597,133 @@ class PaperTradingEngine:
             ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
             rows = [t for t in trades if str(t.get("orderId")) == str(oid)] if ok and isinstance(trades, list) else []
             q = sum(float(t["qty"]) for t in rows)
+            want = execution_module.extract_filled_qty(order_result)
+            if q > 0 and want is not None and q < want - 1e-9:
+                logger.warning(f"訂單{oid}的成交明細只出現 {q}/{want}，還不完整，不拿來算均價({self.label})")
+                return None
             return round(sum(float(t["price"]) * float(t["qty"]) for t in rows) / q, 6) if q > 0 else None
         except Exception as e:
             logger.error(f"用成交明細算均價失敗({self.label}): {e}")
             return None
+
+    def _order_fill_price(self, order_id, want_qty):
+        """補登用：這張單的實際成交均價。先查訂單(avgPrice、cumQuote)，再查成交明細(數量要湊滿)；都沒有回None。"""
+        try:
+            ok, od = execution_module.get_order_status(execution_module._resolve_symbol(self.execution_symbol), order_id,
+                                                       account=self.execution_account)
+        except Exception as e:
+            ok, od = False, f"{type(e).__name__}: {e}"
+        px = execution_module.extract_fill_price(od) if ok else None
+        if px:
+            return px
+        probe = {"orderId": order_id}
+        if want_qty:
+            probe["executedQty"] = str(want_qty)
+        return self._fill_vwap_by_order(probe)
+
+    @staticmethod
+    def _backfill_pending_note(order_result):
+        """通知裡的說明：只附單號，原始回應寫日誌就好(r71：整包貼進Telegram很難讀)。"""
+        oid = order_result.get("orderId") if isinstance(order_result, dict) else None
+        if oid is None:
+            return "(無法計算執行品質：幣安回應沒有成交均價、也沒有訂單號，無法補登)"
+        waited = sum(FILL_BACKFILL_DELAYS)
+        return (f"(成交均價暫缺：幣安回應沒帶avgPrice，訂單 {oid}。背景會在約 {waited} 秒內再查，"
+                f"查到就補登成交價與執行品質、另發一則通知)")
+
+    def _schedule_fill_backfill(self, action, position, order_result, bid=None, ask=None, book_stale=None, est_usd=None):
+        """
+        排一次背景補登(第15條r71)。action是"open"或"close"。當下的東西(報價、數量、進場成交價)先抄下來，
+        背景執行緒不讀之後可能已經變掉的部位。沒有訂單號就沒辦法查，回False。
+        """
+        oid = order_result.get("orderId") if isinstance(order_result, dict) else None
+        if oid is None:
+            return False
+        s = settings_module.get_settings(engine_id=self.engine_id)
+        ctx = {
+            "action": action, "order_id": oid, "want_qty": execution_module.extract_filled_qty(order_result),
+            "trade_id": position.get("id"), "direction": position["direction"], "position": position,
+            "bid": bid, "ask": ask, "book_stale": book_stale, "est_usd": est_usd,
+            "entry_actual": position.get("entry_actual_price"),
+            "real_qty": position.get("real_qty_for_pnl") or position.get("real_open_quantity")
+                        or float(s.get("execution_quantity", 0) or 0),
+            "partial_usd": position.get("partial_realized_usd") or 0.0,
+            "partial_unknown": bool(position.get("partial_pnl_unknown")),
+        }
+        logger.warning(f"{'出場' if action == 'close' else '進場'}成交均價暫缺({self.label})，訂單{oid}排入背景補登")
+        _start_backfill_thread(lambda: self._run_fill_backfill(ctx))
+        return True
+
+    def _run_fill_backfill(self, ctx):
+        """背景執行緒：照FILL_BACKFILL_DELAYS等待再查。整段不能把例外丟出去沒人接(第14條)：出錯推播。"""
+        kind = "出場" if ctx["action"] == "close" else "進場"
+        try:
+            px, tries = None, 0
+            for delay in FILL_BACKFILL_DELAYS:
+                time.sleep(delay)
+                tries += 1
+                try:
+                    px = self._order_fill_price(ctx["order_id"], ctx["want_qty"])
+                except Exception as e:
+                    logger.warning(f"{kind}成交價補登第{tries}次查詢出錯({self.label}): {e}")
+                    px = None
+                if px:
+                    break
+            if not px:
+                logger.warning(f"{kind}成交價補登放棄({self.label})：訂單{ctx['order_id']}查了{tries}次都沒有成交均價")
+                self._backstop_alert(
+                    f"⚠️ {self.label} {kind}成交價補登失敗\n"
+                    f"訂單：{ctx['order_id']}\n"
+                    f"約 {sum(FILL_BACKFILL_DELAYS)} 秒內查了 {tries} 次(訂單查詢＋成交明細)都沒有成交均價，這筆維持估算。\n"
+                    f"可到幣安App的訂單歷史用這個單號查實際成交價"
+                )
+                return
+            self._apply_fill_backfill(ctx, px)
+        except Exception as e:
+            logger.error(f"{kind}成交價補登出錯({self.label}): {e}")
+            try:
+                self._backstop_alert(f"⚠️ {self.label} {kind}成交價補登出錯(不影響部位)\n"
+                                     f"訂單：{ctx.get('order_id')}\n錯誤：{type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+    def _apply_fill_backfill(self, ctx, px):
+        """查到了：寫資料庫(網頁、統計的真實損益由進出場成交價算，寫進去就更正了)，進場的回填部位，補發通知。"""
+        close = ctx["action"] == "close"
+        bid, ask = ctx["bid"], ctx["ask"]
+        quality = execution_module.analyze_execution_quality(ctx["direction"], bid, ask, px, is_close=close) \
+            if (bid and ask) else None
+        args = (ctx["trade_id"], quality["expected_fill_price"] if quality else None, px,
+                quality["slippage_points"] if quality else None, quality["spread"] if quality else None)
+        note = None
+        if quality:
+            note = (f"預期成交價{quality['expected_fill_price']:.2f}(依決策當下ask/bid) vs 實際成交價{px:.2f}，"
+                    f"真正執行滑點{quality['slippage_points']:+.2f}points，當下價差{quality['spread']:.2f}points")
+        real_usd, extra = None, None
+        if close:
+            db.update_paper_trade_exit_execution(*args, book_stale=bool(ctx["book_stale"]))
+            entry = ctx["entry_actual"]
+            if not isinstance(entry, (int, float)):
+                extra = "進場成交價也沒有，USDT 損益仍是估算"
+            elif ctx["partial_unknown"]:
+                extra = "期間有部分出場的成交價不知道，USDT 損益仍是估算"
+            elif ctx["real_qty"]:
+                diff = (px - entry) if ctx["direction"] == "bullish" else (entry - px)
+                real_usd = diff * ctx["real_qty"] + ctx["partial_usd"]
+        else:
+            db.update_paper_trade_entry_execution(*args, book_stale=bool(ctx["book_stale"]))
+            pos = ctx["position"]
+            with self._lock:
+                still_open = self._position is pos
+                if still_open and not isinstance(pos.get("entry_actual_price"), (int, float)):
+                    pos["entry_actual_price"] = px
+            extra = ("部位還在，平倉時會用這個進場價算真實損益" if still_open
+                     else "這筆已經平倉：資料庫已補上進場成交價，網頁的真實損益會自動更正")
+        logger.info(f"{'出場' if close else '進場'}成交價補登成功({self.label})：訂單{ctx['order_id']} @ {px}")
+        notifier_module.notifier.notify_fill_backfill(
+            action=ctx["action"], label=self.label, account=self.execution_account, order_id=ctx["order_id"],
+            fill_price=px, slippage_note=note, real_pnl_usd=real_usd, estimated_usd=ctx["est_usd"], extra_note=extra,
+        )
 
     def _trades_after(self, boundary):
         """
@@ -1271,7 +1407,9 @@ class PaperTradingEngine:
                             # bid/ask拿不到」，不然使用者只會看到完全沒有滑價資訊，
                             # 猜不出是哪個環節出問題(修正記錄見README)
                             if not actual_fill_price:
-                                slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+                                slippage_note = self._backfill_pending_note(result)
+                                self._schedule_fill_backfill("open", position, result, bid=bid, ask=ask,
+                                                             book_stale=signal_result.get("book_stale"))
                             elif not (bid and ask):
                                 slippage_note = f"(無法計算執行品質：決策當下沒有取得bid/ask報價，成交價是{actual_fill_price:.2f})"
                             logger.warning(f"開倉執行品質無法計算({self.label}): fill={actual_fill_price}, bid={bid}, ask={ask}")
@@ -1430,6 +1568,7 @@ class PaperTradingEngine:
         exit_actual_price = None
         closed_externally = False
         close_filled_qty = None
+        backfill_order = None   # 平倉單成交了但當下拿不到均價：結帳、通知之後排背景補登(第15條r71)
         if is_execution_engine and real_open is False:
             is_execution_engine = False
             skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
@@ -1485,7 +1624,8 @@ class PaperTradingEngine:
                         )
                     else:
                         if not actual_fill_price:
-                            slippage_note = f"(無法計算執行品質：幣安訂單回應裡沒有avgPrice，原始回應：{result})"
+                            backfill_order = result
+                            slippage_note = self._backfill_pending_note(result)
                         elif not (bid and ask):
                             slippage_note = f"(無法計算執行品質：決策當下沒有取得bid/ask報價，成交價是{actual_fill_price:.2f})"
                         logger.warning(f"平倉執行品質無法計算({self.label}): fill={actual_fill_price}, bid={bid}, ask={ask}")
@@ -1535,7 +1675,9 @@ class PaperTradingEngine:
                     ok_r, res_r = False, str(e)
                 if ok_r:
                     executed, execution_error = True, None
-                    exit_actual_price = execution_module.extract_fill_price(res_r)
+                    exit_actual_price = execution_module.extract_fill_price(res_r) or self._fill_vwap_by_order(res_r)
+                    if not exit_actual_price:
+                        backfill_order = res_r
                     position["real_open_quantity"] = round(ex_qty, 6)
                 else:
                     execution_error = res_r
@@ -1659,6 +1801,14 @@ class PaperTradingEngine:
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")
+
+        # 背景補登放在結帳、通知之後(第15條r71)：先發的那則是估算，補登查到再發一則更正
+        if backfill_order is not None and not exit_actual_price:
+            qty_s = float(s.get("execution_quantity", 0) or 0)
+            pts = closed_record.get("pnl_points")
+            est = pts * qty_s if (qty_s and isinstance(pts, (int, float))) else None
+            self._safe("排成交價補登", lambda: self._schedule_fill_backfill(
+                "close", position, backfill_order, bid=bid, ask=ask, book_stale=book_stale, est_usd=est))
 
     def get_summary(self, limit=50):
         """

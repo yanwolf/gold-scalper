@@ -304,7 +304,10 @@ class ExecHarness(unittest.TestCase):
             mock.patch.object(ex, "round_price", lambda p, *a, **k: p),
             # 成交明細預設「查不到」，要用的情境自己換(不打網路)
             mock.patch.object(ex, "get_user_trades", return_value=(False, "未模擬"), create=True),
+            # 成交價背景補登(r71)：不真的開執行緒，收下來由測試自己跑(不會在測試結束後還去打網路)
+            mock.patch.object(pt, "_start_backfill_thread", side_effect=lambda fn: self.backfills.append(fn), create=True),
         ]
+        self.backfills = []
         for x in self.ps:
             x.start()
 
@@ -1546,6 +1549,175 @@ class LiveAckResponse(ExecHarness):
         self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
         self.assertAlmostEqual(self.notes[-1].get("real_pnl_usd") or 0, (4380.2 - 4373.5) * 0.1, places=4,
                                msg="平倉回應沒有均價：用這張單號的成交明細算出真實損益")
+
+
+# ------------------------------------------------------------------ r70 → r71 實盤 2026-09-25 22:46
+# 平倉市價單帶了 RESULT、回應是 FILLED 成交 1 張，但 avgPrice、cumQuote 兩個欄位整個不存在(原始回應照抄)；
+# 0.5 秒後查一次訂單、立刻查一次成交明細都沒拿到 → 通知寫「估算」並把整包原始回應貼進 Telegram。
+LIVE_NO_AVG = {"orderId": 17233421715, "symbol": "XAUUSDT", "status": "FILLED", "clientOrderId": "DinxfWcCnuek57MpLPBhF8",
+               "price": "0.00", "origQty": "1.000", "executedQty": "1.000", "cumQty": "1.000", "timeInForce": "GTC",
+               "type": "MARKET", "reduceOnly": True, "closePosition": False, "side": "BUY", "positionSide": "SHORT",
+               "stopPrice": "0.00", "workingType": "CONTRACT_PRICE", "priceProtect": False, "origType": "MARKET",
+               "priceMatch": "NONE", "selfTradePreventionMode": "EXPIRE_MAKER", "goodTillDate": 0, "updateTime": 1790347587245}
+OID71 = 17233421715
+
+
+class LiveFilledNoAvgPrice(ExecHarness):
+    """
+    r71：成交了、但回應沒有均價。當下查不到不能就此放棄——背景延後再查，查到就補寫資料庫(執行品質、真實損益)並補發一則通知；
+    一直查不到要明確說「補登失敗、維持估算」。注入綁在時間(背景等待過後成交明細才出現)，不用第幾次查詢計數(測錯方式18)。
+    """
+
+    def _clock(self, rows_by_time):
+        """rows_by_time: [(第幾秒起看得到, 成交列)]。回傳(clock, 假sleep, 假userTrades)。"""
+        clock = {"t": 0.0}
+        def sleep(s):
+            clock["t"] += s
+        def trades(*a, **k):
+            return (True, _fills(*[r for when, r in rows_by_time if clock["t"] >= when]))
+        return clock, sleep, trades
+
+    def _close(self, rows_by_time, order_status=(True, LIVE_NO_AVG)):
+        pos = _pos(direction="bearish", entry_price=4312.89, entry_actual_price=4312.88, sl_price=4277.44, peak_price=4260.41,
+                   trailing_active=True, real_open_quantity=1.0, real_open_baseline=0.0, backstop_algo_id="B71", id=71)
+        self.eng._position = pos
+        clock, sleep, trades = self._clock(rows_by_time)
+        self.bnotes = []
+        with mock.patch.object(ex, "close_position", return_value=(True, dict(LIVE_NO_AVG))) as cp, \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(-1.0, entry=4312.88))), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=order_status), \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep), \
+             mock.patch.object(pt.db, "update_paper_trade_exit_execution") as ux, \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True,
+                               side_effect=lambda **k: self.bnotes.append(k)), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=True):
+            self.eng._close_position(pos, 4277.45, "觸及移動停損", bid=4277.40, ask=4277.41)
+            sync_calls = list(ux.call_args_list)
+            for fn in list(self.backfills):
+                fn()
+        return cp, ux, sync_calls
+
+    @staticmethod
+    def _prices(calls):
+        """update_paper_trade_exit_execution(trade_id, expected, actual, slip, spread) 各次呼叫的 actual。"""
+        return [c.args[2] for c in calls if len(c.args) > 2 and c.args[2] is not None]
+
+    def test_r71_order_polls_more_than_once_for_avg_price(self):
+        sent, polled = [], []
+        later = dict(LIVE_NO_AVG, avgPrice="4277.41")
+        polls = [LIVE_NO_AVG, LIVE_NO_AVG, later]
+        def fake_req(method, path, params=None, account=None, return_status=False):
+            if method == "POST":
+                sent.append(dict(params))
+                return (True, dict(LIVE_NO_AVG))
+            polled.append(params.get("orderId"))
+            return (True, polls[min(len(polled) - 1, len(polls) - 1)])
+        with mock.patch.object(ex, "_signed_request", side_effect=fake_req), \
+             mock.patch.object(ex, "round_quantity", return_value=(1.0, None)), mock.patch("time.sleep"):
+            ok, res = ex.place_market_order("BUY", 1.0, account="gold", position_side="SHORT")
+        self.assertEqual(len(sent), 1, "前提：送出一張單")
+        self.assertTrue(ok, "前提：FILLED 成交 1 張，是成功")
+        self.assertEqual(res.get("avgPrice"), "4277.41", "FILLED 但沒均價：不能只查一次訂單就放棄")
+
+    def test_r71_cum_quote_is_a_real_fill_price(self):
+        self.assertIsNone(ex.extract_fill_price(LIVE_NO_AVG), "前提：這份回應真的沒有均價")
+        self.assertAlmostEqual(ex.extract_fill_price(dict(LIVE_NO_AVG, cumQuote="8554.82", executedQty="2.000")) or 0, 4277.41,
+                               places=6, msg="沒有 avgPrice 但有 cumQuote：成交額÷成交量就是實際均價")
+
+    def test_r71_close_backfills_exit_price_and_notifies(self):
+        cp, ux, sync_calls = self._close([(2.0, (901, OID71, "BUY", 1.0, 4277.41, 35.47, 3000))])
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、成交")
+        self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
+        self.assertIsNone(self.notes[-1].get("real_pnl_usd"), "前提：當下(成交明細還沒出現)確實拿不到成交價，通知是估算")
+        self.assertEqual(self._prices(sync_calls), [], "前提：當下沒有寫進任何出場成交價")
+        self.assertEqual(self._prices(ux.call_args_list), [4277.41], "背景稍後查到：出場成交價補寫進資料庫(網頁、統計改用真實值)")
+        self.assertEqual(len(self.bnotes), 1, "補登成功要補發一則通知")
+        self.assertAlmostEqual(self.bnotes[0].get("real_pnl_usd") or 0, (4312.88 - 4277.41) * 1.0, places=4,
+                               msg="補發的通知用真實成交價算 USDT 損益")
+        self.assertAlmostEqual(self.bnotes[0].get("fill_price") or 0, 4277.41, places=6)
+
+    def test_r71_close_notice_does_not_dump_raw_response(self):
+        self._close([(2.0, (901, OID71, "BUY", 1.0, 4277.41, 35.47, 3000))])
+        self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
+        note = self.notes[-1].get("slippage_note") or ""
+        self.assertIn("補登", note, "要說明稍後會補登，讓人知道不是就此算估算")
+        self.assertIn(str(OID71), note, "附單號就好")
+        self.assertNotIn("'selfTradePreventionMode'", note, "原始回應整包貼進 Telegram：寫到日誌就好")
+
+    def test_r71_backfill_gives_up_with_one_alert(self):
+        cp, ux, _ = self._close([])   # 成交明細一直查不到、訂單查詢也一直沒有均價
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、成交")
+        self.assertEqual(len(self.backfills), 1, "前提：當下查不到時排了一次背景補登")
+        one(self.eng.alerts, "補登失敗")
+        self.assertEqual(self._prices(ux.call_args_list), [], "查不到就不能寫一個成交價進去")
+        self.assertEqual(self.bnotes, [], "沒補登成功，不發「補登」通知(發的是上面那則失敗告警)")
+
+    def test_r71_partial_trade_rows_are_not_a_fill_price(self):
+        # 成交明細先只出現 0.4 張(4270.0)，稍後才出現另外 0.6 張(4282.0)：只用前半段算均價是錯的
+        cp, ux, sync_calls = self._close([(0.0, (911, OID71, "BUY", 0.4, 4270.0, 17.15, 3000)),
+                                          (2.0, (912, OID71, "BUY", 0.6, 4282.0, 18.53, 3000))])
+        self.assertEqual(cp.call_count, 1, "前提：平倉單送出、成交")
+        self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
+        self.assertIsNone(self.notes[-1].get("real_pnl_usd"), "成交明細只湊到 0.4/1.0 張：當下不能拿來當成交價")
+        self.assertEqual(len(self._prices(ux.call_args_list)), 1, "前提：背景補登有寫進成交價")
+        self.assertAlmostEqual(self._prices(ux.call_args_list)[0], (0.4 * 4270.0 + 0.6 * 4282.0) / 1.0, places=6,
+                               msg="湊滿 1 張之後才用兩段加權")
+
+    def test_r71_open_backfills_entry_price(self):
+        eng = self.eng
+        OPEN_OID = 17233000001
+        raw = dict(LIVE_NO_AVG, orderId=OPEN_OID, side="BUY", positionSide="LONG", reduceOnly=False,
+                   origQty="0.100", executedQty="0.100", cumQty="0.100")
+        clock, sleep, trades = self._clock([(2.0, (951, OPEN_OID, "BUY", 0.1, 4373.6, 0.0, 1000))])
+        self.bnotes = []
+        with mock.patch.object(pt.risk_guard, "check", return_value=(True, None, None)), \
+             mock.patch.object(ex, "resolve_position_mode", return_value=(True, None)), \
+             mock.patch.object(ex, "set_margin_type", return_value=(True, {})), \
+             mock.patch.object(ex, "set_leverage", return_value=(True, {})), \
+             mock.patch.object(ex, "open_position", return_value=(True, raw)) as op, \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0))), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, raw)), \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep), \
+             mock.patch.object(pt.db, "update_paper_trade_entry_execution") as ue, \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True,
+                               side_effect=lambda **k: self.bnotes.append(k)), \
+             mock.patch.object(eng, "_sync_backstop"):
+            eng._position = None
+            eng._open_position({"direction": "bullish", "bid": 4373.4, "ask": 4373.5,
+                                "chan": {"reason": "t"}, "profile": {"reason": "t"}}, 4373.49, 10.0)
+            pos = eng._position
+            self.assertEqual(op.call_count, 1, "前提：開倉單送出")
+            self.assertIsNotNone(pos, "前提：開倉了")
+            self.assertIsNone(pos.get("entry_actual_price"), "前提：當下確實拿不到進場成交價")
+            for fn in list(self.backfills):
+                fn()
+        self.assertAlmostEqual(pos.get("entry_actual_price") or 0, 4373.6, places=6,
+                               msg="背景補登到的進場成交價要回填到部位(平倉時算真實 USDT 損益用)")
+        got = [c.args[2] for c in ue.call_args_list if len(c.args) > 2 and c.args[2] is not None]
+        self.assertEqual(got, [4373.6], "進場成交價補寫進資料庫(重啟後也還在)")
+        self.assertEqual(len(self.bnotes), 1, "補發一則進場補登通知")
+
+
+class BackfillNoticeFormat(unittest.TestCase):
+    """補登通知要真的跑格式化(ExecHarness 底下通知被 mock 掉，第20種)。"""
+    def test_r71_backfill_notice_format(self):
+        from app.notifier import notifier as N, TelegramNotifier
+        self.assertTrue(hasattr(N, "notify_fill_backfill"), "前提：有補登通知(在舊版上重跑時是斷言失敗、不是崩掉)")
+        sent = []
+        with mock.patch.object(TelegramNotifier, "is_enabled", new_callable=mock.PropertyMock, return_value=True), \
+             mock.patch.object(TelegramNotifier, "is_muted", new_callable=mock.PropertyMock, return_value=False), \
+             mock.patch.object(N, "_send_telegram_message", side_effect=lambda t: sent.append(t) or (True, None)):
+            N.notify_fill_backfill(action="close", label="15分K", account="gold", order_id=OID71, fill_price=4277.41,
+                                   slippage_note="預期成交價4277.41 vs 實際成交價4277.41", real_pnl_usd=35.47, estimated_usd=35.44)
+        self.assertEqual(len(sent), 1, "前提：通知真的組出來、送出了")
+        one(sent, "成交價補登")   # 標題行(第21種：只看第一行)
+        self.assertIn("4277.41", sent[0])
+        self.assertIn(str(OID71), sent[0])
+        self.assertIn("+35.47 USDT", sent[0])
+        self.assertIn("依真實成交價", sent[0])
+        self.assertIn("+35.44", sent[0], "附上原本的估算值，才看得出差多少")
 
 
 # ------------------------------------------------------------------ r42 → r44 ＋ 實盤 2026-09-22
