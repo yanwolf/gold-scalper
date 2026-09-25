@@ -178,6 +178,33 @@ class TelegramNotifier:
         if success:
             self._last_notified_at = datetime.now(timezone.utc).isoformat()
 
+    def notify_fill_backfill(self, action, label, account, order_id, fill_price, slippage_note=None,
+                             real_pnl_usd=None, estimated_usd=None, extra_note=None):
+        """
+        成交價背景補登成功(BINANCE_LESSONS.md第15條r71)：送單當下幣安回應沒帶均價、當下也查不到，
+        先發的進場/出場通知是估算；背景稍後查到實際成交均價後補發這一則，資料庫同時已經更正。
+        """
+        if self._muted:
+            return
+        kind = "出場" if action == "close" else "進場"
+        lines = [
+            f"🧾 成交價補登【{label}】{kind}",
+            (f"訂單：{order_id}（帳戶：{account}）" if order_id is not None
+             else f"來源：成交明細（交易所端平倉或分段成交，帳戶：{account}）"),
+            f"實際成交均價：{fill_price:.2f}",
+        ]
+        if slippage_note:
+            lines.append(slippage_note)
+        if real_pnl_usd is not None:
+            txt = f"USDT 損益更正：{'+' if real_pnl_usd >= 0 else ''}{real_pnl_usd:.2f} USDT，依真實成交價"
+            if estimated_usd is not None:
+                txt += f"（原本估算 {'+' if estimated_usd >= 0 else ''}{estimated_usd:.2f}）"
+            lines.append(txt)
+        if extra_note:
+            lines.append(extra_note)
+        lines.append("網頁與統計已改用這個成交價")
+        self._send_telegram_message("\n".join(lines))
+
     def notify_circuit_breaker(self, label, reason):
         """
         風控斷路器「剛觸發」時發送的獨立警示，跟notify_trade_event()是分開的

@@ -96,6 +96,11 @@ FILL_MAX_PAGES = 10        # 界線之後超過這麼多頁就當成沒拿完、
 FILL_BACKFILL_DELAYS = (3, 10, 30, 90)
 
 
+# 部分出場狀態(第15條r74)：這幾個欄位一變就整份寫進資料庫，重啟後還原
+PARTIAL_STATE_KEYS = ("partial_realized_usd", "usd_estimated", "partial_pnl_unknown",
+                      "unanchored_reduce_qty", "unanchored_est_usd")
+
+
 def _start_backfill_thread(fn):
     """背景補登用的執行緒(測試會把它換掉、收下fn自己跑，不會在測試結束後還去打網路)。"""
     threading.Thread(target=fn, daemon=True, name="fill-backfill").start()
@@ -755,6 +760,11 @@ class PaperTradingEngine:
             fill_price=px, slippage_note=note, real_pnl_usd=real_usd, estimated_usd=ctx["est_usd"], extra_note=extra,
         )
 
+    @staticmethod
+    def _save_partial_state(position):
+        """部分出場狀態寫進資料庫(r74)：只在記憶體裡的話，重啟後「還沒認領」的那段會被最後出場混進去。"""
+        db.update_paper_trade_partial_state(position.get("id"), {k: position[k] for k in PARTIAL_STATE_KEYS if k in position})
+
     def _schedule_reduce_backfill(self, position):
         """部分出場(App減碼/ADL)估算之後排背景補登(r72)：那段成交出現時換成實際損益、推進界線。"""
         _start_backfill_thread(lambda: self._run_reduce_backfill(position))
@@ -794,6 +804,7 @@ class PaperTradingEngine:
                     else:
                         txt = f"{fq}@{px}(進場成交價不知道，損益仍是估算)"
                 db.update_paper_trade_fills(position.get("id"), position.get("real_open_order_id"), last_id)
+                self._save_partial_state(position)
                 self._backstop_alert(f"ℹ️ {self.label} 部分出場成交價補登\n"
                                      f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n依成交明細 {txt}")
                 return
@@ -1025,6 +1036,7 @@ class PaperTradingEngine:
                 partial_txt = (f"這部分成交明細查不到({why or '數量對不上'})，用標記價 {px_est} 推估損益 {pnl:+.2f} U(估算)")
             position["real_open_quantity"] = round(qty, 6)
             db.update_paper_trade_real_open(position.get("id"), True, round(qty, 6))
+            self._save_partial_state(position)   # r74：部分出場損益、估算標記、還沒認領的量，重啟後要還在
             self._backstop_alert(
                 f"ℹ️ {self.label} 交易所部位數量減少 {recorded} → {round(qty, 6)}(可能是App手動減碼或ADL)\n"
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
@@ -1269,6 +1281,14 @@ class PaperTradingEngine:
         with self._lock:
             self._position = pos
         self._seeded_from_db = True
+        # r74：重啟前排的部分出場補登跟著記憶體沒了——還有沒認領的量就重新排
+        if pos and (pos.get("unanchored_reduce_qty") or 0) > 1e-9 and (pos.get("real_open_baseline") or 0) <= 1e-9:
+            self._schedule_reduce_backfill(pos)
+        # 進場成交價的補登也一樣(r74)：真的開過倉、有開倉單號、卻沒有進場成交價 → 用單號重新排
+        if pos and pos.get("real_open_executed") and pos.get("real_open_order_id") is not None \
+                and not isinstance(pos.get("entry_actual_price"), (int, float)):
+            self._schedule_fill_backfill("open", pos, {"orderId": pos["real_open_order_id"],
+                                                       "executedQty": str(pos.get("real_open_quantity") or "")})
 
     def _ensure_state_loaded(self):
         """持倉紀錄載入了沒？沒有就試一次。資料庫讀取在鎖外面做，鎖只包住指定部位那一下。"""

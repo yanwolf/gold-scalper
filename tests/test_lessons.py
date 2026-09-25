@@ -27,6 +27,14 @@ from app import paper_trading as pt  # noqa: E402
 import time  # noqa: E402
 QTY = getattr(pt, "QTY_CHECK_EVERY_TICKS", 4)
 
+# r74：背景補登的執行緒，框架預設一律不真的開——收下來，要跑的測試自己拿出來跑。不靠每個測試類別記得換掉
+# (pump-dump-hunter 對照 r73：舊測試裡補登執行緒真的在背景跑、打網路，把「未知」補成已知)。
+# 真的那個存起來，只給驗證正式路徑的那一項用(tests.error_scan 會數有沒有別的測試真的開了)
+_REAL_BACKFILL_START = getattr(pt, "_start_backfill_thread", None)
+_BACKFILL_DEFAULT = []
+if _REAL_BACKFILL_START is not None:
+    pt._start_backfill_thread = _BACKFILL_DEFAULT.append
+
 ONE_WAY_ROWS = [{"symbol": "XAUUSDT", "positionSide": "BOTH", "positionAmt": "0.1"}]
 
 
@@ -94,6 +102,7 @@ def _engine():
     eng._qty_check_tick = 0
     eng._position = None
     _reset_module_state()
+    _BACKFILL_DEFAULT.clear()
     eng._seeded_from_db = True   # r37起「持倉紀錄沒載入就不開倉」：前一個測試模擬讀不到時留下的False不能帶進來
     # 模組層級的「記住的持倉模式」也會被測試改到。在舊版程式上重跑時它可能還不存在(r10才加)，
     # 不存在就略過，不要讓框架本身崩掉(用法第5點r34)
@@ -1239,7 +1248,7 @@ class Lesson34(ExecHarness):
     # 8d：重啟後從資料庫還原開倉單號與界線
     def test_t8d_restore_includes_order_id_and_boundary(self):
         row = (7, "bullish", 4390.0, None, 4380.0, 4395.0, True, "c", "p", 900, "chan_profile_900",
-               True, 0.1, "B1", False, 0.0, 9001, 202)
+               True, 0.1, "B1", False, 0.0, 9001, 202, 4391.2, None)   # r74：SELECT 多了進場成交價、部分出場狀態
         class Cur:
             def __enter__(s): return s
             def __exit__(s, *a): return False
@@ -1252,6 +1261,7 @@ class Lesson34(ExecHarness):
             def putconn(s, c): pass
         with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", Pool(), create=True):
             got = pt.db.get_open_paper_trade(engine_id="chan_profile_900")
+        self.assertIsNotNone(got, "前提：讀得出這一列(欄位數跟 SELECT 對不齊時會讀取失敗、回None，不能讓測試本身崩掉)")
         self.assertEqual(got.get("id"), 7, "前提：真的解析了這一列")
         self.assertEqual((got.get("real_open_order_id"), got.get("fill_boundary_id")), (9001, 202))
 
@@ -1861,7 +1871,10 @@ def _sqlite_pool():
             "entry_expected_price REAL", "entry_actual_price REAL", "entry_slippage_points REAL", "entry_spread_points REAL",
             "exit_expected_price REAL", "exit_actual_price REAL", "exit_slippage_points REAL", "exit_spread_points REAL",
             "entry_book_stale INTEGER", "exit_book_stale INTEGER", "real_open_executed INTEGER", "real_open_quantity REAL",
-            "sl_price REAL", "peak_price REAL", "trailing_active INTEGER", "chan_reason TEXT", "profile_reason TEXT"]
+            "sl_price REAL", "peak_price REAL", "trailing_active INTEGER", "chan_reason TEXT", "profile_reason TEXT",
+            # 重啟還原(load_open_paper_trade)讀的欄位，r74 前這張模擬表沒有，讀持倉的 SQL 在這裡根本跑不了
+            "interval_seconds INTEGER", "backstop_algo_id TEXT", "backstop_used_legacy INTEGER", "real_open_baseline REAL",
+            "real_open_order_id INTEGER", "fill_boundary_id INTEGER", "partial_state TEXT"]
     conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
     class Cur:
         def __init__(s): s.c = conn.cursor()
@@ -1986,8 +1999,111 @@ class RealSqlDb(unittest.TestCase):
         self.assertEqual(rows[0].get("real_pnl_usd_est"), 0.82, "推估值＝點數×張數(8.15×0.1，跟真實損益一樣四捨五入到2位)")
 
 
+    # r74：「還沒認領」的部分出場記號、部分出場損益，重啟後要還在；還原後要重新排補登
+    def test_r74_unclaimed_reduce_survives_restart_and_is_backfilled(self):
+        self.assertTrue(hasattr(pt.db, "update_paper_trade_partial_state"),
+                        "前提：有把部分出場狀態寫進資料庫的函式(在舊版上重跑時是斷言失敗、不是崩掉)")
+        eng = self.eng
+        pool, conn = _sqlite_pool()
+        conn.execute("INSERT INTO paper_trades (id, status, engine_id, direction, entry_price, entry_time, entry_actual_price, "
+                     "sl_price, peak_price, trailing_active, real_open_executed, real_open_quantity, real_open_baseline, "
+                     "real_open_order_id, fill_boundary_id) VALUES (74,'open',?,'bullish',4390.0,'2026-09-25T10:00:00+00:00',"
+                     "4391.2,4370.0,4390.0,0,1,1.0,0.0,9001,101)", (eng.engine_id,))
+        OPEN = (101, 9001, "BUY", 1.0, 4391.2, 0.0, 1000)
+        SEG1 = (150, 9100, "SELL", 0.4, 4380.0, -4.48, 2000)
+        clock, sleep, trades = _lagging([(0.0, OPEN), (2.0, SEG1)])
+        sched = []
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep):
+            eng._load_state()
+            pos = eng._position
+            self.assertIsNotNone(pos, "前提：從資料庫還原了開倉中的部位")
+            with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.6, entry=4391.2, mark=4386.0))):
+                st = eng._check_exchange_quantity(pos)
+            self.assertEqual(st, "reduced", "前提：偵測到 App 減碼 0.4")
+            self.assertTrue(pos.get("usd_estimated"), "前提：那段成交還沒出現，損益是估算的")
+            sched.clear()                               # 服務在補登跑之前重啟：排好的執行緒跟記憶體一起沒了
+            eng._position, eng._seeded_from_db = None, False
+            eng._load_state()
+            pos2 = eng._position
+            self.assertIsNotNone(pos2, "前提：重啟後還原了部位")
+            self.assertAlmostEqual(pos2.get("unanchored_reduce_qty") or 0, 0.4, places=6,
+                                   msg="「還沒認領」的減少量要存進資料庫，重啟後還在(否則最後出場會把那段混進去)")
+            self.assertAlmostEqual(pos2.get("partial_realized_usd") or 0, (4386.0 - 4391.2) * 0.4, places=6,
+                                   msg="部分出場的損益(估算值)也要還在")
+            self.assertTrue(pos2.get("usd_estimated"), "估算標記也要還在")
+            self.assertEqual(pos2.get("entry_actual_price"), 4391.2, "進場成交價要還原(算部分出場的實際損益要用)")
+            self.assertEqual(len(sched), 1, "還原後要重新排補登(重啟前排的那個已經沒了)")
+            for fn in list(sched):
+                fn()
+        self.assertEqual(pos2.get("fill_boundary_id"), 150, "那段出現後補登：界線推進")
+        self.assertAlmostEqual(pos2.get("partial_realized_usd") or 0, (4380.0 - 4391.2) * 0.4, places=6)
+        row = conn.execute("SELECT fill_boundary_id, partial_state FROM paper_trades WHERE id=74").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual(row[0], 150, "界線寫進資料庫")
+        self.assertNotIn("unanchored_reduce_qty", str(row[1] or ""), "補登後資料庫裡的「還沒認領」記號要清掉")
+        self.assertIn("partial_realized_usd", str(row[1] or ""), "前提：部分出場狀態真的寫進資料庫了")
+
+    # r74：進場成交價的補登也只在記憶體裡排——補登跑之前重啟，還原時沒有進場成交價、有開倉單號就重新排
+    def test_r74_missing_entry_price_is_backfilled_after_restart(self):
+        self.assertTrue(hasattr(pt.db, "update_paper_trade_partial_state"), "前提：r74 的還原欄位存在(在舊版上重跑時是斷言失敗)")
+        eng = self.eng
+        pool, conn = _sqlite_pool()
+        conn.execute("INSERT INTO paper_trades (id, status, engine_id, direction, entry_price, entry_time, sl_price, peak_price, "
+                     "trailing_active, real_open_executed, real_open_quantity, real_open_baseline, real_open_order_id, fill_boundary_id) "
+                     "VALUES (75,'open',?,'bullish',4373.49,'2026-09-25T10:00:00+00:00',4360.0,4373.49,0,1,0.1,0.0,17233000001,951)",
+                     (eng.engine_id,))
+        filled = {"orderId": 17233000001, "status": "FILLED", "executedQty": "0.100", "avgPrice": "4373.6"}
+        sched = []
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, filled)), \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True), \
+             mock.patch.object(pt.time, "sleep"):
+            eng._load_state()
+            pos = eng._position
+            self.assertIsNotNone(pos, "前提：還原了部位")
+            self.assertIsNone(pos.get("entry_actual_price"), "前提：資料庫裡沒有進場成交價")
+            self.assertEqual(len(sched), 1, "還原時沒有進場成交價、有開倉單號：重新排補登")
+            for fn in list(sched):
+                fn()
+        self.assertEqual(pos.get("entry_actual_price"), 4373.6, "補登到的進場成交價回填部位")
+        row = conn.execute("SELECT entry_actual_price FROM paper_trades WHERE id=75").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual(row[0], 4373.6, "也寫進資料庫")
+
 
 class FrameworkState(unittest.TestCase):
+    # r74：新增會開背景執行緒的函式，框架的預設也要一起改(第 14 種的另一個樣子)
+    def test_r74_backfill_thread_is_not_really_started_by_default(self):
+        self.assertTrue(hasattr(pt, "_start_backfill_thread"), "前提：程式有背景補登(在舊版上重跑時是斷言失敗、不是崩掉)")
+        eng = _engine()
+        started = []
+        import threading as _th
+        real = _th.Thread.start
+        def spy(t):
+            started.append(t.name)
+            return real(t)
+        before = len(_BACKFILL_DEFAULT)
+        with mock.patch.object(_th.Thread, "start", spy):
+            eng._schedule_fill_backfill("close", _pos(id=1), {"orderId": 1, "executedQty": "0.1"})
+        self.assertEqual(len(_BACKFILL_DEFAULT), before + 1, "前提：真的排了一次補登，被框架的預設收下來")
+        self.assertNotIn("fill-backfill", started, "沒有特別換掉的測試裡，補登執行緒也不能真的開(會在背景打網路)")
+
+    def test_r74_real_backfill_start_runs_in_daemon_thread(self):
+        """正式路徑：真的那個會開一條daemon執行緒去跑(框架預設換掉了，這項確認換掉的東西本身是對的)。"""
+        self.assertIsNotNone(_REAL_BACKFILL_START, "前提：程式有背景補登")
+        import threading as _th
+        done = _th.Event()
+        fn = lambda: done.set()
+        fn._backfill_selftest = True   # tests.error_scan 據此排除這一項
+        _REAL_BACKFILL_START(fn)
+        self.assertTrue(done.wait(2), "背景執行緒真的跑了")
+        ts = [t for t in _th.enumerate() if t.name == "fill-backfill"]
+        self.assertTrue(all(t.daemon for t in ts), "daemon：不能擋住服務關閉")
+
     """用法第5點r44：框架的重設改成自動比對，不靠記得。"""
     def test_reset_restores_every_module_level_container(self):
         import importlib

@@ -32,7 +32,20 @@ def main():
         th.join()
     canary_seen = "inj-canary-stderr" in canary_buf.getvalue()
     stderr_buf = io.StringIO()
-    with mock.patch.object(logging.Logger, "error", capture), mock.patch.object(sys, "stderr", stderr_buf):
+    # r74：數有沒有測試真的開了背景補登執行緒(會在背景打網路、把未知補成已知)。只有驗證正式路徑那一項(目標函式有
+    # _backfill_selftest 標記)可以。金絲雀：先確認計數真的裝上了
+    real_start = threading.Thread.start
+    bf = []
+    def spy(t):
+        if t.name == "fill-backfill" and not getattr(getattr(t, "_target", None), "_backfill_selftest", False):
+            bf.append(t)
+        return real_start(t)
+    with mock.patch.object(threading.Thread, "start", spy):
+        threading.Thread(target=lambda: None, name="fill-backfill").start()
+    bf_canary = len(bf) == 1
+    bf.clear()
+    with mock.patch.object(logging.Logger, "error", capture), mock.patch.object(sys, "stderr", stderr_buf), \
+            mock.patch.object(threading.Thread, "start", spy):
         with open("/dev/null", "w") as devnull:
             r = unittest.TextTestRunner(stream=devnull).run(unittest.defaultTestLoader.loadTestsFromModule(T))
     tracebacks = [l for l in stderr_buf.getvalue().splitlines() if l.startswith("Traceback") or "Exception in thread" in l]
@@ -49,7 +62,13 @@ def main():
     if not canary_seen:
         print("前提不成立：背景執行緒的金絲雀traceback沒攔到，stderr攔截可能沒裝上")
         return 1
-    print(f"stderr攔截：金絲雀有攔到；測試期間的traceback {len(tracebacks)} 行")
+    if not bf_canary:
+        print("前提不成立：背景補登執行緒的計數金絲雀沒數到，計數可能沒裝上")
+        return 1
+    if bf:
+        print(f"有 {len(bf)} 個測試真的開了背景補登執行緒(框架預設應該收下來、不真的開，r74)")
+        return 1
+    print(f"stderr攔截：金絲雀有攔到；測試期間的traceback {len(tracebacks)} 行；真的開的背景補登執行緒 0 個")
     del real_error
     return 1 if (bad or not r.wasSuccessful()) else 0
 
