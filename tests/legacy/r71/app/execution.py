@@ -334,10 +334,19 @@ def extract_fill_price(order_result):
     if not isinstance(order_result, dict):
         return None
     try:
-        avg_price = float(order_result.get("avgPrice", 0))
-        return avg_price if avg_price > 0 else None
+        avg_price = float(order_result.get("avgPrice") or 0)
+    except (TypeError, ValueError):
+        avg_price = 0.0
+    if avg_price > 0:
+        return avg_price
+    # r71(實盤2026-09-25)：RESULT回應FILLED、成交1張，avgPrice跟cumQuote整個不存在。
+    # 有cumQuote(成交額)時，成交額÷成交量就是實際均價(U本位1張=1單位標的)，不是估算
+    try:
+        cum_quote = float(order_result.get("cumQuote") or 0)
+        qty = float(order_result.get("executedQty") or 0)
     except (TypeError, ValueError):
         return None
+    return round(cum_quote / qty, 8) if cum_quote > 0 and qty > 0 else None
 
 
 def analyze_execution_quality(direction, bid, ask, actual_fill_price, is_close=False):
@@ -706,6 +715,8 @@ AMBIGUOUS_CODES = (-1000, -1001, -1006, -1007, "UNCONFIRMED")
 FINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH")
 ORDER_CONFIRM_POLLS = 5          # 送單後沒確認成交時，最多再查幾次訂單
 ORDER_CONFIRM_INTERVAL = 0.3     # 每次間隔(秒)
+FILL_PRICE_POLLS = 3             # 已成交但沒有均價時，查訂單幾次(第15條r71；以前只查1次)
+FILL_PRICE_INTERVAL = 0.5        # 每次間隔(秒)；還是沒有就交給背景補登，不在送單流程裡等太久
 
 
 def extract_filled_qty(order_result):
@@ -823,8 +834,8 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     # 的時間點會比訂單狀態實際確認慢半拍，導致這次回應裡的avgPrice還是"0"
     # (代表當下狀態可能還是"NEW"，不是"FILLED")——如果不處理，執行品質分析
     # 會誤判成「幣安沒有回傳成交價」而完全無法計算。這裡在偵測到avgPrice缺失
-    # 時，短暫等待後重新查詢一次訂單狀態，拿確認後的實際成交價，只重試一次
-    # (不無限重試，避免真的有問題時卡住整個下單流程太久)(修正記錄見README)。
+    # 時，短暫等待後重新查詢訂單狀態，拿確認後的實際成交價(r71起查FILL_PRICE_POLLS次，以前只查1次)，
+    # 次數有上限，避免真的有問題時卡住整個下單流程太久；再查不到交給背景補登(修正記錄見README)。
     # 沒確認成交(ACK或撮合回填慢)：多查幾次訂單。還是沒確認就不能回報成功——平倉時「成功」代表
     # 會直接撤交易所停損、結帳。改回「結果不明」，交給呼叫端查部位確認(開倉：看得到就認領；平倉：確認沒了才結帳)
     # 不是最終狀態(NEW、部分成交)：多查幾次；還不是就撤掉那張單再查一次拿最終成交量(第15條r43/r44：
@@ -851,12 +862,20 @@ def place_market_order(side, quantity, symbol=None, reduce_only=False, account=D
     if success and isinstance(result, dict) and result.get("status") in FINAL_ORDER_STATES and extract_filled_qty(result) is None:
         return False, {"code": "NOT_FILLED", "msg": f"訂單最終狀態{result.get('status')}、成交0", "orderId": result.get("orderId")}
 
+    # 已成交但回應沒有均價(第15條r71：FILLED卻沒有avgPrice/cumQuote)：查訂單幾次，不是只查一次。
+    # 查到就換成查到的那份；都沒有就照原回應回傳(成交是確定的)，由呼叫端查成交明細、再不行排背景補登
     if success and extract_fill_price(result) is None and isinstance(result, dict) and result.get("orderId"):
-        logger.warning(f"訂單{result.get('orderId')}的avgPrice尚未填入(狀態:{result.get('status')})，0.5秒後重新查詢一次")
-        time.sleep(0.5)
-        retry_success, retry_result = get_order_status(symbol, result["orderId"], account=account)
-        if retry_success and extract_fill_price(retry_result) is not None:
-            result = retry_result
+        oid = result["orderId"]
+        logger.warning(f"訂單{oid}已回應(狀態:{result.get('status')})但沒有成交均價，原始回應：{result}")
+        for i in range(FILL_PRICE_POLLS):
+            time.sleep(FILL_PRICE_INTERVAL)
+            ok_p, polled = get_order_status(symbol, oid, account=account)
+            if ok_p and extract_fill_price(polled) is not None:
+                logger.info(f"訂單{oid}第{i + 1}次查詢拿到成交均價{extract_fill_price(polled)}")
+                result = polled
+                break
+        else:
+            logger.warning(f"訂單{oid}查{FILL_PRICE_POLLS}次仍沒有成交均價，交給呼叫端查成交明細／背景補登")
 
     return success, result
 

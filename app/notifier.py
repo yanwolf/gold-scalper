@@ -189,7 +189,8 @@ class TelegramNotifier:
         kind = "出場" if action == "close" else "進場"
         lines = [
             f"🧾 成交價補登【{label}】{kind}",
-            f"訂單：{order_id}（帳戶：{account}）",
+            (f"訂單：{order_id}（帳戶：{account}）" if order_id is not None
+             else f"來源：成交明細（交易所端平倉或分段成交，帳戶：{account}）"),
             f"實際成交均價：{fill_price:.2f}",
         ]
         if slippage_note:

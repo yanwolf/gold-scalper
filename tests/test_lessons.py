@@ -1700,6 +1700,134 @@ class LiveFilledNoAvgPrice(ExecHarness):
         self.assertEqual(len(self.bnotes), 1, "補發一則進場補登通知")
 
 
+def _lagging(rows_by_time):
+    """成交明細稍後才出現(r71/r72)：rows_by_time=[(第幾秒起看得到, 成交列)]，時間由假sleep推進。回傳(clock, sleep, userTrades)。"""
+    clock = {"t": 0.0}
+    def sleep(s):
+        clock["t"] += s
+    def trades(*a, **k):
+        return (True, _fills(*[r for when, r in rows_by_time if clock["t"] >= when]))
+    return clock, sleep, trades
+
+
+class Lesson72(ExecHarness):
+    """
+    r72(pump-dump-hunter 對照 r71)：用「界線之後的平倉成交」算出場價時也要湊滿數量。gold-scalper 有三個地方用它：
+    交易所端平倉的結帳、平倉分段成交後的加權、App 減碼的部分出場(這處本來就要求剛好等於減少量)。
+    湊不滿 → 當成還查不到、估算、排背景補登；補登查到就更正資料庫與部位。
+    另外：部分出場估算時界線沒推進，那段成交之後才出現，最後出場會把它混進去——要先跳過那一段。
+    """
+    OPEN = (101, 9001, "BUY", 1.0, 4391.2, 0.0, 1000)
+    SEG1 = (150, 9100, "SELL", 0.4, 4380.0, -4.48, 2000)
+    SEG2 = (151, 9200, "SELL", 0.6, 4384.0, -4.32, 2100)
+
+    def _pos(self, **kw):
+        p = _pos(real_open_quantity=1.0, entry_actual_price=4391.2, entry_price=4390.0, real_open_baseline=0.0,
+                 real_open_order_id=9001, fill_boundary_id=101, backstop_algo_id=None, backstop_price=None, id=72)
+        p.update(kw)
+        self.eng._position = p
+        return p
+
+    def _run(self, rows_by_time, step):
+        """在同一組(會隨時間出現的)成交明細下，先跑被測的那一步，再把排進來的背景補登跑完。"""
+        clock, sleep, trades = _lagging(rows_by_time)
+        self.bnotes = []
+        with mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True) as ut, \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep), \
+             mock.patch.object(pt.db, "update_paper_trade_exit_execution") as ux, \
+             mock.patch.object(pt.db, "update_paper_trade_fills") as uf, \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True,
+                               side_effect=lambda **k: self.bnotes.append(k)), \
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+            out = step()
+            n_sync = len(self.dbclose)
+            for fn in list(self.backfills):
+                fn()
+        return out, ut, ux, uf, n_sync
+
+    def _gone_step(self, pos):
+        def step():
+            pos["gone_checks"] = 2
+            with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0, mark=4395.0))), \
+                 mock.patch.object(ex, "close_position", return_value=(False, "目前沒有未平倉部位可以平")):
+                return self.eng._check_exchange_quantity(pos)
+        return step
+
+    def _reduce_step(self, pos):
+        def step():
+            with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.6, entry=4391.2, mark=4386.0))):
+                return self.eng._check_exchange_quantity(pos)
+        return step
+
+    def test_r72_external_close_incomplete_fills_not_used_then_backfilled(self):
+        pos = self._pos()
+        st, ut, ux, _, n_sync = self._run([(0.0, self.OPEN), (0.0, self.SEG1), (2.0, self.SEG2)], self._gone_step(pos))
+        self.assertEqual(st, "gone", "前提：判定交易所端已平掉")
+        self.assertTrue(ut.called, "前提：真的查了成交明細")
+        self.assertEqual((n_sync, len(self.dbclose_kw) >= 1, len(self.notes) > 0), (1, True, True), "前提：當下結帳了、通知有送出")
+        self.assertTrue(self.dbclose_kw[0].get("pnl_estimated"), "平倉成交只先出現 0.4/1 張：當下不能拿來當出場價，要標估算")
+        self.assertIsNone(self.notes[-1].get("real_pnl_usd"), "當下的 USDT 損益不能標成依真實成交價")
+        self.assertEqual(len(self.dbclose), 2, "背景補登查到後要把平倉紀錄改寫一次(出場價、點數損益、取消估算)")
+        vwap = 0.4 * 4380.0 + 0.6 * 4384.0
+        self.assertAlmostEqual(self.dbclose[1][1], vwap, places=6, msg="改寫的出場價＝湊滿 1 張後的加權均價")
+        self.assertIs(self.dbclose_kw[1].get("pnl_estimated"), False, "改寫後不再是估算")
+        self.assertEqual(len(self.bnotes), 1, "補發一則補登通知")
+        self.assertAlmostEqual(self.bnotes[0].get("real_pnl_usd") or 0, (vwap - 4391.2) * 1.0, places=6)
+
+    def test_r72_external_close_fills_not_yet_visible_then_backfilled(self):
+        pos = self._pos()
+        st, ut, _, _, n_sync = self._run([(0.0, self.OPEN), (2.0, self.SEG1), (2.0, self.SEG2)], self._gone_step(pos))
+        self.assertEqual(st, "gone", "前提：判定交易所端已平掉")
+        self.assertEqual((n_sync, len(self.dbclose_kw) >= 1), (1, True), "前提：當下結帳了")
+        self.assertTrue(self.dbclose_kw[0].get("pnl_estimated"), "前提：當下成交明細還沒出現，是估算")
+        self.assertEqual(len(self.dbclose), 2, "界線之後的平倉成交稍後才出現：背景補登要改寫平倉紀錄")
+        self.assertAlmostEqual(self.dbclose[1][1], 0.4 * 4380.0 + 0.6 * 4384.0, places=6)
+
+    def test_r72_partial_close_weighting_waits_for_all_segments(self):
+        # 平倉第一張只成交 0.4(r45 的待平倉)，第二張平掉剩下 0.6、回應有均價；出場價要兩段加權，但第一段稍後才出現在成交明細
+        pos = self._pos(real_open_quantity=0.6, partial_close_filled=True, close_orig_qty=1.0)
+        second = {"orderId": 9200, "status": "FILLED", "executedQty": "0.600", "avgPrice": "4384.0"}
+        cp_box = []
+        def step():
+            with mock.patch.object(ex, "get_position_info", return_value=(True, _rows(0.6, entry=4391.2))), \
+                 mock.patch.object(ex, "close_position", return_value=(True, second)) as cp:
+                self.eng._close_position(pos, 4384.0, "觸及停損")
+                cp_box.append(cp.call_count)
+        self._run([(0.0, self.OPEN), (0.0, self.SEG2), (2.0, self.SEG1)], step)
+        self.assertEqual(cp_box, [1], "前提：第二張平倉單送出、成交")
+        self.assertGreater(len(self.notes), 0, "前提：平倉通知有送出")
+        self.assertIsNone(self.notes[-1].get("real_pnl_usd"),
+                          "兩段只查到一段：不能用一段(或只用最後一張單的均價)算整筆 1 張的真實損益")
+        self.assertEqual(len(self.bnotes), 1, "背景補登查到兩段後補發通知")
+        vwap = 0.4 * 4380.0 + 0.6 * 4384.0
+        self.assertAlmostEqual(self.bnotes[0].get("real_pnl_usd") or 0, (vwap - 4391.2) * 1.0, places=6,
+                               msg="兩段加權、數量用原本的 1 張")
+
+    def test_r72_estimated_reduce_is_backfilled_and_boundary_advanced(self):
+        pos = self._pos()
+        st, _, _, uf, _ = self._run([(0.0, self.OPEN), (2.0, self.SEG1)], self._reduce_step(pos))
+        self.assertEqual(st, "reduced", "前提：偵測到減少 0.4")
+        self.assertEqual(pos.get("real_open_quantity"), 0.6, "前提：帳上數量更新成 0.6")
+        self.assertEqual(pos.get("fill_boundary_id"), 150, "減碼那段成交稍後出現：背景補登後界線推進到那一筆")
+        self.assertAlmostEqual(pos.get("partial_realized_usd") or 0, (4380.0 - 4391.2) * 0.4, places=6,
+                               msg="部分出場的損益換成實際成交價算的(不是標記價估的)")
+        self.assertFalse(pos.get("usd_estimated"), "補登後這筆不再含估算")
+        self.assertTrue(uf.called, "界線要寫進資料庫(重啟後也在)")
+        one(self.eng.alerts, "部分出場成交價補登")
+
+    def test_r72_final_close_after_estimated_reduce_skips_that_segment(self):
+        pos = self._pos()
+        st1, _, _, _, _ = self._run([(0.0, self.OPEN)], self._reduce_step(pos))   # 減碼當下成交明細還沒出現：估算
+        self.assertEqual(st1, "reduced", "前提：偵測到減少")
+        self.assertTrue(pos.get("usd_estimated"), "前提：減碼那段是估算的")
+        self.eng._position = pos
+        self.backfills.clear()   # 那次補登還沒跑到，部位就被交易所端平掉了
+        st2, _, _, _, n_sync = self._run([(0.0, self.OPEN), (0.0, self.SEG1), (0.0, self.SEG2)], self._gone_step(pos))
+        self.assertEqual(st2, "gone", "前提：判定交易所端已平掉")
+        self.assertEqual((n_sync, len(self.dbclose), len(self.notes) > 0), (1, 1, True), "前提：結帳了、通知有送出")
+        self.assertEqual(self.dbclose[0][1], 4384.0, "最後出場只算剩下那 0.6 張(id151)，不能把減碼那段(id150)混進來")
+
+
 class BackfillNoticeFormat(unittest.TestCase):
     """補登通知要真的跑格式化(ExecHarness 底下通知被 mock 掉，第20種)。"""
     def test_r71_backfill_notice_format(self):
