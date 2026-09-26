@@ -1998,6 +1998,8 @@ def _sqlite_pool():
             # r76：背景補登還沒完成的記號(進場／出場各一欄)
             "open_backfill TEXT", "exit_backfill TEXT"]
     conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
+    conn.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")   # r85：緊急停止狀態
+    conn.create_function("now", 0, lambda: "2026-09-26T00:00:00+00:00")
     class Cur:
         def __init__(s): s.c = conn.cursor()
         def __enter__(s): return s
@@ -2365,6 +2367,77 @@ class RealSqlDb(unittest.TestCase):
         self.assertIn('"ended"', str(row[0] or ""), "放棄：記號標成已結束，不是刪掉")
         restart()
         self.assertEqual(runs, [1, 0], "放棄過的：再重啟不能又查一輪(舊紀錄的規則只給從來沒有記號的)")
+
+    # ---- r85：執行時才長出來的部位欄位，重啟後要還在(待平倉、分段平倉、結構停利、反轉確認計數、交易所停損價) ----
+    def _restart(self, pool):
+        eng = self.eng
+        eng._position, eng._seeded_from_db = None, False
+        for k in [k for k in vars(eng) if "rescan" in k]:
+            setattr(eng, k, False)
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(pt, "_start_backfill_thread", create=True):
+            eng._load_state()
+        return eng._position
+
+    def test_r85_pending_close_survives_restart(self):
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 85)
+        pos = self._restart(pool)
+        self.assertIsNotNone(pos, "前提：從資料庫還原了部位")
+        # 平倉第一張只成交 0.4：剩 0.6 待平倉(r43/r44 的路徑會設這幾個欄位，然後進待平倉)
+        pos["close_orig_qty"], pos["partial_close_filled"], pos["real_open_quantity"] = 1.0, True, 0.6
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            self.eng._keep_after_failed_close(pos, 4380.0, "觸及停損", "只成交一部分", 0.6)
+        self.assertTrue(pos.get("pending_close"), "前提：記成待平倉")
+        pos2 = self._restart(pool)                     # 待平倉期間部署新版、服務重啟
+        self.assertIsNotNone(pos2, "前提：重啟後還原了部位")
+        self.assertEqual((pos2.get("pending_close") or {}).get("reason"), "觸及停損",
+                         "待平倉(已經決定出場、還沒平完)重啟後要還在，否則不會再重試平倉——出場決定被悄悄忘掉")
+        self.assertEqual(pos2.get("close_fail_count"), 1, "失敗次數也在(告警節奏接得上)")
+        self.assertTrue(pos2.get("partial_close_filled"), "分段平倉的標記要在：最後出場價要兩段加權")
+        self.assertEqual(pos2.get("close_orig_qty"), 1.0, "原本的數量要在：真實損益用整筆 1 張算")
+
+    def test_r85_tick_state_survives_restart(self):
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 86)
+        pos = self._restart(pool)
+        self.assertIsNotNone(pos, "前提：從資料庫還原了部位")
+        def tick():   # 這一輪長出來的：結構停利、反轉確認計數、交易所停損價與持倉模式
+            pos.update(tp_price=4420.0, pending_reversal_direction="bearish", pending_reversal_count=1,
+                       backstop_price=4371.5, backstop_hedge=True)
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(self.eng, "_tick", side_effect=tick):
+            self.eng._loop_once()
+        pos2 = self._restart(pool)
+        self.assertIsNotNone(pos2, "前提：重啟後還原了部位")
+        got = {k: pos2.get(k) for k in ("tp_price", "pending_reversal_direction", "pending_reversal_count",
+                                        "backstop_price", "backstop_hedge")}
+        self.assertEqual(got, {"tp_price": 4420.0, "pending_reversal_direction": "bearish", "pending_reversal_count": 1,
+                               "backstop_price": 4371.5, "backstop_hedge": True},
+                         "每輪結束時，這一輪長出來、重啟後還要用的部位欄位要寫進資料庫")
+
+    # r85：手動緊急停止(含強制平倉後自動停止)重啟後要還在——以前只在記憶體，部署一次就悄悄解除
+    def test_r85_manual_halt_survives_restart(self):
+        from app import risk_guard as RG
+        pool, conn = _sqlite_pool()
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            RG.set_manual_halt(True, "強制平倉後自動停止(測試)")
+            self.assertTrue(RG.get_manual_halt().get("active"), "前提：停止中")
+        _restore_namespaces()   # 模擬重啟：程式模組回到剛載入的樣子(記憶體裡的停止狀態沒了)
+        self.assertFalse(RG._manual_halt.get("active"), "前提：記憶體裡的停止狀態真的回到預設")
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            h = RG.get_manual_halt()
+        self.assertTrue(h.get("active"), "重啟後緊急停止要還在(不能部署一次就悄悄解除)")
+        self.assertEqual(h.get("reason"), "強制平倉後自動停止(測試)", "原因也要在")
+
+    def test_r85_manual_halt_unreadable_is_treated_as_halted(self):
+        from app import risk_guard as RG
+        _restore_namespaces()
+        with mock.patch.object(pt.db, "_enabled", True), \
+             mock.patch.object(pt.db, "load_app_settings", return_value=(False, "連線逾時")):
+            h = RG.get_manual_halt()
+        self.assertTrue(h.get("active"), "讀不到停止狀態：保守當成停止中(不能當成沒有停止)")
+        self.assertIn("讀不到", str(h.get("reason")), "原因要講明是讀不到")
 
 
 class FrameworkState(unittest.TestCase):

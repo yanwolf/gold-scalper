@@ -552,6 +552,24 @@ def set_paper_trade_backfill(trade_id, action, payload):
         _db_write_error("記錄補登記號", e)
 
 
+def end_paper_trade_backfill(trade_id, action, how):
+    """
+    結束補登記號(第15條r78)：標成 {"ended": how}，**不是刪掉**。刪掉就分不出「放棄過」跟「r76 以前、從來沒有記號的舊紀錄」，
+    舊紀錄的重排規則會把放棄過的又撿回來、每次重啟再查一輪。how：found / gave_up / found_elsewhere。
+    """
+    set_paper_trade_backfill(trade_id, action, json.dumps({"ended": how, "at": datetime.now(timezone.utc).isoformat()}))
+
+
+def backfill_mark_state(raw):
+    """記號的狀態：None(從來沒有)／"pending"(還沒完成)／"ended"(已結束)。"""
+    if raw is None:
+        return None
+    return "ended" if str(raw).startswith(ENDED_PREFIX) else "pending"
+
+
+ENDED_PREFIX = '{"ended"'
+
+
 def load_pending_backfills(engine_id):
     """
     重啟時用(第15條r76)：這個引擎還有「補登還沒完成」記號的紀錄(不分開倉中或已平倉)。
@@ -563,15 +581,20 @@ def load_pending_backfills(engine_id):
         conn = _pool.getconn()
         try:
             with conn.cursor() as cur:
+                # 已結束的(r78)不撈：歷史紀錄越來越多，每次重啟只該看還沒完成的
                 cur.execute("""
                     SELECT id, open_backfill, exit_backfill FROM paper_trades
-                    WHERE engine_id = %s AND (open_backfill IS NOT NULL OR exit_backfill IS NOT NULL)
+                    WHERE engine_id = %s
+                      AND ((open_backfill IS NOT NULL AND open_backfill NOT LIKE %s)
+                        OR (exit_backfill IS NOT NULL AND exit_backfill NOT LIKE %s))
                     ORDER BY id;
-                """, (engine_id,))
+                """, (engine_id, ENDED_PREFIX + "%", ENDED_PREFIX + "%"))
                 rows = cur.fetchall()
         finally:
             _pool.putconn(conn)
-        return True, [{"trade_id": r[0], "open": r[1], "close": r[2]} for r in rows]
+        return True, [{"trade_id": r[0],
+                       "open": r[1] if backfill_mark_state(r[1]) == "pending" else None,
+                       "close": r[2] if backfill_mark_state(r[2]) == "pending" else None} for r in rows]
     except Exception as e:
         logger.error(f"讀取補登記號失敗: {e}")
         return False, f"{type(e).__name__}: {e}"
@@ -723,7 +746,7 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
                            chan_reason, profile_reason, interval_seconds, engine_id,
                            real_open_executed, real_open_quantity,
                            backstop_algo_id, backstop_used_legacy, real_open_baseline,
-                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state
+                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state, open_backfill
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -750,6 +773,8 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
             "entry_actual_price": row[18],
         }
         pos.update(_parse_partial_state(row[19]))   # r74：部分出場狀態(含還沒認領的減少量)
+        # r78：進場補登記號的狀態(從來沒有／還沒完成／已結束)——舊紀錄的重排規則只給「從來沒有」的
+        pos["open_backfill_state"] = backfill_mark_state(row[20])
         return True, pos
     except Exception as e:
         # 讀取失敗≠沒有持倉(第8條r37)：以前這裡回None，跟「沒有持倉」一模一樣——資料庫短暫連不上的那次重啟，

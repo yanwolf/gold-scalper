@@ -175,6 +175,122 @@ RESTORE_SELFTEST = [  # (原始碼, 預期報出)
 ]
 
 
+# ---------------------------------------------------------------- r85：執行時長出來的狀態，重啟後讀不讀得回來
+APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
+POSITION_NAMES = ("position", "pos", "pos2", "p")
+# paper_trades 的欄位裡，還原持倉時刻意不讀的(寫明理由)：都是平倉後、或只給網頁看的
+NOT_SELECTED_COLUMNS = {
+    "status": "WHERE 條件本身",
+    "exit_price": "平倉後", "exit_time": "平倉後", "exit_reason": "平倉後", "pnl_points": "平倉後", "pnl_estimated": "平倉後",
+    "exit_expected_price": "平倉後", "exit_actual_price": "平倉後", "exit_slippage_points": "平倉後",
+    "exit_spread_points": "平倉後", "exit_book_stale": "平倉後",
+    "exit_backfill": "出場補登記號：重啟時由 load_pending_backfills 另外讀",
+    "entry_expected_price": "執行品質，只給網頁看", "entry_slippage_points": "執行品質，只給網頁看",
+    "entry_spread_points": "執行品質，只給網頁看", "entry_book_stale": "執行品質，只給網頁看",
+}
+
+
+def runtime_keys(sources):
+    """程式裡寫到部位上的鍵：position["x"] = …／position.setdefault("x", …)／position.update(x=…)。底線開頭(同一次呼叫內的暫存)不算。"""
+    out = {}
+    for name, src in sources.items():
+        for n in ast.walk(ast.parse(src)):
+            key = None
+            if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and isinstance(n.value, ast.Name) \
+                    and n.value.id in POSITION_NAMES and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str):
+                key = n.slice.value
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
+                    and n.func.value.id in POSITION_NAMES and n.func.attr == "setdefault" and n.args \
+                    and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str):
+                key = n.args[0].value
+            if key and not key.startswith("_"):
+                out.setdefault(key, f"{name}:{n.lineno}")
+    return out
+
+
+def _literal_tuple(tree, name):
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+            v = n.value
+            if isinstance(v, ast.BinOp):   # A + (…)
+                return _literal_tuple(tree, v.left.id) + tuple(ast.literal_eval(v.right))
+            return tuple(ast.literal_eval(v)) if not isinstance(v, ast.Dict) else tuple(ast.literal_eval(v))
+    return ()
+
+
+def restored_keys(db_src, pt_src):
+    """重啟時會讀回來的部位鍵：load_open_paper_trade 組出來的字典鍵＋存在 partial_state 的 RUNTIME_STATE_KEYS＋程式在還原時另外設的。"""
+    db_tree, pt_tree = ast.parse(db_src), ast.parse(pt_src)
+    fn = next(n for n in db_tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_open_paper_trade")
+    keys = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Dict):
+            keys |= {k.value for k in n.keys if isinstance(k, ast.Constant)}
+        if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store) and isinstance(n.slice, ast.Constant):
+            keys.add(n.slice.value)
+    return keys | set(_literal_tuple(pt_tree, "RUNTIME_STATE_KEYS")), set(_literal_tuple(pt_tree, "NOT_RESTORED_KEYS"))
+
+
+def state_key_problems(sources, db_src, pt_src):
+    restored, exempt = restored_keys(db_src, pt_src)
+    written = runtime_keys(sources)
+    out = [f"部位鍵 {k}({where})執行時寫、重啟後讀不回來：加進 RUNTIME_STATE_KEYS，或寫明理由列進 NOT_RESTORED_KEYS"
+           for k, where in sorted(written.items()) if k not in restored and k not in exempt]
+    out += [f"NOT_RESTORED_KEYS 裡的 {k} 程式已經不寫了(過期的豁免)" for k in sorted(exempt) if k not in written]
+    return out
+
+
+def column_problems(db_src):
+    """paper_trades 的欄位：還原持倉的 SELECT 沒選的，要在 NOT_SELECTED_COLUMNS 寫明理由(新欄位忘了進 SELECT 就報)。"""
+    import re
+    i = db_src.index("def load_open_paper_trade")
+    sel = set(re.findall(r"\w+", re.search(r"SELECT(.*?)FROM paper_trades", db_src[i:], re.S).group(1)))
+    j = db_src.index("CREATE TABLE IF NOT EXISTS paper_trades")
+    base = re.findall(r"^\s+(\w+)\s+(?:SERIAL|TEXT|DOUBLE|BOOLEAN|INTEGER|BIGINT|TIMESTAMPTZ|REAL|NUMERIC)",
+                      db_src[j:db_src.index(");", j)], re.M)
+    cols = list(dict.fromkeys(base + re.findall(r"ADD COLUMN IF NOT EXISTS (\w+)", db_src)))
+    out = [f"paper_trades.{c} 還原持倉時沒讀、也沒寫明理由" for c in cols if c not in sel and c not in NOT_SELECTED_COLUMNS]
+    out += [f"NOT_SELECTED_COLUMNS 裡的 {c} 已經不存在或已經有讀(過期的豁免)" for c in NOT_SELECTED_COLUMNS
+            if c not in cols or c in sel]
+    return out, len(cols), len(sel)
+
+
+class TestStateKeys(unittest.TestCase):
+    def _src(self, f):
+        with open(os.path.join(APP_DIR, f), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_selftest(self):
+        db_src = ("def load_open_paper_trade():\n    pos = {'id': 1, 'sl_price': 2}\n    pos['entry_actual_price'] = 3\n")
+        pt_src = "A = ('usd_estimated',)\nRUNTIME_STATE_KEYS = A + ('pending_close',)\nNOT_RESTORED_KEYS = {'gone_checks': 'x'}\n"
+        ok = {"p": "position['pending_close'] = 1\nposition['gone_checks'] = 1\nposition.setdefault('usd_estimated', 1)\n"
+                   "pos['sl_price'] = 1\nposition['_tmp'] = 1\n"}
+        self.assertEqual(state_key_problems(ok, db_src, pt_src), [], "都讀得回來或有理由")
+        bad = {"p": "position['pending_close'] = 1\nposition['gone_checks'] = 1\nposition['last_close_win'] = True\n"}
+        self.assertEqual(len(state_key_problems(bad, db_src, pt_src)), 1, "執行時長出來、沒進清單(crypto-screener 的 lastCloseWin)")
+        stale = {"p": "position['pending_close'] = 1\n"}
+        self.assertEqual(len(state_key_problems(stale, db_src, pt_src)), 1, "豁免清單裡的鍵程式已經不寫：過期")
+        bad2 = {"p": "position.setdefault('cooldown_until', 1)\nposition['gone_checks'] = 1\n"}
+        self.assertEqual(len(state_key_problems(bad2, db_src, pt_src)), 1, "setdefault 長出來的也算")
+
+    def test_runtime_position_keys_are_restored(self):
+        sources = {f: self._src(f) for f in ("paper_trading.py", "trading_core.py")}
+        written = runtime_keys(sources)
+        self.assertGreater(len(written), 20, "前提：真的掃到了寫進部位的鍵")
+        self.assertIn("pending_close", written, "前提：掃得到待平倉")
+        self.assertEqual(state_key_problems(sources, self._src("db.py"), self._src("paper_trading.py")), [])
+
+    def test_columns_are_read_on_restore(self):
+        probs, n_cols, n_sel = column_problems(self._src("db.py"))
+        self.assertGreater(n_cols, 30, "前提：真的解析到了 paper_trades 的欄位")
+        self.assertGreater(n_sel, 15, "前提：真的解析到了還原持倉的 SELECT")
+        self.assertEqual(probs, [])
+        fake = self._src("db.py").replace("ADD COLUMN IF NOT EXISTS exit_backfill TEXT;",
+                                          "ADD COLUMN IF NOT EXISTS exit_backfill TEXT;\n ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS cooldown_until TEXT;")
+        self.assertNotEqual(fake, self._src("db.py"), "前提：反向樣本真的插進去了")
+        self.assertEqual(len(column_problems(fake)[0]), 1, "自我驗證：新增欄位沒進 SELECT 就報")
+
+
 class TestChecker(unittest.TestCase):
     def test_restore_order_selftest(self):
         for src, flagged in RESTORE_SELFTEST:

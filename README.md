@@ -2399,6 +2399,13 @@ tp_price目前只存在記憶體，服務重啟後那筆未平倉單退回只用
 - `tests/check_newapi.py`：條件看正負（`not hasattr` 的本體不算守住、else 那邊算）；「寫在前面的敘述」只認擋得住的（assert、assertTrue、`if not hasattr: return/raise/fail/skipTest`）。自我驗證 49 組。
 - 程式本身沒改（preflight 版本號除外）。
 
+## 修正：執行時長出來的部位狀態與緊急停止，重啟後要還在（BINANCE_LESSONS.md 第 8 條 r85／r86）
+
+- 部位的執行狀態白名單擴大（`RUNTIME_STATE_KEYS`）：待平倉、分段平倉、結構停利、反轉確認計數、交易所停損價與持倉模式。待平倉當場寫，其他每輪結束有變才寫。
+- 手動緊急停止（含強制平倉後自動停止）存進資料庫，重啟後讀回；讀不到或讀不懂當成停止中。
+- `tests/check_tests.py`：執行時寫到部位上的鍵要讀得回來或寫明理由；`paper_trades` 欄位沒進還原的 SELECT 要寫明理由。
+- `tests/legacy/` 改留 r79、r84。
+
 ## 舊版程式要留著（BINANCE_LESSONS.md 用法第 5 點 r37）
 
 每次照清單修改、部署前，在 git 打標籤，之後才能拿新的測試跑舊版、確認框架在舊版上不會崩：
