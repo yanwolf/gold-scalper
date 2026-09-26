@@ -69,7 +69,94 @@ for _mn in _STATE_MODULES:
             _STATE_SNAPSHOT.append((_mod, _k, _copy.deepcopy(_v)))
 
 
+# r80：結構性的命名空間還原(pump-dump-hunter r80 的做法)。以前只還原「底線開頭的容器」＋手列的旗標清單(_reset_named_state)，
+# 管不到兩種：用新值取代的值(旗標、常數被改掉)、執行期才長出來的屬性。框架自己的替換(上面的 _start_backfill_thread)裝好之後，
+# 拍下每個程式模組的整份命名空間；每次還原：容器照內容還原(保留同一個物件，別的模組 from x import 拿到的參照才不會斷)、
+# 其他還原成快照那個物件、之後才長出來的屬性刪掉。**正在生效的模擬不動**(Mock 物件)：還原排在裝模擬之前(_engine() 在 setUp
+# 的最前面)，但萬一有人在裝好模擬之後才取引擎，也不能把剛裝上的模擬還原掉(check_tests 另外靜態檢查這個順序)。
+_MISSING = object()
+# 正在生效的 patch(不管是 with 還是 start())：記下來，還原時跳過它們的目標。只認 Mock 物件不夠——
+# patch.object(X, "a", 普通的值) 與 patch.dict 都不是 Mock(r80 的探針測試第一次就撞到)
+_ACTIVE_PATCHES = []
+_orig_patch_enter, _orig_patch_exit = mock._patch.__enter__, mock._patch.__exit__
+_orig_pdict_enter, _orig_pdict_exit = mock._patch_dict.__enter__, mock._patch_dict.__exit__
+
+
+def _patch_enter(self):
+    r = _orig_patch_enter(self)
+    _ACTIVE_PATCHES.append(self)
+    return r
+
+
+def _patch_exit(self, *a):
+    if self in _ACTIVE_PATCHES:
+        _ACTIVE_PATCHES.remove(self)
+    return _orig_patch_exit(self, *a)
+
+
+def _pdict_enter(self):
+    r = _orig_pdict_enter(self)
+    _ACTIVE_PATCHES.append(self)
+    return r
+
+
+def _pdict_exit(self, *a):
+    if self in _ACTIVE_PATCHES:
+        _ACTIVE_PATCHES.remove(self)
+    return _orig_pdict_exit(self, *a)
+
+
+mock._patch.__enter__, mock._patch.__exit__ = _patch_enter, _patch_exit
+mock._patch_dict.__enter__, mock._patch_dict.__exit__ = _pdict_enter, _pdict_exit
+
+
+def _active_patch_targets():
+    """(id(目標), 屬性) 與 patch.dict 的 id(字典)。"""
+    attrs, dicts = set(), set()
+    for p in _ACTIVE_PATCHES:
+        if isinstance(p, mock._patch_dict):
+            dicts.add(id(p.in_dict))
+        elif getattr(p, "target", None) is not None:
+            attrs.add((id(p.target), p.attribute))
+    return attrs, dicts
+
+
+_NS_SNAPSHOT = []
+for _mn in _STATE_MODULES:
+    _mod = _importlib.import_module(_mn)
+    _snap = {}
+    for _k, _v in vars(_mod).items():
+        if _k.startswith("__"):
+            continue
+        if isinstance(_v, (dict, list, set)) or type(_v).__name__ == "deque":
+            _snap[_k] = ("container", _v, _copy.copy(_v))
+        else:
+            _snap[_k] = ("value", _v, None)
+    _NS_SNAPSHOT.append((_mod, _snap))
+
+
+def _restore_namespaces():
+    active, active_dicts = _active_patch_targets()
+    for mod, snap in _NS_SNAPSHOT:
+        cur = vars(mod)
+        for k in [k for k in list(cur) if k not in snap and not k.startswith("__")]:
+            if (id(mod), k) not in active and not isinstance(cur[k], mock.NonCallableMock):   # 還在生效的 patch：不動
+                delattr(mod, k)
+        for k, (kind, obj, contents) in snap.items():
+            now = cur.get(k, _MISSING)
+            if (id(mod), k) in active or isinstance(now, mock.NonCallableMock) or id(obj) in active_dicts:
+                continue                                           # 正在生效的模擬：不動
+            if kind == "container":
+                if now is not obj:
+                    setattr(mod, k, obj)                           # 整個換掉了：換回原本那個物件
+                obj.clear()
+                (obj.update(contents) if isinstance(obj, (dict, set)) else obj.extend(contents))
+            elif now is not obj:
+                setattr(mod, k, obj)
+
+
 def _reset_module_state():
+    _restore_namespaces()   # r80：先整份還原，再做下面既有的(深拷貝還原、手列清單)——多一層，不衝突
     for _mod, _k, _init in _STATE_SNAPSHOT:
         cur = getattr(_mod, _k)
         cur.clear()
@@ -123,6 +210,7 @@ _ENGINE_PRISTINE = _pristine_engine_state(next(iter(pt.PAPER_TRADING_ENGINES.val
 
 
 def _engine():
+    _restore_namespaces()   # r80：最先做——連「取引擎」用的容器都可能被前一個測試換掉
     eng = next(iter(pt.PAPER_TRADING_ENGINES.values()))
     _restore_engine_state(eng, _ENGINE_PRISTINE)   # r78：實例狀態整份還原(之後才長出來的屬性刪掉)
     eng.alerts = []
@@ -216,6 +304,8 @@ class Lesson7(unittest.TestCase):
 
 class Lesson8(unittest.TestCase):
     def setUp(self):
+        # r80：先取引擎(結構性還原)、再裝模擬——以前是每個測試在 setUp 裝好模擬之後才去取引擎
+        self.eng = _engine()
         self.p = [mock.patch.object(ex, "round_price", lambda p, *a, **k: p),
                   mock.patch.object(ex, "current_hedge_mode", return_value=False),
                   # r19起掛停損前會先確認部位還在：模擬交易所上有自己的0.1張
@@ -232,7 +322,7 @@ class Lesson8(unittest.TestCase):
         self.assertEqual(hits, [1, 5, 30, 150, 270, 390])
 
     def test_t8b_backstop_fail_once_then_recover_sends_recovery(self):
-        eng, pos = _engine(), _pos()
+        eng, pos = self.eng, _pos()
         eng._position = pos   # 部位要在帳上：r53 起會送單的函式先確認傳進來的是帳上那一筆
         with mock.patch.object(ex, "place_algo_stop", side_effect=[(False, {"code": -1001}, False), (True, "A1", False)]):
             eng._sync_backstop(pos)
@@ -243,7 +333,7 @@ class Lesson8(unittest.TestCase):
         self.assertIn("補上", eng.alerts[1])
 
     def test_t8b_orphan_fail_at_close_then_next_round_ok_sends_recovery(self):
-        eng = _engine()
+        eng = self.eng
         with mock.patch.object(ex, "cancel_algo_stop", return_value=(False, {"code": -1001}, False)):
             eng._cancel_backstop({"backstop_algo_id": "X1", "backstop_used_legacy": False})
         with mock.patch.object(ex, "cancel_algo_stop", return_value=(True, {}, False)):
@@ -255,7 +345,7 @@ class Lesson8(unittest.TestCase):
 
     def test_t8c1_exception_in_backstop_sync_is_counted(self):
         """掛停損過程丟例外也是一次失敗，要計數、第1次要告警。"""
-        eng, pos = _engine(), _pos()
+        eng, pos = self.eng, _pos()
         eng._position = pos   # 部位要在帳上：r53 起會送單的函式先確認傳進來的是帳上那一筆
         with mock.patch.object(ex, "place_algo_stop", side_effect=RuntimeError("boom")):
             eng._sync_backstop(pos)
@@ -266,7 +356,7 @@ class Lesson8(unittest.TestCase):
 
     def test_t8c1_stale_cancel_failure_during_move_is_counted_at_failure(self):
         """搬移時舊單撤不掉：要在撤不掉的當下計數並告警第1次，不是等平倉才開始算。"""
-        eng, pos = _engine(), _pos(backstop_algo_id="OLD", backstop_price=4370.0)
+        eng, pos = self.eng, _pos(backstop_algo_id="OLD", backstop_price=4370.0)
         eng._position = pos   # 部位要在帳上：r53 起會送單的函式先確認傳進來的是帳上那一筆
         with mock.patch.object(ex, "place_algo_stop", return_value=(True, "NEW", False)), \
              mock.patch.object(ex, "cancel_algo_stop", return_value=(False, {"code": -1001}, False)):
@@ -276,7 +366,7 @@ class Lesson8(unittest.TestCase):
 
     def test_t8c2_failure_state_cleared_by_close_sends_notice(self):
         """backstop失敗中、部位從別的路徑平掉(失敗狀態消失)：要發通知收尾，不能讓使用者等不到結果。"""
-        eng, pos = _engine(), _pos()
+        eng, pos = self.eng, _pos()
         eng._position = pos   # 部位要在帳上：r53 起會送單的函式先確認傳進來的是帳上那一筆
         with mock.patch.object(ex, "place_algo_stop", return_value=(False, {"code": -1001}, False)):
             eng._sync_backstop(pos)
@@ -287,7 +377,7 @@ class Lesson8(unittest.TestCase):
 
     def test_t8d_open_filled_then_later_step_raises_still_reported_as_filled(self):
         """真實開倉已成交、後續記錄步驟丟例外：通知仍要是成交，不能報成下單失敗。"""
-        eng = _engine()
+        eng = self.eng
         captured = {}
         settings = dict(pt.settings_module.get_settings(engine_id=eng.engine_id))
         settings.update(execution_quantity=0.1, execution_leverage=5, execution_margin_type=0, execution_hedge_mode=0)
@@ -2278,6 +2368,34 @@ class RealSqlDb(unittest.TestCase):
 
 
 class FrameworkState(unittest.TestCase):
+    # r80：程式模組的命名空間整份還原；正在生效的模擬不能被還原掉
+    def test_r80_module_namespace_restored_structurally(self):
+        _engine()
+        orig_hook = pt._start_backfill_thread
+        pt._r80_probe_new_attr = 1                  # 執行期才長出來的屬性
+        ex.ORDER_CONFIRM_POLLS = 999                # 不可變的值被換掉(旗標、常數)
+        pt._start_backfill_thread = lambda fn: None  # 框架自己的替換被換掉
+        engines = pt.PAPER_TRADING_ENGINES
+        pt.PAPER_TRADING_ENGINES = {}               # 容器整個被換掉
+        engines["__probe__"] = None                 # 原本那個容器的內容被改
+        _engine()
+        self.assertFalse(hasattr(pt, "_r80_probe_new_attr"), "之後才長出來的屬性要刪掉")
+        self.assertNotEqual(ex.ORDER_CONFIRM_POLLS, 999, "被換掉的值要還原")
+        self.assertIs(pt._start_backfill_thread, orig_hook, "還原成框架自己的替換(不是程式原本的真執行緒)")
+        self.assertIs(pt.PAPER_TRADING_ENGINES, engines, "容器還原成原本那個物件(別的模組拿到的參照才不會斷)")
+        self.assertNotIn("__probe__", pt.PAPER_TRADING_ENGINES, "容器內容也要還原")
+
+    def test_r80_restore_does_not_undo_active_mocks(self):
+        _engine()
+        with mock.patch.object(ex, "get_order_status", return_value=(True, {})) as m, \
+             mock.patch.object(pt, "_r80_created_by_patch", "x", create=True):
+            _engine()   # 裝好模擬之後才取引擎(不該這樣寫，check_tests 會擋；這裡確認萬一發生也不會把模擬還原掉)
+            self.assertIs(ex.get_order_status, m, "正在生效的模擬不能被還原掉")
+            self.assertEqual(getattr(pt, "_r80_created_by_patch", None), "x", "patch 裝上的普通值(不是 Mock)也不能被刪掉")
+        self.assertFalse(hasattr(pt, "_r80_created_by_patch"), "前提：patch 結束後自己收掉了")
+        with mock.patch.dict(pt.PAPER_TRADING_ENGINES, {"__probe__": None}):
+            _engine()
+            self.assertIn("__probe__", pt.PAPER_TRADING_ENGINES, "patch.dict 正在生效的內容不能被還原掉")
     # r78：引擎實例狀態由框架整份還原，不靠每個新旗標記得加進重設清單
     def test_r78_engine_instance_state_restored_between_tests(self):
         eng = _engine()

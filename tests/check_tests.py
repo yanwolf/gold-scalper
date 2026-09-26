@@ -99,7 +99,97 @@ SELFTEST = [  # (測試主體, 預期是否被報出)
 ]
 
 
+RESTORERS = ("_engine", "_reset_module_state", "_restore_namespaces")
+
+
+def _is_patch_ctx(expr):
+    """with 的項目是 mock.patch(...)／mock.patch.object(...)／patch.dict(...) 之類。"""
+    f = expr.func if isinstance(expr, ast.Call) else None
+    while isinstance(f, ast.Attribute):
+        if f.attr == "patch":
+            return True
+        f = f.value
+    return isinstance(f, ast.Name) and f.id == "patch"
+
+
+def restore_order_problems(source):
+    """
+    結構性還原(r80)要排在裝模擬之前：_engine()／_reset_module_state() 不能在模擬已經生效時呼叫——
+    在 with mock.patch… 裡面、同一個函式裡 .start() 之後、或 setUp(含同檔的父類別)已經 start() 了模擬的類別的測試方法裡。
+    (執行期另外有保險：還原會跳過正在生效的 patch；這裡是把寫錯的順序直接擋下來。)
+    """
+    tree = ast.parse(source)
+    par = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    classes = {c.name: c for c in tree.body if isinstance(c, ast.ClassDef)}
+
+    def starts(fn):
+        return [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "start" and not n.args]
+
+    def setup_starts(cls, seen=()):
+        if cls is None or cls.name in seen:
+            return False
+        su = next((f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "setUp"), None)
+        if su is not None and starts(su):
+            return True
+        return any(setup_starts(classes.get(b.id), seen + (cls.name,)) for b in cls.bases if isinstance(b, ast.Name))
+
+    out = []
+    for cls in [c for c in tree.body if isinstance(c, ast.ClassDef)]:
+        inherited = setup_starts(cls)
+        for fn in [f for f in cls.body if isinstance(f, ast.FunctionDef)]:
+            st = starts(fn)
+            for n in ast.walk(fn):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in RESTORERS):
+                    continue
+                why = None
+                p = par.get(n)
+                while p is not None and p is not fn:
+                    if isinstance(p, ast.With) and any(_is_patch_ctx(i.context_expr) for i in p.items):
+                        why = "在 with mock.patch… 裡面"
+                    p = par.get(p)
+                if why is None and any(l < n.lineno for l in st):
+                    why = "同一個函式裡 .start() 之後"
+                if why is None and inherited and fn.name != "setUp":
+                    why = "setUp 已經裝上模擬(start())"
+                if why:
+                    out.append(f"{cls.name}.{fn.name} 第{n.lineno}行：{n.func.id}() {why}——結構性還原要排在裝模擬之前")
+    return out
+
+
+# 刻意在模擬生效時還原、驗證執行期保險的那一項(寫明理由，不是漏掉)
+RESTORE_ORDER_ALLOWED = {
+    "FrameworkState.test_r80_restore_does_not_undo_active_mocks": "驗證執行期保險：還原會跳過正在生效的 patch",
+}
+
+RESTORE_SELFTEST = [  # (原始碼, 預期報出)
+    ("class A:\n    def setUp(self):\n        self.eng = _engine()\n        self.p = mock.patch.object(ex, 'x')\n"
+     "        self.p.start()\n    def test_x(self):\n        pass\n", False),
+    ("class A:\n    def setUp(self):\n        self.p = mock.patch.object(ex, 'x')\n        self.p.start()\n"
+     "        self.eng = _engine()\n", True),
+    ("class A:\n    def test_x(self):\n        with mock.patch.object(ex, 'x'):\n            _engine()\n", True),
+    ("class A:\n    def test_x(self):\n        _engine()\n        with mock.patch.object(ex, 'x'):\n            pass\n", False),
+    ("class H:\n    def setUp(self):\n        self.eng = _engine()\n        mock.patch('t').start()\n"
+     "class B(H):\n    def test_x(self):\n        _engine()\n", True),
+    ("class A:\n    def test_x(self):\n        with mock.patch.dict(d, {}):\n            _reset_module_state()\n", True),
+]
+
+
 class TestChecker(unittest.TestCase):
+    def test_restore_order_selftest(self):
+        for src, flagged in RESTORE_SELFTEST:
+            self.assertEqual(bool(restore_order_problems(src)), flagged, src)
+
+    def test_lessons_restore_before_mocks(self):
+        path = os.path.join(os.path.dirname(__file__), "test_lessons.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        self.assertGreater(src.count("_engine()"), 10, "前提：真的掃到了取引擎的地方")
+        got = [p for p in restore_order_problems(src) if p.split(" ")[0] not in RESTORE_ORDER_ALLOWED]
+        self.assertEqual(got, [])
+        self.assertTrue(all(any(p.startswith(k + " ") for p in restore_order_problems(src)) for k in RESTORE_ORDER_ALLOWED),
+                        "允許清單裡的每一項都要真的還會被報出(不然是過期的豁免)")
+
     def test_selftest_fixed_samples(self):
         for body, flagged in SELFTEST:
             src = f"class C:\n    def test_x(self):\n        {body}\n"
