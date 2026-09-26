@@ -36,10 +36,15 @@ def main():
     # _backfill_selftest 標記)可以。金絲雀：先確認計數真的裝上了
     real_start = threading.Thread.start
     bf = []
+    current = {"test": "(金絲雀)"}   # r76：記下是哪一支測試開的，報出來才找得到
     def spy(t):
         if t.name == "fill-backfill" and not getattr(getattr(t, "_target", None), "_backfill_selftest", False):
-            bf.append(t)
+            bf.append(current["test"])
         return real_start(t)
+    class _Result(unittest.TextTestResult):
+        def startTest(self, test):
+            current["test"] = test.id()
+            super().startTest(test)
     with mock.patch.object(threading.Thread, "start", spy):
         threading.Thread(target=lambda: None, name="fill-backfill").start()
     bf_canary = len(bf) == 1
@@ -47,7 +52,8 @@ def main():
     with mock.patch.object(logging.Logger, "error", capture), mock.patch.object(sys, "stderr", stderr_buf), \
             mock.patch.object(threading.Thread, "start", spy):
         with open("/dev/null", "w") as devnull:
-            r = unittest.TextTestRunner(stream=devnull).run(unittest.defaultTestLoader.loadTestsFromModule(T))
+            r = unittest.TextTestRunner(stream=devnull, resultclass=_Result).run(
+                unittest.defaultTestLoader.loadTestsFromModule(T))
     tracebacks = [l for l in stderr_buf.getvalue().splitlines() if l.startswith("Traceback") or "Exception in thread" in l]
     errs.extend(("stderr", l) for l in tracebacks)
     loggers = sorted({n for n, _ in errs})
@@ -66,7 +72,10 @@ def main():
         print("前提不成立：背景補登執行緒的計數金絲雀沒數到，計數可能沒裝上")
         return 1
     if bf:
-        print(f"有 {len(bf)} 個測試真的開了背景補登執行緒(框架預設應該收下來、不真的開，r74)")
+        by_test = {}
+        for name in bf:
+            by_test[name] = by_test.get(name, 0) + 1
+        print(f"有測試真的開了背景補登執行緒(框架預設應該收下來、不真的開，r74)：{by_test}")
         return 1
     print(f"stderr攔截：金絲雀有攔到；測試期間的traceback {len(tracebacks)} 行；真的開的背景補登執行緒 0 個")
     del real_error

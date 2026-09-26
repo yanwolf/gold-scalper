@@ -17,6 +17,7 @@ BINANCE_LESSONS.md 對照測試(清單第5點的做法：先在修改前的程�
   t8d 已成交先通知
 """
 import logging
+import json
 import unittest
 from unittest import mock
 
@@ -101,6 +102,7 @@ def _engine():
     eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
     eng._qty_check_tick = 0
     eng._position = None
+    eng._backfill_rescanned = False   # r76：「每個行程只重新排一次」是實例狀態，引擎在測試間共用，前一個測試留下的True不能帶進來
     _reset_module_state()
     _BACKFILL_DEFAULT.clear()
     eng._seeded_from_db = True   # r37起「持倉紀錄沒載入就不開倉」：前一個測試模擬讀不到時留下的False不能帶進來
@@ -1874,7 +1876,9 @@ def _sqlite_pool():
             "sl_price REAL", "peak_price REAL", "trailing_active INTEGER", "chan_reason TEXT", "profile_reason TEXT",
             # 重啟還原(load_open_paper_trade)讀的欄位，r74 前這張模擬表沒有，讀持倉的 SQL 在這裡根本跑不了
             "interval_seconds INTEGER", "backstop_algo_id TEXT", "backstop_used_legacy INTEGER", "real_open_baseline REAL",
-            "real_open_order_id INTEGER", "fill_boundary_id INTEGER", "partial_state TEXT"]
+            "real_open_order_id INTEGER", "fill_boundary_id INTEGER", "partial_state TEXT",
+            # r76：背景補登還沒完成的記號(進場／出場各一欄)
+            "open_backfill TEXT", "exit_backfill TEXT"]
     conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
     class Cur:
         def __init__(s): s.c = conn.cursor()
@@ -2073,6 +2077,145 @@ class RealSqlDb(unittest.TestCase):
         row = conn.execute("SELECT entry_actual_price FROM paper_trades WHERE id=75").fetchone()
         self.assertTrue(row, "前提：這一列還在")
         self.assertEqual(row[0], 4373.6, "也寫進資料庫")
+
+    # ---- r76：出場成交價的補登，重啟後靠平倉紀錄上的「補登還沒完成」記號重新排 ----
+    NO_AVG_CLOSE = {"orderId": 9200, "symbol": "XAUUSDT", "status": "FILLED", "executedQty": "1.000", "cumQty": "1.000",
+                    "side": "SELL", "positionSide": "LONG", "type": "MARKET", "updateTime": 1790400000000}
+
+    def _open_row(self, conn, tid, **kw):
+        f = dict(id=tid, status="open", engine_id=self.eng.engine_id, direction="bullish", entry_price=4390.0,
+                 entry_time="2026-09-25T10:00:00+00:00", entry_actual_price=4391.2, sl_price=4370.0, peak_price=4390.0,
+                 trailing_active=0, real_open_executed=1, real_open_quantity=1.0, real_open_baseline=0.0,
+                 real_open_order_id=9001, fill_boundary_id=101)
+        f.update(kw)
+        conn.execute(f"INSERT INTO paper_trades ({', '.join(f)}) VALUES ({', '.join('?' * len(f))})", tuple(f.values()))
+
+    def _close_with_missing_fill(self, pool, conn, trades, on_close_write=None):
+        """從資料庫還原部位 → 平倉(回應沒均價、成交明細還沒出現) → 回傳(排進來的補登, 推播)。"""
+        eng, sched, pushed = self.eng, [], []
+        real_close = pt.db.close_paper_trade
+        def close_write(*a, **k):
+            if on_close_write:
+                on_close_write()
+            return real_close(*a, **k)
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(eng, "_is_execution_engine", return_value=True), \
+             mock.patch.object(pt.settings_module, "get_settings", return_value=_exec_settings(eng)), \
+             mock.patch.object(ex, "current_hedge_mode", return_value=False), \
+             mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+             mock.patch.object(pt.db, "close_paper_trade", side_effect=close_write), \
+             mock.patch.object(ex, "close_position", return_value=(True, dict(self.NO_AVG_CLOSE))), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, dict(self.NO_AVG_CLOSE))), \
+             mock.patch.object(ex, "get_position_info", return_value=(True, _rows(1.0, entry=4391.2))), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(pt.notifier_module.notifier, "notify_trade_event"), \
+             mock.patch.object(pt.notifier_module.notifier, "send_raw_message", side_effect=pushed.append), \
+             mock.patch.object(eng, "_cancel_backstop", return_value=True):
+            eng._load_state()
+            pos = eng._position
+            self.assertIsNotNone(pos, "前提：從資料庫還原了部位")
+            eng._close_position(pos, 4384.0, "觸及停損", bid=4384.0, ask=4384.1)
+        return sched, pushed
+
+    def _restart_and_run(self, pool, trades, sleep):
+        eng, sched, pushed, bnotes = self.eng, [], [], []
+        eng._position, eng._seeded_from_db = None, False
+        for k in [k for k in vars(eng) if "rescan" in k]:
+            setattr(eng, k, False)   # 新的行程：「每個行程只重新排一次」的旗標也跟著重來
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, dict(self.NO_AVG_CLOSE))), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep), \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True,
+                               side_effect=lambda **k: bnotes.append(k)), \
+             mock.patch.object(pt.notifier_module.notifier, "send_raw_message", side_effect=pushed.append):
+            eng._load_state()
+            n = len(sched)
+            for fn in list(sched):
+                fn()
+        return n, bnotes, pushed
+
+    def test_r76_exit_backfill_is_rescheduled_after_restart(self):
+        self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號(在舊版上重跑時是斷言失敗、不是崩掉)")
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 76)
+        OPEN = (101, 9001, "BUY", 1.0, 4391.2, 0.0, 1000)
+        FILL = (160, 9200, "SELL", 1.0, 4384.1, -7.1, 3000)
+        clock, sleep, trades = _lagging([(0.0, OPEN), (2.0, FILL)])
+        sched, _ = self._close_with_missing_fill(pool, conn, trades)
+        self.assertEqual(len(sched), 1, "前提：當下查不到出場成交價，排了背景補登")
+        row = conn.execute("SELECT status, exit_backfill, exit_actual_price FROM paper_trades WHERE id=76").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual((row[0], row[2]), ("closed", None), "前提：已結帳、還沒有出場成交價")
+        self.assertTrue(row[1], "已平倉紀錄上要有「出場補登還沒完成」的記號")
+        # 服務在補登跑之前重啟：排好的執行緒跟記憶體一起沒了
+        n, bnotes, _ = self._restart_and_run(pool, trades, sleep)
+        self.assertEqual(n, 1, "重啟後照記號重新排出場補登")
+        row = conn.execute("SELECT exit_actual_price, exit_backfill FROM paper_trades WHERE id=76").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual(row[0], 4384.1, "重新排的補登查到出場成交價，寫進資料庫")
+        self.assertIsNone(row[1], "補登完成：記號清掉")
+        self.assertEqual(len(bnotes), 1, "補發補登通知")
+        n2, _, _ = self._restart_and_run(pool, trades, sleep)
+        self.assertEqual(n2, 0, "記號清掉之後，再重啟不會又排一次")
+
+    def test_r76_marker_cleared_when_backfill_gives_up(self):
+        self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號")
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 77)
+        clock, sleep, trades = _lagging([(0.0, (101, 9001, "BUY", 1.0, 4391.2, 0.0, 1000))])   # 出場成交一直沒出現
+        sched, _ = self._close_with_missing_fill(pool, conn, trades)
+        self.assertEqual(len(sched), 1, "前提：排了背景補登")
+        before = conn.execute("SELECT exit_backfill FROM paper_trades WHERE id=77").fetchone()
+        self.assertTrue(before and before[0], "前提：放棄之前記號是在的(不然「清掉」是空的通過)")
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, dict(self.NO_AVG_CLOSE))), \
+             mock.patch.object(ex, "get_user_trades", side_effect=trades, create=True), \
+             mock.patch.object(pt.time, "sleep", side_effect=sleep):
+            for fn in list(sched):
+                fn()
+        one(self.eng.alerts, "出場成交價補登失敗")
+        row = conn.execute("SELECT exit_backfill FROM paper_trades WHERE id=77").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertIsNone(row[0], "查不到(放棄)也要清掉記號，否則每次重啟都再查一輪")
+
+    def test_r76_marker_is_written_before_the_close_record(self):
+        self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號")
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 78)
+        clock, sleep, trades = _lagging([(0.0, (101, 9001, "BUY", 1.0, 4391.2, 0.0, 1000))])
+        seen = []
+        self._close_with_missing_fill(pool, conn, trades, on_close_write=lambda: seen.append(
+            conn.execute("SELECT exit_backfill FROM paper_trades WHERE id=78").fetchone()))
+        self.assertEqual(len(seen), 1, "前提：寫了平倉紀錄")
+        self.assertTrue(seen[0], "前提：寫平倉紀錄時這一列在")
+        self.assertTrue(seen[0][0], "記號要在寫平倉紀錄(界線)之前就寫好：結帳後、排補登前當掉，重啟後才知道要補")
+
+    def test_r76_entry_backfill_marker_on_closed_trade(self):
+        self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號")
+        pool, conn = _sqlite_pool()
+        # 進場成交價還在補登，部位就平掉了，接著重啟：這筆已平倉、沒有進場成交價，靠記號重新排
+        self._open_row(conn, 79, status="closed", entry_actual_price=None, exit_price=4384.0,
+                       exit_time="2026-09-25T11:00:00+00:00", exit_actual_price=4384.1)
+        filled = dict(self.NO_AVG_CLOSE, orderId=9001, side="BUY", avgPrice="4391.3")
+        eng, sched = self.eng, []
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True):
+            pt.db.set_paper_trade_backfill(79, "open", json.dumps({"action": "open", "order_id": 9001, "want_qty": 1.0,
+                                                                     "trade_id": 79, "direction": "bullish"}))
+        with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+             mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+             mock.patch.object(ex, "get_order_status", return_value=(True, filled)), \
+             mock.patch.object(pt.notifier_module.notifier, "notify_fill_backfill", create=True), \
+             mock.patch.object(pt.time, "sleep"):
+            eng._load_state()
+            self.assertEqual(len(sched), 1, "已平倉紀錄上有進場補登記號：重新排")
+            for fn in list(sched):
+                fn()
+        row = conn.execute("SELECT entry_actual_price, open_backfill FROM paper_trades WHERE id=79").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertEqual(row[0], 4391.3, "補登到的進場成交價寫進資料庫(網頁的真實損益跟著更正)")
+        self.assertIsNone(row[1], "記號清掉")
 
 
 class FrameworkState(unittest.TestCase):

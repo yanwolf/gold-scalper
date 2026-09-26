@@ -17,6 +17,7 @@
 
 import os
 import functools
+import json
 import threading
 import time
 import logging
@@ -647,9 +648,20 @@ class PaperTradingEngine:
         rewrite={"exit_time", "exit_reason"}：交易所端平倉時出場價本身就是估的，查到要把平倉紀錄改寫(出場價、點數損益、取消估算)。
         兩種來源都沒有回False。
         """
+        ctx = self._backfill_ctx(action, position, order_result, bid=bid, ask=ask, book_stale=book_stale, est_usd=est_usd,
+                                 fills_qty=fills_qty, real_qty=real_qty, rewrite=rewrite)
+        if ctx is None:
+            return False
+        self._mark_backfill(ctx)
+        self._start_fill_backfill(ctx)
+        return True
+
+    def _backfill_ctx(self, action, position, order_result, bid=None, ask=None, book_stale=None, est_usd=None,
+                      fills_qty=None, real_qty=None, rewrite=None):
+        """補登要用的資料(沒有訂單號也沒有成交明細數量就是None)。當下的東西先抄下來，背景執行緒不讀之後會變的部位。"""
         oid = order_result.get("orderId") if isinstance(order_result, dict) else None
         if oid is None and not fills_qty:
-            return False
+            return None
         s = settings_module.get_settings(engine_id=self.engine_id)
         ctx = {
             "action": action, "order_id": oid, "fills_qty": fills_qty, "rewrite": rewrite,
@@ -662,10 +674,69 @@ class PaperTradingEngine:
             "partial_usd": position.get("partial_realized_usd") or 0.0,
             "partial_unknown": bool(position.get("partial_pnl_unknown")),
         }
-        src = f"訂單{oid}" if oid is not None else f"界線之後的平倉成交(要湊滿{fills_qty})"
-        logger.warning(f"{'出場' if action == 'close' else '進場'}成交均價暫缺({self.label})，{src}排入背景補登")
+        return ctx
+
+    @staticmethod
+    def _backfill_payload(ctx):
+        """記號的內容(r76)：補登要用的全部資料，部位存當下的快照(不含 _ 開頭的暫存欄位)。"""
+        d = {k: v for k, v in ctx.items() if k != "position"}
+        d["position"] = {k: v for k, v in (ctx.get("position") or {}).items() if not str(k).startswith("_")}
+        return json.dumps(d, ensure_ascii=False, default=str)
+
+    def _mark_backfill(self, ctx):
+        """寫「補登還沒完成」記號(r76)。寫不進去照樣補登(這一輪還是會做，只是重啟後不會重新排)。"""
+        db.set_paper_trade_backfill(ctx.get("trade_id"), ctx["action"], self._backfill_payload(ctx))
+
+    def _clear_backfill_mark(self, ctx):
+        try:
+            db.set_paper_trade_backfill(ctx.get("trade_id"), ctx["action"], None)
+        except Exception as e:
+            logger.error(f"清掉補登記號失敗({self.label}): {e}")
+
+    def _start_fill_backfill(self, ctx):
+        src = f"訂單{ctx['order_id']}" if ctx.get("order_id") is not None else f"界線之後的平倉成交(要湊滿{ctx.get('fills_qty')})"
+        logger.warning(f"{'出場' if ctx['action'] == 'close' else '進場'}成交均價暫缺({self.label})，{src}排入背景補登")
         _start_backfill_thread(lambda: self._run_fill_backfill(ctx))
-        return True
+
+    def _ctx_from_payload(self, action, payload, live_position):
+        """記號還原成補登資料(r76)。進場補登的部位還開著就接回帳上那一筆(查到要回填)；其餘用快照。"""
+        d = json.loads(payload)
+        if not isinstance(d, dict):
+            raise ValueError(f"補登記號不是物件：{type(d).__name__}")
+        tid = d.get("trade_id")
+        snap = d.get("position") or {"id": tid, "direction": d.get("direction")}
+        live = live_position if (live_position is not None and live_position.get("id") == tid) else None
+        d["position"] = live if (action == "open" and live is not None) else snap
+        d["action"] = action
+        for k, v in (("order_id", None), ("want_qty", None), ("fills_qty", None), ("rewrite", None), ("bid", None),
+                     ("ask", None), ("book_stale", None), ("est_usd", None), ("entry_actual", snap.get("entry_actual_price")),
+                     ("real_qty", snap.get("real_open_quantity")), ("partial_usd", 0.0), ("partial_unknown", False),
+                     ("direction", snap.get("direction"))):
+            d.setdefault(k, v)
+        return d
+
+    def _reschedule_backfills(self, live_position):
+        """重啟後照記號重新排背景補登(r76)，回傳排了哪些(trade_id, action)。讀不到記號要推播，不能當成沒有要補的。"""
+        ok, rows = db.load_pending_backfills(self.engine_id)
+        if not ok:
+            self._backstop_alert(f"⚠️ {self.label} 讀不到「補登還沒完成」的記號\n{rows}\n這次重啟不會重新排背景補登")
+            return set()
+        done = set()
+        for r in rows:
+            for action in ("open", "close"):
+                if not r.get(action):
+                    continue
+                try:
+                    ctx = self._ctx_from_payload(action, r[action], live_position)
+                except Exception as e:
+                    logger.error(f"補登記號讀不懂({self.label}，紀錄{r['trade_id']}): {e}")
+                    self._backstop_alert(f"⚠️ {self.label} 補登記號讀不懂(紀錄 {r['trade_id']}，{action})\n{e}\n這筆不會重新補登")
+                    continue
+                self._start_fill_backfill(ctx)
+                done.add((r["trade_id"], action))
+        if done:
+            logger.warning(f"重啟後照記號重新排背景補登({self.label})：{sorted(done)}")
+        return done
 
     @staticmethod
     def _fills_may_appear(st, why):
@@ -698,6 +769,7 @@ class PaperTradingEngine:
                     break
             if not px:
                 logger.warning(f"{kind}成交價補登放棄({self.label})：{src}，查了{tries}次都沒有成交均價")
+                self._clear_backfill_mark(ctx)   # 查不到也清掉(r76)：不然每次重啟都再查一輪
                 self._backstop_alert(
                     f"⚠️ {self.label} {kind}成交價補登失敗\n"
                     f"{src}\n"
@@ -706,6 +778,7 @@ class PaperTradingEngine:
                 )
                 return
             self._apply_fill_backfill(ctx, px)
+            self._clear_backfill_mark(ctx)   # 補登完成(r76)
         except Exception as e:
             logger.error(f"{kind}成交價補登出錯({self.label}): {e}")
             try:
@@ -1284,9 +1357,16 @@ class PaperTradingEngine:
         # r74：重啟前排的部分出場補登跟著記憶體沒了——還有沒認領的量就重新排
         if pos and (pos.get("unanchored_reduce_qty") or 0) > 1e-9 and (pos.get("real_open_baseline") or 0) <= 1e-9:
             self._schedule_reduce_backfill(pos)
+        # 照資料庫的「補登還沒完成」記號重新排(r76)，每個行程只做一次：出場補登(已平倉紀錄)、進場補登(開倉中或已平倉)
+        rescheduled = set()
+        if not getattr(self, "_backfill_rescanned", False):
+            self._backfill_rescanned = True
+            rescheduled = self._safe("重新排背景補登", lambda: self._reschedule_backfills(pos), default=set()) or set()
         # 進場成交價的補登也一樣(r74)：真的開過倉、有開倉單號、卻沒有進場成交價 → 用單號重新排
+        # (有記號的上面已經排過；這條給記號出現之前的舊紀錄)
         if pos and pos.get("real_open_executed") and pos.get("real_open_order_id") is not None \
-                and not isinstance(pos.get("entry_actual_price"), (int, float)):
+                and not isinstance(pos.get("entry_actual_price"), (int, float)) \
+                and (pos.get("id"), "open") not in rescheduled:
             self._schedule_fill_backfill("open", pos, {"orderId": pos["real_open_order_id"],
                                                        "executedQty": str(pos.get("real_open_quantity") or "")})
 
@@ -1861,6 +1941,19 @@ class PaperTradingEngine:
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = self._safe_closed_record(position, exit_price, exit_reason, exit_time)
         pnl_estimated = bool(position.pop("_pnl_estimated", False))
+        # 出場成交價要補登：記號在寫平倉紀錄(界線)之前寫好(r76)——結帳後、排補登前當掉，重啟後才知道要補
+        backfill_ctx = None
+        if (backfill_order is not None or backfill_fills) and not exit_actual_price:
+            qty_s = float(s.get("execution_quantity", 0) or 0)
+            pts = closed_record.get("pnl_points")
+            est = pts * qty_s if (qty_s and isinstance(pts, (int, float))) else None
+            rewrite = {"exit_time": exit_time, "exit_reason": exit_reason} if closed_externally else None
+            backfill_ctx = self._safe("準備成交價補登", lambda: self._backfill_ctx(
+                "close", position, backfill_order, bid=bid, ask=ask, book_stale=book_stale, est_usd=est,
+                fills_qty=None if backfill_order is not None else backfill_fills,
+                real_qty=position.get("real_qty_for_pnl"), rewrite=rewrite), default=None)
+            if backfill_ctx:
+                self._safe("記下補登還沒完成", lambda: self._mark_backfill(backfill_ctx))
         self._safe("寫平倉紀錄", lambda: db.close_paper_trade(
             position.get("id"), exit_price, exit_time, exit_reason, closed_record.get("pnl_points"),
             pnl_estimated=pnl_estimated))
@@ -1936,16 +2029,13 @@ class PaperTradingEngine:
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")
 
-        # 背景補登放在結帳、通知之後(第15條r71)：先發的那則是估算，補登查到再發一則更正
-        if (backfill_order is not None or backfill_fills) and not exit_actual_price:
-            qty_s = float(s.get("execution_quantity", 0) or 0)
-            pts = closed_record.get("pnl_points")
-            est = pts * qty_s if (qty_s and isinstance(pts, (int, float))) else None
-            rewrite = {"exit_time": exit_time, "exit_reason": exit_reason} if closed_externally else None
-            self._safe("排成交價補登", lambda: self._schedule_fill_backfill(
-                "close", position, backfill_order, bid=bid, ask=ask, book_stale=book_stale, est_usd=est,
-                fills_qty=None if backfill_order is not None else backfill_fills,
-                real_qty=position.get("real_qty_for_pnl"), rewrite=rewrite))
+        # 背景補登放在結帳、通知之後(第15條r71)：先發的那則是估算，補登查到再發一則更正。
+        # 這段期間成交價已經有了(例如交易所停損單的狀態查到均價)：不用補，記號清掉
+        if backfill_ctx:
+            if exit_actual_price:
+                self._clear_backfill_mark(backfill_ctx)
+            else:
+                self._safe("排成交價補登", lambda: self._start_fill_backfill(backfill_ctx))
 
     def get_summary(self, limit=50):
         """

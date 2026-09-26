@@ -237,6 +237,15 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS partial_state TEXT;
                 """)
+                # 背景補登還沒完成的記號(第15條r76)：補登是執行緒，重啟就沒了——記號在資料庫，重啟後照它重新排
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS open_backfill TEXT;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS exit_backfill TEXT;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -517,6 +526,55 @@ def update_paper_trade_partial_state(trade_id, state):
             _pool.putconn(conn)
     except Exception as e:
         _db_write_error("記錄部分出場狀態", e)
+
+
+_BACKFILL_COLUMNS = {"open": "open_backfill", "close": "exit_backfill"}
+
+
+def set_paper_trade_backfill(trade_id, action, payload):
+    """
+    「補登還沒完成」的記號(第15條r76)。action是"open"(進場)或"close"(出場)；payload是補登要用的資料(JSON字串)，
+    None代表清掉(補登完成或放棄)。出場的記號要在寫平倉紀錄之前寫：結帳後、排補登前當掉，重啟後才知道要補。
+    """
+    col = _BACKFILL_COLUMNS[action]   # 欄位名只從固定表裡取，不接外部字串
+    if not _enabled or trade_id is None:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE paper_trades SET {col} = %s WHERE id = %s;", (payload, trade_id))
+            conn.commit()
+            _db_write_ok("記錄補登記號")
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        _db_write_error("記錄補登記號", e)
+
+
+def load_pending_backfills(engine_id):
+    """
+    重啟時用(第15條r76)：這個引擎還有「補登還沒完成」記號的紀錄(不分開倉中或已平倉)。
+    回傳(ok, [{"trade_id", "open", "close"}])；讀取失敗回(False, 錯誤)，不能當成「沒有要補的」。
+    """
+    if not _enabled:
+        return True, []
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, open_backfill, exit_backfill FROM paper_trades
+                    WHERE engine_id = %s AND (open_backfill IS NOT NULL OR exit_backfill IS NOT NULL)
+                    ORDER BY id;
+                """, (engine_id,))
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return True, [{"trade_id": r[0], "open": r[1], "close": r[2]} for r in rows]
+    except Exception as e:
+        logger.error(f"讀取補登記號失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _parse_partial_state(raw):
