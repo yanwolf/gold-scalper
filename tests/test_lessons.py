@@ -2439,6 +2439,16 @@ class RealSqlDb(unittest.TestCase):
         self.assertTrue(h.get("active"), "讀不到停止狀態：保守當成停止中(不能當成沒有停止)")
         self.assertIn("讀不到", str(h.get("reason")), "原因要講明是讀不到")
 
+    # r88：讀的一方不過濾(pump-dump-hunter、crypto-screener 的探針)。gold-scalper 的白名單只在寫的一方(RUNTIME_STATE_KEYS，
+    # 有靜態檢查)；讀的一方如果哪天也加了過濾，兩邊要一起維護、漏一邊就是 r85 的坑——這項會失敗
+    def test_r88_read_side_keeps_unknown_state_keys(self):
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 88, partial_state=json.dumps({"partial_realized_usd": -1.5, "_r88_probe_never_seen": 7}))
+        pos = self._restart(pool)
+        self.assertIsNotNone(pos, "前提：從資料庫還原了部位")
+        self.assertEqual(pos.get("partial_realized_usd"), -1.5, "前提：部位狀態真的讀回來了")
+        self.assertEqual(pos.get("_r88_probe_never_seen"), 7, "資料庫裡有的鍵整份讀回(讀的一方不過濾)")
+
 
 class FrameworkState(unittest.TestCase):
     # r80：程式模組的命名空間整份還原；正在生效的模擬不能被還原掉
