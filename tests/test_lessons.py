@@ -53,6 +53,7 @@ def one(alerts, title):
 
 
 import copy as _copy
+import threading
 import importlib as _importlib
 import pkgutil as _pkgutil
 import app as _app_pkg
@@ -94,15 +95,42 @@ def _reset_named_state():
             setattr(S, k, v)
 
 
+def _pristine_engine_state(eng):
+    """
+    引擎在測試之間是共用同一個物件(r77：「只做一次」旗標被前一支測試留下)。載入時記下它原本的屬性：
+    不可變的值直接記、容器記深拷貝；鎖、Event 這類不動。_engine() 每次照這份還原，並刪掉之後才長出來的屬性——
+    不靠每新增一個實例狀態就記得加進重設清單(r78)。
+    """
+    import collections
+    keep = {}
+    for k, v in vars(eng).items():
+        if isinstance(v, (bool, int, float, str, type(None))):
+            keep[k] = ("value", v)
+        elif isinstance(v, (list, dict, set, collections.deque)):
+            keep[k] = ("copy", _copy.deepcopy(v))
+    return keep
+
+
+def _restore_engine_state(eng, pristine):
+    lock_types = (type(threading.RLock()), type(threading.Lock()), threading.Event)
+    for k in [k for k in vars(eng) if k not in pristine and not isinstance(getattr(eng, k), lock_types)]:
+        delattr(eng, k)
+    for k, (kind, v) in pristine.items():
+        setattr(eng, k, v if kind == "value" else _copy.deepcopy(v))
+
+
+_ENGINE_PRISTINE = _pristine_engine_state(next(iter(pt.PAPER_TRADING_ENGINES.values())))
+
+
 def _engine():
     eng = next(iter(pt.PAPER_TRADING_ENGINES.values()))
+    _restore_engine_state(eng, _ENGINE_PRISTINE)   # r78：實例狀態整份還原(之後才長出來的屬性刪掉)
     eng.alerts = []
     eng._backstop_alert = lambda t: eng.alerts.append(t)
     eng._orphan_cancels = []
     eng._step_errors = {}      # 前一個測試留下的出錯次數不能帶進來
     eng._qty_check_tick = 0
     eng._position = None
-    eng._backfill_rescanned = False   # r76：「每個行程只重新排一次」是實例狀態，引擎在測試間共用，前一個測試留下的True不能帶進來
     _reset_module_state()
     _BACKFILL_DEFAULT.clear()
     eng._seeded_from_db = True   # r37起「持倉紀錄沒載入就不開倉」：前一個測試模擬讀不到時留下的False不能帶進來
@@ -1250,7 +1278,7 @@ class Lesson34(ExecHarness):
     # 8d：重啟後從資料庫還原開倉單號與界線
     def test_t8d_restore_includes_order_id_and_boundary(self):
         row = (7, "bullish", 4390.0, None, 4380.0, 4395.0, True, "c", "p", 900, "chan_profile_900",
-               True, 0.1, "B1", False, 0.0, 9001, 202, 4391.2, None)   # r74：SELECT 多了進場成交價、部分出場狀態
+               True, 0.1, "B1", False, 0.0, 9001, 202, 4391.2, None, None)   # r74：進場成交價、部分出場狀態；r78：進場補登記號
         class Cur:
             def __enter__(s): return s
             def __exit__(s, *a): return False
@@ -2155,7 +2183,7 @@ class RealSqlDb(unittest.TestCase):
         row = conn.execute("SELECT exit_actual_price, exit_backfill FROM paper_trades WHERE id=76").fetchone()
         self.assertTrue(row, "前提：這一列還在")
         self.assertEqual(row[0], 4384.1, "重新排的補登查到出場成交價，寫進資料庫")
-        self.assertIsNone(row[1], "補登完成：記號清掉")
+        self.assertIn('"ended"', str(row[1] or ""), "補登完成：記號標成已結束(r78：標記、不是刪掉)")
         self.assertEqual(len(bnotes), 1, "補發補登通知")
         n2, _, _ = self._restart_and_run(pool, trades, sleep)
         self.assertEqual(n2, 0, "記號清掉之後，再重啟不會又排一次")
@@ -2178,7 +2206,8 @@ class RealSqlDb(unittest.TestCase):
         one(self.eng.alerts, "出場成交價補登失敗")
         row = conn.execute("SELECT exit_backfill FROM paper_trades WHERE id=77").fetchone()
         self.assertTrue(row, "前提：這一列還在")
-        self.assertIsNone(row[0], "查不到(放棄)也要清掉記號，否則每次重啟都再查一輪")
+        self.assertIn('"ended"', str(row[0] or ""),
+                      "查不到(放棄)也要結束記號，否則每次重啟都再查一輪；r78：標成已結束、不是刪掉(刪掉就跟沒記號的舊紀錄分不出)")
 
     def test_r76_marker_is_written_before_the_close_record(self):
         self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號")
@@ -2215,10 +2244,52 @@ class RealSqlDb(unittest.TestCase):
         row = conn.execute("SELECT entry_actual_price, open_backfill FROM paper_trades WHERE id=79").fetchone()
         self.assertTrue(row, "前提：這一列還在")
         self.assertEqual(row[0], 4391.3, "補登到的進場成交價寫進資料庫(網頁的真實損益跟著更正)")
-        self.assertIsNone(row[1], "記號清掉")
+        self.assertIn('"ended"', str(row[1] or ""), "記號標成已結束")
+
+    # r78：放棄過的進場補登，重啟後不能被「沒有記號的舊紀錄」那條規則撿回來再查一輪
+    def test_r78_gave_up_entry_backfill_is_not_retried_after_restart(self):
+        self.assertTrue(hasattr(pt.db, "set_paper_trade_backfill"), "前提：有補登記號(在舊版上重跑時是斷言失敗、不是崩掉)")
+        pool, conn = _sqlite_pool()
+        self._open_row(conn, 80, entry_actual_price=None)   # 開倉中、有開倉單號、沒有進場成交價、也沒有記號(r75 以前的舊紀錄)
+        no_avg = dict(self.NO_AVG_CLOSE, orderId=9001, side="BUY")
+        runs = []
+        def restart():
+            eng, sched = self.eng, []
+            eng._position, eng._seeded_from_db = None, False
+            for k in [k for k in vars(eng) if "rescan" in k]:
+                setattr(eng, k, False)   # 新的行程
+            with mock.patch.object(pt.db, "_enabled", True), mock.patch.object(pt.db, "_pool", pool, create=True), \
+                 mock.patch.object(pt, "_start_backfill_thread", side_effect=sched.append, create=True), \
+                 mock.patch.object(ex, "get_order_status", return_value=(True, no_avg)), \
+                 mock.patch.object(ex, "get_user_trades", return_value=(True, []), create=True), \
+                 mock.patch.object(pt.time, "sleep"):
+                eng._load_state()
+                for fn in list(sched):
+                    fn()
+            runs.append(len(sched))
+        restart()
+        self.assertEqual(runs, [1], "前提：第一次重啟，舊紀錄的規則排了進場補登")
+        one(self.eng.alerts, "進場成交價補登失敗")   # 前提：這次補登查不到、放棄了
+        row = conn.execute("SELECT open_backfill FROM paper_trades WHERE id=80").fetchone()
+        self.assertTrue(row, "前提：這一列還在")
+        self.assertIn('"ended"', str(row[0] or ""), "放棄：記號標成已結束，不是刪掉")
+        restart()
+        self.assertEqual(runs, [1, 0], "放棄過的：再重啟不能又查一輪(舊紀錄的規則只給從來沒有記號的)")
 
 
 class FrameworkState(unittest.TestCase):
+    # r78：引擎實例狀態由框架整份還原，不靠每個新旗標記得加進重設清單
+    def test_r78_engine_instance_state_restored_between_tests(self):
+        eng = _engine()
+        eng._r78_probe_flag = True          # 測試途中才長出來的屬性(像 r76 的「只做一次」旗標)
+        eng._qty_check_tick = 99            # 原本就有的值被改掉
+        eng._closed_trades_memory.append({"probe": 1})
+        eng2 = _engine()
+        self.assertIs(eng2, eng, "前提：引擎在測試之間是同一個物件")
+        self.assertFalse(hasattr(eng2, "_r78_probe_flag"), "之後才長出來的屬性要刪掉")
+        self.assertEqual(eng2._qty_check_tick, 0, "原本就有的值要還原")
+        self.assertEqual(len(eng2._closed_trades_memory), 0, "容器也要還原")
+
     # r74：新增會開背景執行緒的函式，框架的預設也要一起改(第 14 種的另一個樣子)
     def test_r74_backfill_thread_is_not_really_started_by_default(self):
         self.assertTrue(hasattr(pt, "_start_backfill_thread"), "前提：程式有背景補登(在舊版上重跑時是斷言失敗、不是崩掉)")

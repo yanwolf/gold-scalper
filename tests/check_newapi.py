@@ -21,6 +21,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ALIASES = {"pt": "paper_trading", "ex": "execution", "pf": "preflight", "RG": "risk_guard", "TS": "trading_stats",
            "m": "main", "S": "settings", "N": "notifier"}
 ENGINE_ALIASES = ("eng", "self.eng")
+# r78：兩層以上的寫法也要認(pt.db.X 以前完全沒檢查——base 是屬性不是名稱)
+CHAINS = dict(ALIASES, **{
+    "pt.db": "db", "pt.notifier_module": "notifier", "pt.notifier_module.notifier": "notifier",
+    "pt.settings_module": "settings", "pt.execution_module": "execution", "pt.risk_guard": "risk_guard",
+    "pt.trading_core": "trading_core", "eng": "engine", "self.eng": "engine",
+})
+
+
+def _dotted(node):
+    """ast 運算式 → 'pt.db' 這種字串；不是單純的名稱／屬性鏈回 None。"""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 def names_in(path):
@@ -69,23 +87,35 @@ def legacy_names(legacy_root):
 
 
 def _uses(fn_node):
-    """回傳 [(顯示名, 模組別名或'engine', 屬性, 行號)]"""
+    """回傳 [(顯示名, 模組名或'engine', 屬性, 行號, base字串)]"""
     out = []
     for n in ast.walk(fn_node):
         if not isinstance(n, ast.Attribute):
             continue
-        base = n.value
-        if isinstance(base, ast.Name) and base.id in ALIASES:
-            out.append((f"{base.id}.{n.attr}", ALIASES[base.id], n.attr, n.lineno))
-        elif isinstance(base, ast.Name) and base.id == "eng":
-            out.append((f"eng.{n.attr}", "engine", n.attr, n.lineno))
-        elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name) and base.value.id == "self" and base.attr == "eng":
-            out.append((f"self.eng.{n.attr}", "engine", n.attr, n.lineno))
+        base = _dotted(n.value)
+        if base in CHAINS:
+            out.append((f"{base}.{n.attr}", CHAINS[base], n.attr, n.lineno, base))
     return out
 
 
-def _guarded(src_of_fn, attr):
-    return (f'"{attr}"' in src_of_fn or f"'{attr}'" in src_of_fn) and ("hasattr(" in src_of_fn or "getattr(" in src_of_fn)
+def _guards(fn_node):
+    """
+    這個函式裡的守護：hasattr(base, "attr")／getattr(base, "attr", ...)。回傳 [(模組名, 屬性, 行號)]。
+    r78 起看**每一處用法**：守護要守的是同一個(模組, 屬性)，而且在用法之前(或在 setUp)。以前只要方法裡
+    出現過屬性名的字串(mock.patch.object 的字串也算)、又有任何一個 hasattr，就當成守住了。
+    """
+    out = []
+    for n in ast.walk(fn_node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hasattr", "getattr") \
+                and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str):
+            base = _dotted(n.args[0])
+            if base in CHAINS:
+                out.append((CHAINS[base], n.args[1].value, n.lineno))
+    return out
+
+
+def _guarded(guards, setup_guards, mod, attr, line):
+    return any(g[:2] == (mod, attr) for g in setup_guards) or any(g[:2] == (mod, attr) and g[2] <= line for g in guards)
 
 
 def _test_assigned_engine_attrs(tree):
@@ -101,31 +131,37 @@ def _test_assigned_engine_attrs(tree):
 
 
 def problems(test_source, legacy):
+    """
+    每一個函式(測試方法、類別裡的輔助方法、模組層級的輔助函式)裡的每一處用法，各自要有守護(r78)。
+    輔助函式也算：舊版上重跑時它一樣會被呼叫、一樣會崩。
+    """
     out = []
     tree = ast.parse(test_source)
     test_attrs = _test_assigned_engine_attrs(tree)
+    units = [(None, f, []) for f in tree.body if isinstance(f, ast.FunctionDef)]
     for cls in [c for c in tree.body if isinstance(c, ast.ClassDef)]:
-        setup_src = ""
+        setup_guards = []
         for f in cls.body:
             if isinstance(f, ast.FunctionDef) and f.name == "setUp":
-                setup_src = ast.get_source_segment(test_source, f) or ""
-        for fn in [f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name.startswith("test")]:
-            fn_src = (ast.get_source_segment(test_source, fn) or "") + setup_src
-            for shown, mod, attr, line in _uses(fn):
-                if mod == "engine" and attr in test_attrs:
+                setup_guards = _guards(f)
+        units += [(cls.name, f, setup_guards) for f in cls.body if isinstance(f, ast.FunctionDef)]
+    for cls_name, fn, setup_guards in units:
+        guards = _guards(fn)
+        for shown, mod, attr, line, _base in _uses(fn):
+            if mod == "engine" and attr in test_attrs:
+                continue
+            missing = []
+            for v, (mods, eng) in legacy.items():
+                if mod != "engine" and mod not in mods:
                     continue
-                missing = []
-                for v, (mods, eng) in legacy.items():
-                    exists = attr in eng if mod == "engine" else (mod in mods and attr in mods[mod])
-                    if mod != "engine" and mod not in mods:
-                        continue
-                    if not exists:
-                        missing.append(v)
-                if missing and not _guarded(fn_src, attr):
-                    out.append(f"{cls.name}.{fn.name} 第{line}行：{shown} 在舊版 {missing} 不存在，方法裡沒有 hasattr/getattr 守護(在舊版上會是崩掉，不是斷言失敗)")
+                exists = attr in eng if mod == "engine" else attr in mods[mod]
+                if not exists:
+                    missing.append(v)
+            if missing and not _guarded(guards, setup_guards, mod, attr, line):
+                where = f"{cls_name}.{fn.name}" if cls_name else fn.name
+                out.append(f"{where} 第{line}行：{shown} 在舊版 {missing} 不存在，這一處之前沒有 hasattr/getattr 守護同一個屬性"
+                           f"(在舊版上會是崩掉，不是斷言失敗)")
     return out
-
-
 def _fake_legacy(engine_attrs=(), **mods):
     return {"rX": ({k: set(v) for k, v in mods.items()}, set(engine_attrs))}
 
@@ -138,6 +174,20 @@ SELFTEST = [  # (測試原始碼, 人造舊版, 預期是否報出)
     ("class A:\n    def setUp(self):\n        self.assertTrue(hasattr(self.eng, '_new_lock'))\n    def test_x(self):\n        self.eng._new_lock\n", _fake_legacy(engine_attrs=["_lock"]), False),
     ("class A:\n    def test_x(self):\n        zz.newfn()\n", _fake_legacy(paper_trading=["oldfn"]), False),   # 不在別名清單裡：不管
     ("def _engine():\n    eng.alerts = []\nclass A:\n    def test_x(self):\n        eng.alerts\n", _fake_legacy(engine_attrs=["_lock"]), False),  # 框架自己掛的
+    # r78：粒度改成每一處用法
+    ("class A:\n    def test_x(self):\n        self.assertTrue(hasattr(pt, 'other'))\n        pt.newfn()\n",
+     _fake_legacy(paper_trading=["oldfn"]), True),     # 守的是別的屬性
+    ("class A:\n    def test_x(self):\n        pt.newfn()\n        self.assertTrue(hasattr(pt, 'newfn'))\n",
+     _fake_legacy(paper_trading=["oldfn"]), True),     # 守護在用法之後
+    ("class A:\n    def test_x(self):\n        mock.patch.object(pt, 'newfn', create=True)\n        hasattr(ex, 'y')\n        pt.newfn()\n",
+     _fake_legacy(paper_trading=["oldfn"], execution=["y"]), True),   # patch 的字串＋別的 hasattr 不算守住
+    ("class A:\n    def test_x(self):\n        pt.db.newfn()\n\n", _fake_legacy(paper_trading=["db"], db=["oldfn"]), True),  # 兩層
+    ("class A:\n    def test_x(self):\n        self.assertTrue(hasattr(pt.db, 'newfn'))\n        pt.db.newfn()\n",
+     _fake_legacy(paper_trading=["db"], db=["oldfn"]), False),
+    ("class A:\n    def _helper(self):\n        pt.newfn()\n", _fake_legacy(paper_trading=["oldfn"]), True),   # 輔助方法也算
+    ("def _helper():\n    return pt.newfn()\n", _fake_legacy(paper_trading=["oldfn"]), True),                    # 模組層級輔助函式
+    ("def _helper():\n    if hasattr(pt, 'newfn'):\n        return pt.newfn()\n", _fake_legacy(paper_trading=["oldfn"]), False),
+    ("class A:\n    def test_x(self):\n        m._resumed['k']\n", _fake_legacy(main=["app"]), True),   # pump-dump-hunter r77 的樣子
 ]
 
 

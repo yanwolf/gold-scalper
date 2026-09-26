@@ -687,11 +687,12 @@ class PaperTradingEngine:
         """寫「補登還沒完成」記號(r76)。寫不進去照樣補登(這一輪還是會做，只是重啟後不會重新排)。"""
         db.set_paper_trade_backfill(ctx.get("trade_id"), ctx["action"], self._backfill_payload(ctx))
 
-    def _clear_backfill_mark(self, ctx):
+    def _clear_backfill_mark(self, ctx, how):
+        """結束記號(r78：標成已結束，不刪)。how：found／gave_up／found_elsewhere。"""
         try:
-            db.set_paper_trade_backfill(ctx.get("trade_id"), ctx["action"], None)
+            db.end_paper_trade_backfill(ctx.get("trade_id"), ctx["action"], how)
         except Exception as e:
-            logger.error(f"清掉補登記號失敗({self.label}): {e}")
+            logger.error(f"結束補登記號失敗({self.label}): {e}")
 
     def _start_fill_backfill(self, ctx):
         src = f"訂單{ctx['order_id']}" if ctx.get("order_id") is not None else f"界線之後的平倉成交(要湊滿{ctx.get('fills_qty')})"
@@ -769,7 +770,7 @@ class PaperTradingEngine:
                     break
             if not px:
                 logger.warning(f"{kind}成交價補登放棄({self.label})：{src}，查了{tries}次都沒有成交均價")
-                self._clear_backfill_mark(ctx)   # 查不到也清掉(r76)：不然每次重啟都再查一輪
+                self._clear_backfill_mark(ctx, "gave_up")   # 查不到也結束(r76)：不然每次重啟都再查一輪
                 self._backstop_alert(
                     f"⚠️ {self.label} {kind}成交價補登失敗\n"
                     f"{src}\n"
@@ -778,7 +779,7 @@ class PaperTradingEngine:
                 )
                 return
             self._apply_fill_backfill(ctx, px)
-            self._clear_backfill_mark(ctx)   # 補登完成(r76)
+            self._clear_backfill_mark(ctx, "found")   # 補登完成(r76)
         except Exception as e:
             logger.error(f"{kind}成交價補登出錯({self.label}): {e}")
             try:
@@ -1366,7 +1367,8 @@ class PaperTradingEngine:
         # (有記號的上面已經排過；這條給記號出現之前的舊紀錄)
         if pos and pos.get("real_open_executed") and pos.get("real_open_order_id") is not None \
                 and not isinstance(pos.get("entry_actual_price"), (int, float)) \
-                and (pos.get("id"), "open") not in rescheduled:
+                and (pos.get("id"), "open") not in rescheduled \
+                and pos.get("open_backfill_state") is None:   # r78：放棄過(已結束)的不再撿回來
             self._schedule_fill_backfill("open", pos, {"orderId": pos["real_open_order_id"],
                                                        "executedQty": str(pos.get("real_open_quantity") or "")})
 
@@ -2033,7 +2035,7 @@ class PaperTradingEngine:
         # 這段期間成交價已經有了(例如交易所停損單的狀態查到均價)：不用補，記號清掉
         if backfill_ctx:
             if exit_actual_price:
-                self._clear_backfill_mark(backfill_ctx)
+                self._clear_backfill_mark(backfill_ctx, "found_elsewhere")
             else:
                 self._safe("排成交價補登", lambda: self._start_fill_backfill(backfill_ctx))
 
