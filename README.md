@@ -2394,6 +2394,11 @@ tp_price目前只存在記憶體，服務重啟後那筆未平倉單退回只用
 - `tests/check_tests.py` 新增「還原要排在裝模擬之前」的靜態檢查。
 - 程式本身沒改（preflight 版本號除外）。`tests/legacy/` 改留 r77、r79。
 
+## 測試工具：新介面檢查看正負、只認擋得住的前提（BINANCE_LESSONS.md 第 15 條 r83）
+
+- `tests/check_newapi.py`：條件看正負（`not hasattr` 的本體不算守住、else 那邊算）；「寫在前面的敘述」只認擋得住的（assert、assertTrue、`if not hasattr: return/raise/fail/skipTest`）。自我驗證 49 組。
+- 程式本身沒改（preflight 版本號除外）。
+
 ## 舊版程式要留著（BINANCE_LESSONS.md 用法第 5 點 r37）
 
 每次照清單修改、部署前，在 git 打標籤，之後才能拿新的測試跑舊版、確認框架在舊版上不會崩：

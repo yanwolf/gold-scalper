@@ -192,24 +192,104 @@ def _stmt_chain(node, par):
     return out
 
 
-def guarded(use, mod, attr, scope, par, resolve, setup_scope=None):
-    if setup_scope is not None and _contains_guard(setup_scope, mod, attr, resolve):
+def _pos(test, mod, attr, resolve):
+    """test 為真 ⇒ 屬性一定在(r83：看正負。`not hasattr(...)` 為真代表不在)。"""
+    if _is_guard(test, mod, attr, resolve):
         return True
-    # 1. 在「以它為條件」的分支裡(if／條件運算式的 body、and 的後段)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_pos(v, mod, attr, resolve) for v in test.values)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return all(_pos(v, mod, attr, resolve) for v in test.values)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _neg(test.operand, mod, attr, resolve)
+    return False
+
+
+def _neg(test, mod, attr, resolve):
+    """test 為假 ⇒ 屬性一定在。"""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return any(_neg(v, mod, attr, resolve) for v in test.values)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return all(_neg(v, mod, attr, resolve) for v in test.values)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return _pos(test.operand, mod, attr, resolve)
+    return False
+
+
+_STOPPERS = ("fail", "skipTest")   # self.fail(...)／self.skipTest(...)：會丟例外、不往下走
+
+
+def _leaves(body):
+    """這串敘述執行完一定不會往下走(return／raise／continue／break／self.fail／self.skipTest 收尾)。"""
+    if not body:
+        return False
+    last = body[-1]
+    if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call) and isinstance(last.value.func, ast.Attribute) \
+            and last.value.func.attr in _STOPPERS:
+        return True
+    if isinstance(last, ast.If):
+        return _leaves(last.body) and _leaves(last.orelse)
+    return False
+
+
+def _blocks(stmt, mod, attr, resolve):
+    """
+    這個敘述擋得住嗎——執行過它還能往下走，屬性就一定在(r83)。只是「出現過」守護不算：
+    前提檢查失敗只記一筆、不停下來的寫法(pump-dump-hunter 的 check(...))、光寫 hasattr(...)、存進變數沒用，後面照樣崩。
+    認的：assert 守護；self.assertTrue(守護)／self.assertFalse(反向守護)(失敗會丟例外)；
+    if 反向守護: 離開(return／raise／continue／break／self.fail／self.skipTest)；if 守護: …(不離開) else: 離開；
+    with／try 區塊裡的上述敘述(依序執行)。
+    """
+    if isinstance(stmt, ast.Assert):
+        return _pos(stmt.test, mod, attr, resolve)
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute) \
+            and stmt.value.args:
+        name, arg = stmt.value.func.attr, stmt.value.args[0]
+        if name == "assertTrue":
+            return _pos(arg, mod, attr, resolve)
+        if name == "assertFalse":
+            return _neg(arg, mod, attr, resolve)
+        return False
+    if isinstance(stmt, ast.If):
+        if _neg(stmt.test, mod, attr, resolve) and _leaves(stmt.body):
+            return True
+        if _pos(stmt.test, mod, attr, resolve) and _leaves(stmt.orelse):
+            return True
+        return False
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return any(_blocks(s, mod, attr, resolve) for s in stmt.body)
+    if isinstance(stmt, ast.Try):
+        return any(_blocks(s, mod, attr, resolve) for s in stmt.body) and not stmt.handlers
+    return False
+
+
+def guarded(use, mod, attr, scope, par, resolve, setup_scope=None):
+    if setup_scope is not None and any(_blocks(s, mod, attr, resolve) for s in setup_scope.body):
+        return True
+    # 1. 在「以它為條件」的分支裡：if／條件運算式的本體(條件為真⇒在)、else 那邊(條件為假⇒在)、and 的後段、or 的後段(r83 看正負)
     child, p = use, par.get(use)
     while p is not None:
-        if isinstance(p, ast.If) and any(s is child for s in p.body) and _contains_guard(p.test, mod, attr, resolve):
-            return True
-        if isinstance(p, ast.IfExp) and child is p.body and _contains_guard(p.test, mod, attr, resolve):
-            return True
-        if isinstance(p, ast.BoolOp) and isinstance(p.op, ast.And):
+        if isinstance(p, ast.If):
+            if any(s is child for s in p.body) and _pos(p.test, mod, attr, resolve):
+                return True
+            if any(s is child for s in p.orelse) and _neg(p.test, mod, attr, resolve):
+                return True
+        if isinstance(p, ast.IfExp):
+            if child is p.body and _pos(p.test, mod, attr, resolve):
+                return True
+            if child is p.orelse and _neg(p.test, mod, attr, resolve):
+                return True
+        if isinstance(p, ast.BoolOp) and any(v is child for v in p.values):
             idx = next(i for i, v in enumerate(p.values) if v is child)
-            if any(_contains_guard(v, mod, attr, resolve) for v in p.values[:idx]):
+            f = _pos if isinstance(p.op, ast.And) else _neg   # and：前面都為真才到這裡；or：前面都為假才到這裡
+            if any(f(v, mod, attr, resolve) for v in p.values[:idx]):
                 return True
         if p is scope:
             break
         child, p = p, par.get(p)
-    # 2. 寫在前面的敘述裡(同一個區塊或外層區塊、排在這一處所在敘述之前)
+    # 2. 寫在前面、而且擋得住的敘述(同一個區塊或外層區塊、排在這一處所在敘述之前)——r83：只是出現過守護不算
     chain = _stmt_chain(use, par)
     for su in chain:
         if su is scope:
@@ -219,8 +299,7 @@ def guarded(use, mod, attr, scope, par, resolve, setup_scope=None):
         if blk is None:
             continue
         idx = next(i for i, s in enumerate(blk) if s is su)
-        if any(_contains_guard(s, mod, attr, resolve) for s in blk[:idx]
-               if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))):
+        if any(_blocks(s, mod, attr, resolve) for s in blk[:idx]):
             return True
     return False
 
@@ -360,6 +439,26 @@ SELFTEST = [  # (測試原始碼, 人造舊版, 預期是否報出, 說明)
                                                                   notifier=["notifier"]), True, "三層(模組→模組→實例)"),
     ("from app import stats as st\nclass A:\n    def test_x(self):\n        st.newfn()\n",
      _fake_legacy(stats=["oldfn"]), True, "別名從 import 自動列出(沒列在清單裡的模組)"),
+    # r83：正負、以及「寫在前面的敘述」只認擋得住的
+    (C + "        check('前提', hasattr(pt, 'newfn'))\n        pt.newfn()\n", L_PT, True, "前提 check(...) 失敗不會停下來"),
+    (C + "        hasattr(pt, 'newfn')\n        pt.newfn()\n", L_PT, True, "前面光寫 hasattr(...)"),
+    (C + "        ok = hasattr(pt, 'newfn')\n        pt.newfn()\n", L_PT, True, "存進變數沒用"),
+    (C + "        if not hasattr(pt, 'newfn'):\n            print('x')\n        pt.newfn()\n", L_PT, True, "if not hasattr 但沒離開"),
+    (C + "        if not hasattr(pt, 'newfn'):\n            pt.newfn()\n", L_PT, True, "not 底下"),
+    (C + "        x = pt.newfn() if not hasattr(pt, 'newfn') else None\n", L_PT, True, "條件運算式、not"),
+    (C + "        x = not hasattr(pt, 'newfn') and pt.newfn()\n", L_PT, True, "not … and"),
+    (C + "        assert hasattr(pt, 'newfn')\n        pt.newfn()\n", L_PT, False, "assert"),
+    (C + "        if not hasattr(pt, 'newfn'):\n            return\n        pt.newfn()\n", L_PT, False, "if not … return"),
+    (C + "        if not hasattr(pt, 'newfn'):\n            self.skipTest('x')\n        pt.newfn()\n", L_PT, False, "if not … skipTest"),
+    (C + "        if not hasattr(pt, 'newfn'):\n            pass\n        else:\n            pt.newfn()\n", L_PT, False,
+     "if not … else 那邊"),
+    (C + "        x = None if not hasattr(pt, 'newfn') else pt.newfn()\n", L_PT, False, "條件運算式 not … else 那邊"),
+    (C + "        x = not hasattr(pt, 'newfn') or pt.newfn()\n", L_PT, False, "not … or"),
+    (C + "        with ctx():\n            self.assertTrue(hasattr(pt, 'newfn'))\n        pt.newfn()\n", L_PT, False, "with 區塊裡的前提"),
+    (C + "        self.assertFalse(not hasattr(pt, 'newfn'))\n        pt.newfn()\n", L_PT, False, "assertFalse(反向)"),
+    (C + "        self.assertTrue(not hasattr(pt, 'newfn'))\n        pt.newfn()\n", L_PT, True, "assertTrue(反向)：確認不在"),
+    ("class A:\n    def setUp(self):\n        hasattr(pt, 'newfn')\n    def test_x(self):\n        pt.newfn()\n", L_PT, True,
+     "setUp 裡只是出現過"),
 ]
 
 
@@ -369,7 +468,7 @@ class TestNewApi(unittest.TestCase):
             self.assertEqual(bool(problems(src, legacy, FAKE_INFO)), flagged, f"{why}\n{src}")
 
     def test_selftest_sample_count(self):
-        self.assertGreaterEqual(len(SELFTEST), 32, "前提：自我驗證的樣本沒被刪掉")
+        self.assertGreaterEqual(len(SELFTEST), 49, "前提：自我驗證的樣本沒被刪掉")
 
     def test_real_app_resolves_chains(self):
         """前提：真的程式上，多層的鏈認得出來(認不出來的話，整個檢查對它們是空跑)。"""
