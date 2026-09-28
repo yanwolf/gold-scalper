@@ -29,7 +29,7 @@ from app import smc_structure
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
-from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown
+from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown, compute_reentry_breakdown
 from app import daily_smc
 
 logger = logging.getLogger("backtest")
@@ -189,6 +189,7 @@ def run_backtest(
     end_time_ms=None,
     progress_cb=None,
     daily_smc_against_weight=0.5,
+    cooldown_hours=0,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -379,6 +380,25 @@ def run_backtest(
         # 濾網開著卻沒有日線資料：照跑會變成「全部當中性」，結果看起來像濾網有效/無效其實都不是——直接報錯
         return {"error": f"日線SMC濾網需要日K資料，但這次沒拿到（{daily_smc_error or '沒有已收盤日K'}），請稍後再試或先關閉日線濾網"}
     skipped_daily_smc = 0
+
+    # r94：出場後冷卻(只存在回測，跟日線濾網一樣不是 settings 欄位)。上一筆出場(不分賺賠、不分出場原因)後
+    # cooldown_hours 小時內不開新倉；0＝關閉。同一步「反轉出場＋反手開倉」也算在冷卻內
+    try:
+        cooldown_hours = float(cooldown_hours or 0)
+    except (TypeError, ValueError):
+        return {"error": f"冷卻時間要是數字(小時)，收到 {cooldown_hours}"}
+    if not 0 <= cooldown_hours <= 72:
+        return {"error": f"冷卻時間要在 0～72 小時之間，收到 {cooldown_hours}"}
+    cooldown_ms = int(cooldown_hours * 3600 * 1000)
+    skipped_cooldown = 0
+
+    def _last_exit_ms():
+        if not closed_trades:
+            return None
+        try:
+            return int(datetime.fromisoformat(closed_trades[-1]["exit_time"]).timestamp() * 1000)
+        except (TypeError, ValueError, KeyError):
+            return None
 
     def _daily_tag_at(t_ms):
         """t_ms 當下最後一根已收盤日K的結構標記(不看未來)；沒有資料時 bias=None。"""
@@ -608,7 +628,14 @@ def run_backtest(
                 daily_ok, _ = trend_filter_allows(daily_smc_filter_mode, daily_tag["bias"], result["direction"])
                 if not daily_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok:
                     skipped_daily_smc += 1   # 只數「其他濾網都放行、只被日線擋下」的，才看得出日線濾網本身的影響
-            if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
+            cooldown_ok = True
+            if cooldown_ms:
+                last_exit = _last_exit_ms()
+                if last_exit is not None and step_time - last_exit < cooldown_ms:
+                    cooldown_ok = False
+                    if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
+                        skipped_cooldown += 1   # 只數「其他濾網都放行、只被冷卻擋下」的
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok:
                 entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
@@ -702,6 +729,9 @@ def run_backtest(
         "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
         "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數
         "daily_smc_breakdown": compute_daily_smc_breakdown(closed_trades),
+        "reentry_breakdown": compute_reentry_breakdown(closed_trades),   # r93：出場後多快再進場
+        "cooldown_hours": cooldown_hours,          # r94：出場後冷卻(只存在回測)
+        "skipped_cooldown": skipped_cooldown,
         "daily_smc_error": daily_smc_error,
         "daily_smc_candle_count": len(daily_close_times),
         "daily_smc_against_weight": daily_smc_against_weight if daily_smc_filter_mode == 3 else None,

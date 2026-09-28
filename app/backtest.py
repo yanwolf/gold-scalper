@@ -286,7 +286,23 @@ def run_backtest(
         else:
             klines = fetch_historical_klines(symbol=symbol, days=days, end_time_ms=end_time_ms)
     if not klines:
-        return {"error": "抓不到歷史K線資料，請稍後再試"}
+        # r95：走到這裡代表幣安「正常回應但沒有資料」(網路/API錯誤會在 fetch 裡直接拋例外，不會到這裡)，
+        # 重試不會有用——以前寫「請稍後再試」會讓人以為是暫時性問題。最常見是回測期間在合約上市之前
+        req_end = end_time_ms if end_time_ms is not None else resolve_end_time_ms()
+        req_start = req_end - days * 24 * 60 * 60 * 1000 + 1
+        fmt = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        return {"error": f"這段期間（{fmt(req_start)}～{fmt(req_end)} UTC）幣安沒有 {symbol} 的K線資料，"
+                         f"可能是在合約上市之前，或商品代號不對；重試也不會有資料",
+                "no_data": True}
+    # r95：資料比要求的起點晚很多(例如視窗橫跨合約上市日)——照跑，但標出實際從哪天開始，免得誤以為是完整的一段
+    data_gap_note = None
+    req_end = end_time_ms if end_time_ms is not None else int(klines[-1][6])
+    req_start = req_end - days * 24 * 60 * 60 * 1000 + 1
+    first_open = int(klines[0][0])
+    if first_open - req_start > 24 * 60 * 60 * 1000:
+        _d = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        data_gap_note = (f"資料從 {_d(first_open)} 才開始（要求的起點是 {_d(req_start)}），"
+                         f"實際只回測了約 {max(0, round((req_end + 1 - first_open) / (24 * 60 * 60 * 1000)))} 天")
 
     trades = klines_to_synthetic_trades(klines)
     trade_times = [t["time"] for t in trades]  # 給bisect搜尋用的平行時間清單
@@ -736,6 +752,7 @@ def run_backtest(
         "daily_smc_candle_count": len(daily_close_times),
         "daily_smc_against_weight": daily_smc_against_weight if daily_smc_filter_mode == 3 else None,
         "daily_bias_days": daily_bias_days,
+        "data_gap_note": data_gap_note,   # r95：資料起點比要求的晚(例如橫跨合約上市日)
         "data_start_time_iso": datetime.fromtimestamp(int(klines[0][0]) / 1000, tz=timezone.utc).isoformat(),
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,

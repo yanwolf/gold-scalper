@@ -481,3 +481,49 @@ class Cooldown(unittest.TestCase):
         from app import settings as S, paper_trading as pt
         self.assertFalse(any("cooldown" in k for k in S.get_settings().keys()))
         self.assertNotIn("cooldown_hours", inspect.getsource(pt))
+
+
+class NoData(unittest.TestCase):
+    """r95：合約上市前沒有資料——不能再叫人「請稍後再試」；視窗橫跨上市日要標出實際從哪天開始。"""
+    def test_empty_period_says_no_data_not_retry(self):
+        end = B.resolve_end_time_ms("2025-11-02", now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+        with mock.patch.object(B, "fetch_historical_klines", return_value=[]):
+            r = B.run_backtest(days=30, interval_seconds=900, end_time_ms=end)
+        self.assertTrue(r.get("no_data"))
+        self.assertNotIn("稍後再試", r["error"])
+        self.assertIn("2025-10-04", r["error"])
+        self.assertIn("2025-11-02", r["error"])
+        self.assertIn("上市", r["error"])
+        row = J._window_row(0, r, 0, end)
+        self.assertTrue(row["no_data"])
+
+    def test_network_error_is_not_reported_as_no_data(self):
+        end = B.resolve_end_time_ms("2025-11-02", now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+        with mock.patch.object(B, "fetch_historical_klines", side_effect=RuntimeError("inj-timeout")):
+            with self.assertRaises(RuntimeError):
+                B.run_backtest(days=30, interval_seconds=900, end_time_ms=end)
+        self.assertFalse(J._window_row(0, {"error": "RuntimeError: inj-timeout"}, 0, end)["no_data"])
+
+    def test_window_crossing_listing_day_is_flagged(self):
+        closes = _path_up_then_down()
+        req_start = T0 + len(closes) * DAY
+        days = 6
+        end = req_start + days * DAY - 1
+        kl = _klines_1m(2, req_start + 4 * DAY)          # 前 4 天沒有資料(模擬上市日在視窗中間)
+        with mock.patch.object(B, "compute_signal_from_trades", return_value={**FAKE, "direction": "bearish"}):
+            r = B.run_backtest(days=days, interval_seconds=900, klines=kl, daily_klines=_raw(closes), end_time_ms=end,
+                               trend_filter_mode=0, use_chop_filter=False, block_market_closed=False, min_atr_points=0,
+                               use_atr=False, sl_points=0.3, trail_trigger_points=50, trail_distance_points=50, reversal_confirm_count=3)
+        self.assertNotIn("error", r)
+        self.assertIsNotNone(r["data_gap_note"])
+        self.assertIn("實際只回測了約 2 天", r["data_gap_note"])
+
+    def test_full_window_has_no_gap_note(self):
+        closes = _path_up_then_down()
+        start = T0 + len(closes) * DAY
+        with mock.patch.object(B, "compute_signal_from_trades", return_value={**FAKE, "direction": "bearish"}):
+            r = B.run_backtest(days=2, interval_seconds=900, klines=_klines_1m(2, start), daily_klines=_raw(closes),
+                               end_time_ms=start + 2 * DAY - 1, trend_filter_mode=0, use_chop_filter=False,
+                               block_market_closed=False, min_atr_points=0, use_atr=False, sl_points=0.3,
+                               trail_trigger_points=50, trail_distance_points=50, reversal_confirm_count=3)
+        self.assertIsNone(r["data_gap_note"])

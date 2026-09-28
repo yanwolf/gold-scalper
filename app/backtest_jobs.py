@@ -97,10 +97,11 @@ def _window_row(idx, res, start_ms, end_ms):
     row = {"index": idx, "start": _iso(start_ms), "end": _iso(end_ms)}
     if not isinstance(res, dict) or res.get("error"):
         row["error"] = (res or {}).get("error") if isinstance(res, dict) else "回測沒有結果"
+        row["no_data"] = bool(isinstance(res, dict) and res.get("no_data"))   # r95：沒有資料(不是暫時性錯誤)
         return row
     for k in ("total_trades", "win_rate", "total_pnl_points", "profit_factor", "max_drawdown_points",
               "daily_bias_days", "daily_smc_breakdown", "skipped_daily_smc", "skipped_trend", "daily_smc_error",
-              "skipped_cooldown"):
+              "skipped_cooldown", "data_gap_note"):
         row[k] = res.get(k)
     return row
 

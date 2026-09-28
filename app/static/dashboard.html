@@ -3290,6 +3290,7 @@ function renderBacktestResult(data, el){
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
         ${data.daily_smc_filter_mode == 3 ? `／ 日線SMC：逆日線結構下 ${data.daily_smc_against_weight} 倍量(損益、回撤都已照比例折算)` : (data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : '')}
         ${data.cooldown_hours ? `／ 出場後冷卻 ${data.cooldown_hours} 小時，只被冷卻擋掉 ${data.skipped_cooldown || 0} 次` : ''}
+        ${data.data_gap_note ? `／ 🟡 ${data.data_gap_note}` : ''}
         ${data.daily_bias_days ? `／ 這段期間日線：偏多 ${data.daily_bias_days.bullish} 天、偏空 ${data.daily_bias_days.bearish} 天${data.daily_bias_days.none ? `、未定 ${data.daily_bias_days.none} 天` : ''}` : ''}
         ${data.daily_smc_error ? `／ ⚠️ 日線標記沒有資料(${data.daily_smc_error})，分組全部記為未知` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
@@ -3467,9 +3468,14 @@ function renderBacktestJob(job){
   const fmtDay = iso => new Date(iso).toLocaleDateString('zh-TW', {month:'numeric', day:'numeric'});
   const cards = wins.map((w, i) => {
     const title = `${new Date(w.start).getFullYear()} ${fmtDay(w.start)}～${fmtDay(w.end)}`;
-    if(w.error) return `<div class="bt-win"><div class="bt-win-head"><span>${title}</span></div><div class="bt-win-split">⚠️ ${w.error}</div></div>`;
+    // r95：沒有資料(合約上市前)不是警告，用灰色說明就好；真的出錯才用 ⚠️
+    if(w.error) return `<div class="bt-win"><div class="bt-win-head"><span>${title}</span></div><div class="bt-win-split">${w.no_data ? 'ⓘ' : '⚠️'} ${w.error}</div></div>`;
     const bd = w.daily_bias_days || {};
-    return btWinCard(title, `日線 多${bd.bullish ?? '-'}／空${bd.bearish ?? '-'}天`, w, '', i);
+    const biasText = (bd.bullish || bd.bearish) ? `日線 多${bd.bullish ?? '-'}／空${bd.bearish ?? '-'}天${bd.none ? `／未定${bd.none}` : ''}`
+      : (bd.none ? `日線未定(日K還不到${30}根)` : '日線 --');
+    let card = btWinCard(title, biasText, w, '', i);
+    if(w.data_gap_note) card = card.replace('<div class="bt-win-split">', `<div class="bt-win-split" style="color:var(--gold);">🟡 ${w.data_gap_note}</div><div class="bt-win-split">`);
+    return card;
   }).join('');
   const ag = job.aggregate;
   el.innerHTML = head + `
