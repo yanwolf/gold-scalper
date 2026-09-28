@@ -258,6 +258,17 @@ def init_schema():
                         updated_at TIMESTAMPTZ DEFAULT now()
                     );
                 """)
+                # r90：背景回測任務的結果(網頁關掉、重新整理後用job_id再查得到；只給研究端用，跟交易無關)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS backtest_jobs (
+                        id TEXT PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        status TEXT NOT NULL,
+                        summary TEXT,
+                        payload TEXT
+                    );
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS settings_audit (
                         id BIGSERIAL PRIMARY KEY,
@@ -1347,3 +1358,77 @@ def get_settings_audit(limit=50):
     except Exception as e:
         logger.error(f"讀取審計紀錄失敗: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# r90：背景回測任務(backtest_jobs.py)。跟交易無關：寫失敗只影響「重新整理後還查不查得到」，不推播、不計入資料庫健康
+# ---------------------------------------------------------------------------
+BACKTEST_JOBS_KEEP = 30
+
+
+def save_backtest_job(job_id, status, summary_json, payload_json):
+    """新增或更新一筆回測任務，並只保留最近 BACKTEST_JOBS_KEEP 筆。沒資料庫時回 False。"""
+    if not _enabled:
+        return False
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO backtest_jobs (id, status, summary, payload) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, summary = EXCLUDED.summary,
+                        payload = EXCLUDED.payload, updated_at = NOW();
+                    """,
+                    (job_id, status, summary_json, payload_json),
+                )
+                cur.execute(
+                    """
+                    DELETE FROM backtest_jobs WHERE id NOT IN
+                        (SELECT id FROM backtest_jobs ORDER BY created_at DESC LIMIT %s);
+                    """,
+                    (BACKTEST_JOBS_KEEP,),
+                )
+            conn.commit()
+            return True
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"寫入回測任務失敗: {e}")
+        return False
+
+
+def load_backtest_job(job_id):
+    """(ok, payload字串或None)。沒資料庫＝(True, None)。"""
+    if not _enabled:
+        return True, None
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT payload FROM backtest_jobs WHERE id = %s;", (job_id,))
+                row = cur.fetchone()
+        finally:
+            _pool.putconn(conn)
+        return True, (row[0] if row else None)
+    except Exception as e:
+        logger.warning(f"讀取回測任務失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+def list_backtest_jobs(limit=10):
+    """(ok, [summary字串...])，新→舊。"""
+    if not _enabled:
+        return True, []
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT summary FROM backtest_jobs ORDER BY created_at DESC LIMIT %s;", (int(limit),))
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return True, [r[0] for r in rows if r[0]]
+    except Exception as e:
+        logger.warning(f"讀取回測任務清單失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"

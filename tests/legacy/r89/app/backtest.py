@@ -29,7 +29,8 @@ from app import smc_structure
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
-from app.trading_stats import compute_stats, assess_readiness
+from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown
+from app import daily_smc
 
 logger = logging.getLogger("backtest")
 
@@ -168,6 +169,8 @@ def run_backtest(
     smc_require_ema=None,
     smc_exit_mode=None,
     smc_min_rr=None,
+    daily_smc_filter_mode=0,
+    daily_klines=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -327,6 +330,36 @@ def run_backtest(
             trend_close_times.append(bar["bucket_start"] + trend_interval_seconds * 1000 - 1)
             trend_dirs.append(d)
     skipped_trend = 0
+
+    # 日線SMC結構(r89)：每筆回測交易都標記「開倉當下最後一根已收盤日K」的結構方向，結果依順／逆分組統計；
+    # daily_smc_filter_mode(0關閉/1只擋逆勢/2嚴格，語意同趨勢濾網)只存在回測——不是settings欄位，
+    # 「一鍵套用到引擎」也不會帶過去，正式端完全不受影響。daily_klines可由呼叫端給(測試用)，沒給才抓。
+    daily_smc_filter_mode = int(daily_smc_filter_mode or 0)
+    daily_close_times, daily_series, daily_dates, daily_smc_error = [], [], [], None
+    try:
+        if daily_klines is not None:
+            _dc = daily_smc.klines_to_closed_candles(daily_klines)
+            daily_close_times = [c["close_time"] for c in _dc]
+            daily_series = daily_smc.bias_series(_dc)
+            daily_dates = [datetime.fromtimestamp(c["bucket_start"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d") for c in _dc]
+        else:
+            daily_close_times, daily_series, daily_dates = daily_smc.backtest_series(
+                symbol, days, lambda sym, d: fetch_historical_klines(symbol=sym, interval="1d", days=d, max_days=d))
+    except Exception as e:
+        daily_smc_error = f"日K抓取失敗：{type(e).__name__}: {e}"
+        logger.warning(f"回測日線SMC標記失敗: {e}")
+    if daily_smc_filter_mode and not daily_close_times:
+        # 濾網開著卻沒有日線資料：照跑會變成「全部當中性」，結果看起來像濾網有效/無效其實都不是——直接報錯
+        return {"error": f"日線SMC濾網需要日K資料，但這次沒拿到（{daily_smc_error or '沒有已收盤日K'}），請稍後再試或先關閉日線濾網"}
+    skipped_daily_smc = 0
+
+    def _daily_tag_at(t_ms):
+        """t_ms 當下最後一根已收盤日K的結構標記(不看未來)；沒有資料時 bias=None。"""
+        i = bisect.bisect_right(daily_close_times, t_ms) - 1
+        if i < 0:
+            return {"bias": None, "confirmed": False, "as_of": None, "stale": False}
+        return {"bias": daily_series[i]["bias"], "confirmed": daily_series[i]["confirmed"],
+                "as_of": daily_dates[i], "stale": False}
 
     # SMC結構策略(smc_structure.py)：整段回測先把1分K重取樣成1小時K，再用REST抓「回測視窗
     # 之前」的1小時K當warmup(結構判定至少要250根，30天只有720根，前面一大段會被warmup吃掉)。
@@ -534,7 +567,13 @@ def run_backtest(
                 trend_ok, _ = trend_filter_allows(trend_filter_mode, trend_dir, result["direction"])
                 if not trend_ok:
                     skipped_trend += 1
-            if not is_choppy and not market_closed and not atr_too_low and trend_ok:
+            daily_tag = _daily_tag_at(step_time)
+            daily_ok = True
+            if daily_smc_filter_mode:
+                daily_ok, _ = trend_filter_allows(daily_smc_filter_mode, daily_tag["bias"], result["direction"])
+                if not daily_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok:
+                    skipped_daily_smc += 1   # 只數「其他濾網都放行、只被日線擋下」的，才看得出日線濾網本身的影響
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
                 entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
@@ -544,6 +583,7 @@ def run_backtest(
                     chan_reason=result["chan"]["reason"],
                     profile_reason=result["profile"]["reason"],
                 )
+                position["daily_smc"] = daily_tag
                 if strategy_type == "smc_structure" and int(smc_cfg.get("exit_mode", 0)) == 1:
                     tp = (result.get("smc") or {}).get("suggested_tp_price")
                     if tp:
@@ -604,6 +644,11 @@ def run_backtest(
         "trend_interval_seconds": trend_interval_seconds,
         "trend_slow_multiplier": trend_slow_multiplier,
         "skipped_trend": skipped_trend,  # 被趨勢濾網擋掉的進場訊號數
+        "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
+        "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數
+        "daily_smc_breakdown": compute_daily_smc_breakdown(closed_trades),
+        "daily_smc_error": daily_smc_error,
+        "daily_smc_candle_count": len(daily_close_times),
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,

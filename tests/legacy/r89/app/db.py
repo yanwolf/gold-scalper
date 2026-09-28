@@ -246,6 +246,11 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS exit_backfill TEXT;
                 """)
+                # r89：開倉當下的日線SMC結構標記(JSON，daily_smc.tag_for_trade)，只做分組統計參考，不參與進出場
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS daily_smc TEXT;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -407,6 +412,27 @@ def load_recent_trades(limit=100000):
 # 模擬單(paper trading)持久化函式
 # ---------------------------------------------------------------------------
 
+def _dump_daily_smc(tag):
+    """r89：日線結構標記轉 JSON 存進資料庫。沒有標記或轉不了就存 NULL(統計歸「未知」)，不影響開倉。"""
+    if not isinstance(tag, dict):
+        return None
+    try:
+        return json.dumps(tag, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_daily_smc(raw):
+    """r89：讀回日線結構標記。讀不懂就回 None(統計歸「未知」)。"""
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def insert_open_paper_trade(position):
     """
     新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
@@ -437,8 +463,9 @@ def insert_open_paper_trade(position):
                     INSERT INTO paper_trades
                         (direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                          chan_reason, profile_reason, status, interval_seconds, engine_id,
-                         entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
+                         entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points,
+                         daily_smc)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -448,6 +475,7 @@ def insert_open_paper_trade(position):
                         position.get("interval_seconds", 60), position.get("engine_id", "chan_profile_60"),
                         position.get("entry_expected_price"), position.get("entry_actual_price"),
                         position.get("entry_slippage_points"), position.get("entry_spread_points"),
+                        _dump_daily_smc(position.get("daily_smc")),
                     ),
                 )
                 new_id = cur.fetchone()[0]
@@ -513,19 +541,21 @@ def update_paper_trade_partial_state(trade_id, state):
     unanchored_reduce_qty(還沒認領的減少量)、unanchored_est_usd。每次變動整份覆寫；trade_id是None時跳過。
     """
     if not _enabled or trade_id is None:
-        return
+        return False
     try:
         conn = _pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE paper_trades SET partial_state = %s WHERE id = %s;",
-                            (json.dumps(state or {}, ensure_ascii=False), trade_id))
+                            (json.dumps(state or {}, ensure_ascii=False, default=str), trade_id))
             conn.commit()
-            _db_write_ok("記錄部分出場狀態")
+            _db_write_ok("記錄部位執行狀態")
+            return True
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        _db_write_error("記錄部分出場狀態", e)
+        _db_write_error("記錄部位執行狀態", e)
+        return False
 
 
 _BACKFILL_COLUMNS = {"open": "open_backfill", "close": "exit_backfill"}
@@ -746,7 +776,8 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
                            chan_reason, profile_reason, interval_seconds, engine_id,
                            real_open_executed, real_open_quantity,
                            backstop_algo_id, backstop_used_legacy, real_open_baseline,
-                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state, open_backfill
+                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state, open_backfill,
+                           daily_smc
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -771,6 +802,8 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
             "real_open_order_id": row[16], "fill_boundary_id": row[17],
             # r74：進場成交價以前沒還原——重啟後算部分出場／最後出場的實際損益、判斷重開都用得到
             "entry_actual_price": row[18],
+            # r89：開倉時的日線結構標記(網頁顯示、平倉後分組統計)
+            "daily_smc": _parse_daily_smc(row[21]),
         }
         pos.update(_parse_partial_state(row[19]))   # r74：部分出場狀態(含還沒認領的減少量)
         # r78：進場補登記號的狀態(從來沒有／還沒完成／已結束)——舊紀錄的重排規則只給「從來沒有」的
@@ -807,7 +840,7 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                            entry_book_stale, exit_book_stale,
                            real_open_executed, real_open_quantity,
                            entry_actual_price, exit_actual_price,
-                           sl_price, peak_price, trailing_active, pnl_estimated
+                           sl_price, peak_price, trailing_active, pnl_estimated, daily_smc
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -842,6 +875,7 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                     if r[15] and r[17] and r[18] and r[16] else None
                 ),
                 "pnl_estimated": bool(r[22]),
+                "daily_smc": _parse_daily_smc(r[23]),   # r89：開倉時的日線結構(分組統計用)
                 # 真實成交價缺漏時的推估值(使用者決定2026-09-22)：點數×張數，網頁標「估」、照算、分開計數
                 "real_pnl_usd_est": (
                     round(r[6] * r[16], 2)

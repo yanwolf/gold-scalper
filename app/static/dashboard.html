@@ -618,6 +618,22 @@
       <option value="6000">最高精細度(約6000步，慢5倍)</option>
     </select>
   </div>
+  <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
+    <label style="font-size:12px; color:var(--muted);">結束日期(UTC)</label>
+    <input type="date" id="backtestEndDate" />
+    <select id="backtestWindows">
+      <option value="1" selected>只跑這一段</option>
+      <option value="2">往回連續 2 段</option>
+      <option value="3">往回連續 3 段</option>
+      <option value="4">往回連續 4 段</option>
+      <option value="6">往回連續 6 段</option>
+      <option value="12">往回連續 12 段</option>
+    </select>
+  </div>
+  <div style="font-size:11.5px; color:var(--muted); margin:4px 0 12px; line-height:1.6;">
+    ↑ 結束日期留空＝到現在。連續段數：從結束日期往回切成好幾段、每段用上面選的天數(例如 30 天 × 6 段＝往回半年)，每段各自一份結果，最後加一行合計。
+    回測在背景跑，網頁會每幾秒更新進度；關掉頁面或鎖屏也沒關係，回來後在下面「最近的回測」點開就看得到。一次只跑一個，後送的會排隊。
+  </div>
   <div style="font-size:11.5px; color:var(--muted); margin:-4px 0 12px; line-height:1.6;">
     ↑ 精細度=訊號檢查步數上限，回測時間跟步數成正比。訊號只在所選週期的K線收盤時檢查，停損/移動停損則一律用1分K高低價逐根檢查(不受精細度影響)。
     1分K：標準精細度1天每根都看、2天隔一根、30天隔36根(不可信)。5分K：7天每根都看、30天隔7根(高精細度隔2根、最高精細度每根)。15分K：14天每根都看、30天隔一根(高精細度每根)。掃描沿用這個設定(時間再乘以組數)。
@@ -796,13 +812,22 @@
           <option value="">關閉(只分組統計)</option>
           <option value="1">只擋逆日線結構</option>
           <option value="2">嚴格(逆勢和日線未定都擋)</option>
+          <option value="3">逆日線結構下部分量(不擋)</option>
         </select>
+      </div>
+      <div class="settings-field">
+        <label>逆日線結構的下單比例(只在「下部分量」時有效)</label>
+        <input type="number" id="backtestDailySmcWeight" placeholder="留空=0.5(半量)" step="0.1" min="0" max="1" />
       </div>
     </div>
   </div>
 
   <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
+  </div>
+  <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
+    <select id="backtestJobList"><option value="">最近的回測…</option></select>
+    <button id="backtestJobOpenBtn" class="btn-secondary">打開</button>
   </div>
   <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
     <select id="backtestLoadSource"></select>
@@ -1184,6 +1209,11 @@ const els = {
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
   backtestDailySmcMode: document.getElementById('backtestDailySmcMode'),
+  backtestDailySmcWeight: document.getElementById('backtestDailySmcWeight'),
+  backtestEndDate: document.getElementById('backtestEndDate'),
+  backtestWindows: document.getElementById('backtestWindows'),
+  backtestJobList: document.getElementById('backtestJobList'),
+  backtestJobOpenBtn: document.getElementById('backtestJobOpenBtn'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -3149,6 +3179,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
   addIfPresent('daily_smc_filter_mode', els.backtestDailySmcMode);
+  addIfPresent('daily_smc_against_weight', els.backtestDailySmcWeight);
   addIfPresent('smc_touch_window', els.backtestSmcTouchWindow);
   addIfPresent('smc_wt_level', els.backtestSmcWtLevel);
   addIfPresent('smc_confirm_bos', els.backtestSmcConfirmBos);
@@ -3158,39 +3189,24 @@ function buildBacktestParamOverrides(){
   return params.toString();
 }
 
-els.backtestRunBtn.addEventListener('click', async () => {
-  const days = els.backtestDays.value;
-  const intervalSeconds = els.backtestInterval.value;
-  const strategyType = els.backtestStrategy.value;
-  const resonanceMinConditions = els.backtestResonanceThreshold.value;
-  const symbol = els.backtestSymbol.value;
-  const bucketSize = els.backtestBucketSize.value;
-  const paramOverrides = buildBacktestParamOverrides();
-  els.backtestRunBtn.disabled = true;
-  els.backtestRunBtn.textContent = '回測中...';
-  els.backtestResult.innerHTML = '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候...</div>';
-
-  try{
-    const targetSteps = els.backtestResolution.value;
-    const res = await fetch(`/backtest/run?days=${days}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`);
-    if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
-    const data = await res.json();
-
-    if(data.error){
-      els.backtestResult.innerHTML = `<div class="error">${data.error}</div>`;
-      return;
-    }
-
+// r90：回測改成背景任務(送出→拿 job_id→輪詢)，長時間回測不會讓網頁逾時；結果畫面抽成 renderBacktestResult()
+function renderBacktestResult(data, el){
+  el = el || els.backtestResult;
+  if(data.error){
+    el.innerHTML = `<div class="error">${data.error}</div>`;
+    return;
+  }
     const readinessDiv = document.createElement('div');
     renderReadinessBanner(readinessDiv, data.readiness);
 
-    els.backtestResult.innerHTML = `
+    el.innerHTML = `
       <div class="backtest-meta">
-        回測範圍：過去 ${data.backtest_days} 天 ／ ${data.kline_count} 根${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}(還原成 ${data.synthetic_trade_count} 筆合成成交)
+        回測範圍：${data.data_start_time ? `${new Date(data.data_start_time).toLocaleDateString('zh-TW')} ～ ${new Date(data.data_end_time).toLocaleDateString('zh-TW')}(${data.backtest_days} 天)` : `過去 ${data.backtest_days} 天`} ／ ${data.kline_count} 根${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}(還原成 ${data.synthetic_trade_count} 筆合成成交)
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
         ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_cfg ? ` ／ SMC參數：視窗${data.smc_cfg.touch_window}、WT門檻${data.smc_cfg.wt_level}、BOS${data.smc_cfg.confirm_bos}、EMA${data.smc_cfg.require_ema ? '要' : '不要'}、出場${data.smc_cfg.exit_mode == 1 ? '結構停利' : '移動停損'}${data.smc_cfg.exit_mode == 1 ? '(RR≥' + data.smc_cfg.min_rr + ')' : ''}` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
-        ${data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : ''}
+        ${data.daily_smc_filter_mode == 3 ? `／ 日線SMC：逆日線結構下 ${data.daily_smc_against_weight} 倍量(損益、回撤都已照比例折算)` : (data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : '')}
+        ${data.daily_bias_days ? `／ 這段期間日線：偏多 ${data.daily_bias_days.bullish} 天、偏空 ${data.daily_bias_days.bearish} 天${data.daily_bias_days.none ? `、未定 ${data.daily_bias_days.none} 天` : ''}` : ''}
         ${data.daily_smc_error ? `／ ⚠️ 日線標記沒有資料(${data.daily_smc_error})，分組全部記為未知` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
@@ -3271,13 +3287,174 @@ els.backtestRunBtn.addEventListener('click', async () => {
       body.style.display = hidden ? '' : 'none';
       caret.textContent = hidden ? '▾' : '▸';
     });
+}
+
+let backtestPollTimer = null;
+const BT_JOB_KEY = 'gs_last_backtest_job';
+
+function btPf(r){
+  if(!r || !r.total_trades) return '--';
+  return r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : (r.profit_factor_infinite || r.total_pnl_points > 0 ? '∞' : '--');
+}
+
+function btBreakdownCell(bd, key){
+  const r = (bd || []).find(x => x.key === key);
+  if(!r || !r.total_trades) return '<span style="color:var(--muted);">0</span>';
+  return `${r.total_trades}筆 ${Number(r.total_pnl_points).toFixed(0)}`;
+}
+
+function renderBacktestJob(job){
+  const el = els.backtestResult;
+  const pg = job.progress || {};
+  const statusText = {queued:'排隊中', running:'執行中', done:'完成', error:'失敗', interrupted:'中斷'}[job.status] || job.status;
+  const pct = pg.steps ? Math.floor(pg.step / pg.steps * 100) : 0;
+  const head = `
+    <div class="backtest-meta">
+      回測任務 <span class="mono">${job.job_id}</span>：${statusText}
+      ${job.status === 'running' || job.status === 'queued' ? `／ 第 ${pg.window || 0}/${pg.windows || job.windows} 段，${pg.phase || ''}${pg.steps ? ` ${pct}%` : ''}` : ''}
+      ／ 每段 ${job.days} 天、共 ${job.windows} 段，結束於 ${job.end_time ? new Date(job.end_time).toLocaleString('zh-TW', {hour12:false}) : '現在'}
+      ${job.error ? `<br/>⚠️ ${job.error}` : ''}
+    </div>`;
+  const wins = job.window_results || [];
+  if(job.windows === 1){
+    if(wins.length && wins[0].result){
+      el.innerHTML = head + '<div id="backtestDetail"></div>';
+      renderBacktestResult(wins[0].result, document.getElementById('backtestDetail'));
+    }else{
+      el.innerHTML = head + (job.status === 'error' || job.status === 'interrupted' ? '' : '<div class="loading-spinner">正在抓取歷史資料並重播計算，請稍候(可以先離開，回來再打開)…</div>');
+    }
+    return;
+  }
+  const rows = wins.map((w, i) => {
+    if(w.error) return `<tr><td>${new Date(w.start).toLocaleDateString('zh-TW')}～${new Date(w.end).toLocaleDateString('zh-TW')}</td><td colspan="6" style="color:var(--muted);">${w.error}</td></tr>`;
+    const bd = w.daily_bias_days || {};
+    const pnlClass = w.total_pnl_points >= 0 ? 'positive' : 'negative';
+    return `<tr class="bt-win-row" data-idx="${i}" style="cursor:pointer;">
+      <td>${new Date(w.start).toLocaleDateString('zh-TW')}～${new Date(w.end).toLocaleDateString('zh-TW')}</td>
+      <td class="mono">${bd.bullish ?? '-'}/${bd.bearish ?? '-'}</td>
+      <td class="mono">${w.total_trades}</td>
+      <td class="mono ${w.total_trades ? pnlClass : ''}">${w.total_trades ? Number(w.total_pnl_points).toFixed(1) : '--'}</td>
+      <td class="mono">${btPf(w)}</td>
+      <td class="mono">${w.total_trades ? Number(w.max_drawdown_points).toFixed(1) : '--'}</td>
+      <td class="mono" style="font-size:11px;">順 ${btBreakdownCell(w.daily_smc_breakdown, 'aligned')}<br/>逆 ${btBreakdownCell(w.daily_smc_breakdown, 'against')}</td>
+    </tr>`;
+  }).join('');
+  const ag = job.aggregate;
+  const agRow = ag ? `<tr style="font-weight:600; border-top:1px solid var(--border);">
+      <td>合計</td><td></td><td class="mono">${ag.total_trades}</td>
+      <td class="mono ${ag.total_pnl_points >= 0 ? 'positive' : 'negative'}">${Number(ag.total_pnl_points).toFixed(1)}</td>
+      <td class="mono">${btPf(ag)}</td><td class="mono">${Number(ag.max_drawdown_points).toFixed(1)}</td>
+      <td class="mono" style="font-size:11px;">順 ${btBreakdownCell(ag.daily_smc_breakdown, 'aligned')}<br/>逆 ${btBreakdownCell(ag.daily_smc_breakdown, 'against')}</td>
+    </tr>` : '';
+  el.innerHTML = head + `
+    <div style="overflow-x:auto; margin-top:8px;">
+      <table style="width:100%; font-size:12px; border-collapse:collapse;">
+        <thead><tr style="color:var(--muted); text-align:left;"><th>期間</th><th>日線多/空天數</th><th>筆數</th><th>損益</th><th>PF</th><th>回撤</th><th>日線分組(筆數 損益)</th></tr></thead>
+        <tbody>${rows}${agRow}</tbody>
+      </table>
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-top:4px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
+    ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
+    <div id="backtestDetail" style="margin-top:12px;"></div>`;
+  el.querySelectorAll('.bt-win-row').forEach(tr => tr.addEventListener('click', () => {
+    const w = wins[Number(tr.dataset.idx)];
+    if(w && w.result) renderBacktestResult(w.result, document.getElementById('backtestDetail'));
+  }));
+}
+
+async function pollBacktestJob(jobId){
+  if(backtestPollTimer) clearTimeout(backtestPollTimer);
+  try{
+    const res = await fetch(`/backtest/jobs/${jobId}`);
+    if(!res.ok && res.status < 500){
+      // 403(正式端沒有回測)、404 之類：重試也不會好，停止輪詢
+      els.backtestResult.innerHTML = `<div class="error">讀不到回測任務 (${res.status})</div>`;
+      setBacktestBusy(false);
+      return;
+    }
+    if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
+    const job = await res.json();
+    if(job.error && !job.job_id){
+      els.backtestResult.innerHTML = `<div class="error">${job.error}</div>`;
+      setBacktestBusy(false);
+      return;
+    }
+    renderBacktestJob(job);
+    if(job.status === 'queued' || job.status === 'running'){
+      setBacktestBusy(true);
+      backtestPollTimer = setTimeout(() => pollBacktestJob(jobId), 3000);
+    }else{
+      setBacktestBusy(false);
+      loadBacktestJobList();
+    }
+  }catch(err){
+    // 網路一時斷掉(手機切背景)：稍後再查，不把任務當成失敗
+    backtestPollTimer = setTimeout(() => pollBacktestJob(jobId), 6000);
+  }
+}
+
+function setBacktestBusy(busy){
+  els.backtestRunBtn.disabled = busy;
+  els.backtestRunBtn.textContent = busy ? '回測中…(可以先離開)' : '執行回測';
+}
+
+async function loadBacktestJobList(){
+  try{
+    const res = await fetch('/backtest/jobs?limit=10');
+    if(!res.ok) return;
+    const data = await res.json();
+    const statusText = {queued:'排隊中', running:'執行中', done:'完成', error:'失敗', interrupted:'中斷'};
+    els.backtestJobList.innerHTML = '<option value="">最近的回測…</option>' + (data.jobs || []).map(j => {
+      const when = j.created_at ? new Date(j.created_at).toLocaleString('zh-TW', {hour12:false, month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '';
+      const ag = j.aggregate;
+      return `<option value="${j.job_id}">${when}｜${j.days}天×${j.windows}段${j.end_date ? '(至' + j.end_date + ')' : ''}｜${statusText[j.status] || j.status}${ag ? `｜PF ${btPf(ag)}` : ''}</option>`;
+    }).join('');
+  }catch(err){ /* 清單拿不到不影響回測本身 */ }
+}
+
+els.backtestJobOpenBtn.addEventListener('click', () => {
+  const id = els.backtestJobList.value;
+  if(!id) return;
+  try{ localStorage.setItem(BT_JOB_KEY, id); }catch(e){}
+  els.backtestResult.innerHTML = '<div class="loading-spinner">讀取中…</div>';
+  pollBacktestJob(id);
+});
+
+els.backtestRunBtn.addEventListener('click', async () => {
+  const days = els.backtestDays.value;
+  const intervalSeconds = els.backtestInterval.value;
+  const strategyType = els.backtestStrategy.value;
+  const resonanceMinConditions = els.backtestResonanceThreshold.value;
+  const symbol = els.backtestSymbol.value;
+  const bucketSize = els.backtestBucketSize.value;
+  const paramOverrides = buildBacktestParamOverrides();
+  const endDate = els.backtestEndDate.value;
+  const windows = els.backtestWindows.value || '1';
+  setBacktestBusy(true);
+  els.backtestResult.innerHTML = '<div class="loading-spinner">送出回測任務…</div>';
+  try{
+    const targetSteps = els.backtestResolution.value;
+    const qs = `days=${days}&windows=${windows}${endDate ? '&end_date=' + endDate : ''}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`;
+    const res = await fetch(`/backtest/jobs?${qs}`, {method: 'POST'});
+    if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
+    const data = await res.json();
+    if(data.error) throw new Error(data.error);
+    try{ localStorage.setItem(BT_JOB_KEY, data.job_id); }catch(e){}
+    loadBacktestJobList();
+    pollBacktestJob(data.job_id);
   }catch(err){
     els.backtestResult.innerHTML = `<div class="error">回測失敗：${err.message}</div>`;
+    setBacktestBusy(false);
   }
-
-  els.backtestRunBtn.disabled = false;
-  els.backtestRunBtn.textContent = '執行回測';
 });
+
+// 回到頁面時接上次的回測(還在跑就繼續更新，跑完就直接顯示結果)
+(function resumeLastBacktest(){
+  loadBacktestJobList();
+  let id = null;
+  try{ id = localStorage.getItem(BT_JOB_KEY); }catch(e){}
+  if(id) pollBacktestJob(id);
+})();
 
 // --- 策略參數設定面板 ---
 

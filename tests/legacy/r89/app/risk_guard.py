@@ -16,6 +16,7 @@ execution_quantity換算成美元)，不是直接查幣安的已實現損益—�
 在執行成功的情況下應該非常接近。
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -187,17 +188,49 @@ def get_account_daily_pnl_usd(execution_account, quantity):
 # 停止「開新倉」而不是停止「管理部位」，才不會把已經在場上的單子晾著。
 # ---------------------------------------------------------------------------
 _manual_halt = {"active": False, "reason": None, "at": None, "by": None}
+# r85：緊急停止狀態存進資料庫(app_settings 的保留鍵)。以前只在記憶體——部署一次、服務重啟，
+# 手動按下的停止、強制平倉後的自動停止都悄悄解除，而且不會有任何訊息
+_HALT_DB_KEY = "_manual_halt"
+_halt_loaded = {"done": False}
+
+
+def _ensure_halt_loaded():
+    """第一次用到時從資料庫讀回停止狀態。讀取失敗回 False(呼叫端保守當成停止中)，下次再試。"""
+    if _halt_loaded["done"]:
+        return True
+    if not db.is_enabled():
+        _halt_loaded["done"] = True
+        return True
+    ok, stored = db.load_app_settings()
+    if not ok:
+        return False
+    raw = stored.get(_HALT_DB_KEY)
+    if raw:
+        try:
+            d = json.loads(raw)
+            if not isinstance(d, dict):
+                raise ValueError(f"不是物件：{type(d).__name__}")
+            _manual_halt.update({k: d.get(k) for k in _manual_halt})   # 只有這四個鍵，寫的一方也只寫這四個
+        except Exception as e:
+            logger.error(f"緊急停止狀態讀不懂，保守當成停止中: {e}")
+            _manual_halt.update(active=True, reason="緊急停止狀態讀不懂(資料庫)，保守停止；確認後在網頁解除")
+    _halt_loaded["done"] = True
+    return True
 
 
 def set_manual_halt(active, reason=None):
-    from datetime import datetime, timezone
+    _halt_loaded["done"] = True   # 手動設定的為準，不再被讀回來的蓋掉
     _manual_halt["active"] = bool(active)
     _manual_halt["reason"] = reason if active else None
     _manual_halt["at"] = datetime.now(timezone.utc).isoformat()
+    db.save_app_settings({_HALT_DB_KEY: json.dumps(_manual_halt, ensure_ascii=False)})
     return dict(_manual_halt)
 
 
 def get_manual_halt():
+    if not _ensure_halt_loaded():
+        return {"active": True, "reason": "讀不到緊急停止狀態(資料庫)，保守當成停止中；每次檢查會重試",
+                "at": None, "by": None}
     return dict(_manual_halt)
 
 
@@ -266,8 +299,9 @@ def _check_inner(engine, quantity, sl_points=None, bid=None, ask=None):
             _history_read_failed(hist_err)
             return False, f"讀不到平倉紀錄(資料庫)，不知道今天虧多少、連虧幾筆，暫停真實下單：{hist_err}", "history_unreadable"
         _history_read_ok()
-    if _manual_halt["active"]:
-        return False, f"手動緊急停止中({_manual_halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"
+    halt = get_manual_halt()   # r85：重啟後從資料庫讀回；讀不到當成停止中
+    if halt["active"]:
+        return False, f"手動緊急停止中({halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"
 
     s = settings_module.get_settings()
 

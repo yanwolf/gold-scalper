@@ -68,7 +68,22 @@ SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
 
 
-def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None):
+def resolve_end_time_ms(end_date=None, now=None):
+    """
+    r90：回測結束時間。end_date(UTC日期 "YYYY-MM-DD")＝那一天 23:59:59.999 UTC；留空＝現在(對齊上一根已收完的整分鐘)。
+    晚於現在的一律夾回現在(不能回測未來)。格式不對拋 ValueError(網頁要看得到原因)。
+    """
+    minute_ms = 60 * 1000
+    now_ms = int((now or datetime.now(timezone.utc)).timestamp() * 1000)
+    now_aligned = (now_ms // minute_ms) * minute_ms - 1
+    if not end_date:
+        return now_aligned
+    d = datetime.strptime(str(end_date).strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = int(d.timestamp() * 1000) + 24 * 60 * 60 * 1000 - 1
+    return min(end, now_aligned)
+
+
+def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None, end_time_ms=None):
     """
     分頁抓取Binance期貨歷史K線，回傳由舊到新排序的原始K線資料。
     公開市場資料，不需要API Key。max_days不指定時上限是MAX_BACKTEST_DAYS(1分K的合理上限)，
@@ -78,8 +93,8 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
     # 結束時間對齊到「上一根已收完的整分鐘」，起點也跟著對齊。以前直接用now()，
     # 每次呼叫的視窗起點都差幾秒到幾分鐘，抓回來的K線集合會位移，跟下面的
     # stride取樣疊在一起後，兩次回測檢查到的K線幾乎完全不同(修正記錄見README)。
-    minute_ms = 60 * 1000
-    end_time = (int(datetime.now(timezone.utc).timestamp() * 1000) // minute_ms) * minute_ms - 1
+    # r90：end_time_ms 可以指定(回測過去某一段)，沒指定就是現在
+    end_time = end_time_ms if end_time_ms is not None else resolve_end_time_ms()
     start_time = end_time - days * 24 * 60 * 60 * 1000 + 1
 
     all_klines = []
@@ -171,6 +186,9 @@ def run_backtest(
     smc_min_rr=None,
     daily_smc_filter_mode=0,
     daily_klines=None,
+    end_time_ms=None,
+    progress_cb=None,
+    daily_smc_against_weight=0.5,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -263,9 +281,9 @@ def run_backtest(
     if klines is None:
         if smc_long_range:
             klines = fetch_historical_klines(symbol=symbol, interval=SMC_LONG_RANGE_STOP_INTERVAL,
-                                             days=days, max_days=SMC_MAX_BACKTEST_DAYS)
+                                             days=days, max_days=SMC_MAX_BACKTEST_DAYS, end_time_ms=end_time_ms)
         else:
-            klines = fetch_historical_klines(symbol=symbol, days=days)
+            klines = fetch_historical_klines(symbol=symbol, days=days, end_time_ms=end_time_ms)
     if not klines:
         return {"error": "抓不到歷史K線資料，請稍後再試"}
 
@@ -335,6 +353,12 @@ def run_backtest(
     # daily_smc_filter_mode(0關閉/1只擋逆勢/2嚴格，語意同趨勢濾網)只存在回測——不是settings欄位，
     # 「一鍵套用到引擎」也不會帶過去，正式端完全不受影響。daily_klines可由呼叫端給(測試用)，沒給才抓。
     daily_smc_filter_mode = int(daily_smc_filter_mode or 0)
+    if daily_smc_filter_mode not in (0, 1, 2, 3):
+        return {"error": f"日線SMC濾網模式只能是 0～3，收到 {daily_smc_filter_mode}"}
+    try:
+        daily_smc_against_weight = min(1.0, max(0.0, float(daily_smc_against_weight)))
+    except (TypeError, ValueError):
+        return {"error": f"逆日線下單比例要是 0～1 的數字，收到 {daily_smc_against_weight}"}
     daily_close_times, daily_series, daily_dates, daily_smc_error = [], [], [], None
     try:
         if daily_klines is not None:
@@ -343,8 +367,11 @@ def run_backtest(
             daily_series = daily_smc.bias_series(_dc)
             daily_dates = [datetime.fromtimestamp(c["bucket_start"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d") for c in _dc]
         else:
+            # warmup 從回測視窗起點往前算：抓「視窗結束往前 days+400 天」的日K(視窗在過去時也涵蓋得到)
             daily_close_times, daily_series, daily_dates = daily_smc.backtest_series(
-                symbol, days, lambda sym, d: fetch_historical_klines(symbol=sym, interval="1d", days=d, max_days=d))
+                symbol, days, lambda sym, d: fetch_historical_klines(symbol=sym, interval="1d", days=d, max_days=d,
+                                                                      end_time_ms=end_time_ms),
+                end_key=end_time_ms)
     except Exception as e:
         daily_smc_error = f"日K抓取失敗：{type(e).__name__}: {e}"
         logger.warning(f"回測日線SMC標記失敗: {e}")
@@ -372,7 +399,7 @@ def run_backtest(
         try:
             # warmup要落在回測視窗「之前」：抓 days+40 天的1小時K，再過濾掉視窗內的部分
             raw = fetch_historical_klines(symbol=symbol, interval="1h", days=days + 40,
-                                          max_days=SMC_MAX_BACKTEST_DAYS + 40)
+                                          max_days=SMC_MAX_BACKTEST_DAYS + 40, end_time_ms=end_time_ms)
             hist = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in raw]
         except Exception as e:
@@ -445,7 +472,10 @@ def run_backtest(
                 trading_core.update_trailing_stop(position, kline_lows[i], step_trail_trigger_points, step_trail_distance_points)
         return position, None
 
-    for step_time in step_times:
+    total_steps = len(step_times)
+    for step_no, step_time in enumerate(step_times):
+        if progress_cb and step_no % 200 == 0:
+            progress_cb(step_no, total_steps)
         # 先把上一個訊號步到這一步之間的每根1分K走一遍停損檢查
         if position and last_signal_step_time is not None:
             position, closed = _run_intrabar_stops(position, last_signal_step_time, step_time - 1)
@@ -569,7 +599,12 @@ def run_backtest(
                     skipped_trend += 1
             daily_tag = _daily_tag_at(step_time)
             daily_ok = True
-            if daily_smc_filter_mode:
+            size_weight = 1.0
+            if daily_smc_filter_mode == 3:
+                # r90：逆日線結構不擋、改下部分量(預設半量)；日線未定照全量
+                if daily_tag["bias"] and daily_tag["bias"] != result["direction"]:
+                    size_weight = daily_smc_against_weight
+            elif daily_smc_filter_mode:
                 daily_ok, _ = trend_filter_allows(daily_smc_filter_mode, daily_tag["bias"], result["direction"])
                 if not daily_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok:
                     skipped_daily_smc += 1   # 只數「其他濾網都放行、只被日線擋下」的，才看得出日線濾網本身的影響
@@ -584,10 +619,30 @@ def run_backtest(
                     profile_reason=result["profile"]["reason"],
                 )
                 position["daily_smc"] = daily_tag
+                if size_weight != 1.0:
+                    position["size_weight"] = size_weight
                 if strategy_type == "smc_structure" and int(smc_cfg.get("exit_mode", 0)) == 1:
                     tp = (result.get("smc") or {}).get("suggested_tp_price")
                     if tp:
                         position["tp_price"] = float(tp)
+
+    # r90：減量的單(逆日線下半量)——損益點數照倉位比例折算，原始點數留在 pnl_points_full；
+    # 統計/回撤一律用折算後的點數(單位是「全量一口的點數」)
+    for t in closed_trades:
+        w = t.get("size_weight")
+        if w is not None and w != 1.0 and t.get("pnl_points") is not None and "pnl_points_full" not in t:
+            t["pnl_points_full"] = t["pnl_points"]
+            t["pnl_points"] = t["pnl_points"] * w
+
+    # r90：這個視窗裡日線偏多/偏空/未定各幾天(看這段回測是哪一種行情)
+    daily_bias_days = {"bullish": 0, "bearish": 0, "none": 0}
+    if daily_close_times and klines:
+        w_start, w_end = int(klines[0][0]), int(klines[-1][6])
+        for ct, sv in zip(daily_close_times, daily_series):
+            if w_start <= ct <= w_end:
+                daily_bias_days[sv["bias"] or "none"] += 1
+    if progress_cb:
+        progress_cb(total_steps, total_steps)
 
     stats = compute_stats(closed_trades)
     readiness = assess_readiness(stats)
@@ -649,6 +704,9 @@ def run_backtest(
         "daily_smc_breakdown": compute_daily_smc_breakdown(closed_trades),
         "daily_smc_error": daily_smc_error,
         "daily_smc_candle_count": len(daily_close_times),
+        "daily_smc_against_weight": daily_smc_against_weight if daily_smc_filter_mode == 3 else None,
+        "daily_bias_days": daily_bias_days,
+        "data_start_time_iso": datetime.fromtimestamp(int(klines[0][0]) / 1000, tz=timezone.utc).isoformat(),
         "strategy_type": strategy_type,
         "resonance_min_conditions": resonance_min_conditions,
         "symbol": symbol,

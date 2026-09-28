@@ -2533,7 +2533,7 @@ class FrameworkState(unittest.TestCase):
         self.assertGreater(len(names), 5, "前提：真的掃到了模組層級的狀態")
         for mod, k in names:
             v = getattr(mod, k)
-            v["__probe__"] = 1 if isinstance(v, dict) else None
+            if isinstance(v, dict): v["__probe__"] = 1   # r90：以前這行對 list 也做 v["__probe__"]=…，模組層級一有 list 就崩
             if isinstance(v, list): v.append("__probe__")
             if isinstance(v, set): v.add("__probe__")
         _reset_module_state()
