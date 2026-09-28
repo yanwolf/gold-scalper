@@ -114,7 +114,9 @@ def _aggregate(results):
             "profit_factor": st["profit_factor"],
             "profit_factor_infinite": st["profit_factor"] is None and st["total_trades"] > 0,
             "max_drawdown_points": st["max_drawdown_points"],
-            "daily_smc_breakdown": trading_stats.compute_daily_smc_breakdown(trades)}
+            "daily_smc_breakdown": trading_stats.compute_daily_smc_breakdown(trades),
+            # r93：各段交易接起來算(段與段首尾相接，第二段第一筆的「上一筆」是第一段最後一筆)
+            "reentry_breakdown": trading_stats.compute_reentry_breakdown(trades)}
 
 
 def _set_progress(job_id, **kw):

@@ -1606,6 +1606,46 @@ function dailySmcTagText(tag){
   return `日線${tag.bias === 'bullish' ? '偏多' : '偏空'}${tag.confirmed ? '(已確認)' : '(CHoCH待確認)'}${tag.stale ? '・過期' : ''}`;
 }
 
+// r93：出場後多快再進場的分組(驗證「大賺出場後立刻再追、隨即被掃」這個模式)
+function reentryBreakdownHtml(rb, title){
+  if(!rb || !rb.groups) return '';
+  const rows = rb.groups;
+  if(!rows.reduce((a, r) => a + (r.total_trades || 0), 0)) return '';
+  const short = key => {
+    const m = /^after_(win|loss)_(\d+)h$/.exec(key);
+    return m ? `${m[1] === 'win' ? '賺後' : '賠後'} ≤${m[2]}h` : '其他';
+  };
+  const body = rows.map(r => {
+    const n = r.total_trades;
+    const pf = n ? (r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : (r.profit_factor_infinite ? '∞' : '--')) : '--';
+    const avgCls = r.avg_pnl_points >= 0 ? 'bt-pos' : 'bt-neg';
+    const sep = r.key.startsWith('after_loss_1h') || r.key === 'rest' ? 'border-top:1px solid var(--grid);' : '';
+    return `<tr style="${sep}">
+      <td style="white-space:nowrap; padding-right:8px;">${short(r.key)}</td>
+      <td class="mono" style="padding-right:8px;">${n}</td>
+      <td class="mono" style="padding-right:8px;">${n ? r.win_rate + '%' : '--'}</td>
+      <td class="mono ${n ? avgCls : ''}" style="padding-right:8px;">${n ? btNum(r.avg_pnl_points, 2) : '--'}</td>
+      <td class="mono" style="padding-right:8px;">${pf}</td>
+      <td class="mono">${r.same_dir_ratio != null ? r.same_dir_ratio + '%' : '--'}</td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="spread-adjusted-card" style="margin-top:10px;">
+      <div class="spread-adjusted-title">${title}</div>
+      <div style="overflow-x:auto;">
+        <table style="width:100%; font-size:12px; border-collapse:collapse;">
+          <thead><tr style="color:var(--muted); text-align:left;"><th>上一筆</th><th>筆數</th><th>勝率</th><th>每筆平均</th><th>PF</th><th>同向</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+      <div style="font-size:11px; color:var(--muted); margin-top:4px; line-height:1.5;">
+        每筆依「上一筆賺或賠、上一筆出場後隔多久才進場」分組；≤1h、≤3h、≤6h 是「以內」的累計(≤3h 包含 ≤1h 的單)。
+        「同向」＝跟上一筆同方向的比例(追同一波的程度)。拿「賺後」幾列的每筆平均、PF 跟「其他」比：明顯比較差，才值得在回測試「獲利出場後冷卻一段時間」。${rb.skipped ? ` 時間讀不懂略過 ${rb.skipped} 筆。` : ''}
+      </div>
+    </div>
+  `;
+}
+
 function dailySmcBreakdownHtml(rows, title){
   if(!rows || !rows.length) return '';
   const total = rows.reduce((a, r) => a + (r.total_trades || 0), 0);
@@ -2736,6 +2776,9 @@ function renderPaperTrading(data, t){
   if(ddEl && data.daily_smc_breakdown){
     ddEl.innerHTML += dailySmcBreakdownHtml(data.daily_smc_breakdown, '依開倉時日線SMC結構分組（純參考，不影響下單）');
   }
+  if(ddEl && data.reentry_breakdown){
+    ddEl.innerHTML += reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場（純參考，不影響下單）');
+  }
 
   renderTradeList(t.paperTradeList, data.recent_trades, data.settings_changed_at);
 }
@@ -3248,6 +3291,7 @@ function renderBacktestResult(data, el){
       </div>
       <div id="backtestSpreadAdjusted"></div>
       <div id="backtestDailySmc"></div>
+      <div id="backtestReentry"></div>
       <div class="settings-group" style="margin-top:12px;">
         <div style="font-size:12px; color:var(--gold); margin-bottom:6px;">把這組回測參數套用到模擬引擎</div>
         <div class="controls">
@@ -3273,6 +3317,7 @@ function renderBacktestResult(data, el){
     `;
 
     renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
+    document.getElementById('backtestReentry').innerHTML = reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場');
     document.getElementById('backtestDailySmc').innerHTML = dailySmcBreakdownHtml(
       data.daily_smc_breakdown, `依開倉時日線SMC結構分組${data.daily_smc_filter_mode ? '（已開日線濾網：被擋的單不在這裡）' : '（沒開日線濾網：順勢那組≈開濾網的近似結果）'}`);
 
@@ -3416,6 +3461,7 @@ function renderBacktestJob(job){
     ${ag ? btWinCard('<b>合計</b>', '', ag, 'total', null) : ''}
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
     ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
+    ${ag ? reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場') : ''}
     <div id="backtestDetail" style="margin-top:12px;"></div>`;
   el.querySelectorAll('.bt-win[data-idx]').forEach(card => card.addEventListener('click', () => {
     const w = wins[Number(card.dataset.idx)];

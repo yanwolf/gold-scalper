@@ -348,3 +348,78 @@ class MobileLayout(unittest.TestCase):
 
     def test_no_undefined_border_variable(self):
         self.assertNotIn("var(--border)", self.html, "沒有這個 CSS 變數(r90 用了、邊框沒顯示)")
+
+
+class Reentry(unittest.TestCase):
+    """r93：依「上一筆賺或賠、隔多久才再進場」分組。"""
+    @staticmethod
+    def _t(entry, exit_, pnl, direction="bearish"):
+        return {"entry_time": f"2026-06-11T{entry}:00+00:00", "exit_time": f"2026-06-11T{exit_}:00+00:00",
+                "pnl_points": pnl, "direction": direction}
+
+    def _groups(self, trades):
+        from app import trading_stats as TS
+        return {g["key"]: g for g in TS.compute_reentry_breakdown(trades)["groups"]}
+
+    def test_quick_reentry_after_win_is_grouped(self):
+        trades = [
+            self._t("01:00", "06:30", 74.45),          # 第一筆 → 其他
+            self._t("07:00", "09:16", -30.35),         # 賺後 0.5h
+            self._t("11:30", "12:15", 20.35, "bullish"),  # 賠後 2.2h、反方向
+            self._t("20:00", "21:00", -5.0, "bullish"),  # 賺後 7.75h → 其他
+        ]
+        g = self._groups(list(reversed(trades)))       # 順序打亂也要先依開倉時間排
+        self.assertEqual(g["after_win_1h"]["total_trades"], 1)
+        self.assertEqual(g["after_win_1h"]["total_pnl_points"], -30.35)
+        self.assertEqual(g["after_win_1h"]["same_dir_ratio"], 100.0)
+        self.assertEqual(g["after_win_3h"]["total_trades"], 1, "≤3h 包含 ≤1h 的")
+        self.assertEqual(g["after_loss_1h"]["total_trades"], 0)
+        self.assertEqual(g["after_loss_3h"]["total_trades"], 1)
+        self.assertEqual(g["after_loss_3h"]["avg_pnl_points"], 20.35)
+        self.assertEqual(g["after_loss_3h"]["same_dir_ratio"], 0.0, "跟上一筆反方向")
+        self.assertEqual(g["rest"]["total_trades"], 2, "第一筆＋間隔超過 6 小時的")
+        self.assertIsNone(g["rest"]["same_dir_ratio"])
+
+    def test_every_trade_counted_once_in_rest_or_longest_window(self):
+        import random
+        rnd = random.Random(7)
+        trades, t = [], datetime(2026, 6, 1, tzinfo=timezone.utc)
+        from datetime import timedelta
+        for _ in range(60):
+            t += timedelta(minutes=rnd.randint(5, 900))
+            x = t + timedelta(minutes=rnd.randint(15, 300))
+            trades.append({"entry_time": t.isoformat(), "exit_time": x.isoformat(), "pnl_points": rnd.uniform(-20, 20),
+                           "direction": rnd.choice(["bullish", "bearish"])})
+            t = x
+        g = self._groups(trades)
+        self.assertEqual(g["after_win_6h"]["total_trades"] + g["after_loss_6h"]["total_trades"] + g["rest"]["total_trades"], 60)
+        self.assertLessEqual(g["after_win_1h"]["total_trades"], g["after_win_3h"]["total_trades"])
+        self.assertLessEqual(g["after_win_3h"]["total_trades"], g["after_win_6h"]["total_trades"])
+
+    def test_unreadable_times_are_skipped_not_guessed(self):
+        from app import trading_stats as TS
+        r = TS.compute_reentry_breakdown([{"entry_time": None, "exit_time": "x", "pnl_points": 1}, self._t("01:00", "02:00", 3)])
+        self.assertEqual(r["skipped"], 1)
+        self.assertEqual(sum(g["total_trades"] for g in r["groups"] if g["key"] in ("after_win_6h", "after_loss_6h", "rest")), 1)
+
+    def test_backtest_job_and_live_summary_include_it(self):
+        from tests.test_daily_smc import _path_up_then_down as _p
+        closes = _p()
+        start = T0 + len(closes) * DAY
+        with mock.patch.object(B, "compute_signal_from_trades", return_value={**FAKE, "direction": "bearish"}):
+            r = B.run_backtest(days=2, interval_seconds=900, klines=_klines_1m(2, start), daily_klines=_raw(closes),
+                               trend_filter_mode=0, use_chop_filter=False, block_market_closed=False, min_atr_points=0,
+                               use_atr=False, sl_points=0.3, trail_trigger_points=50, trail_distance_points=50, reversal_confirm_count=3)
+        self.assertGreater(r["total_trades"], 1, "前提：有好幾筆")
+        self.assertEqual(sum(g["total_trades"] for g in r["reentry_breakdown"]["groups"]
+                             if g["key"] in ("after_win_6h", "after_loss_6h", "rest")), r["total_trades"])
+        agg = J._aggregate([r, r])
+        self.assertIn("reentry_breakdown", agg)
+        from app import paper_trading as pt
+        eng = next(iter(pt.PAPER_TRADING_ENGINES.values()))
+        mem = [self._t("07:00", "09:16", -30.35), self._t("01:00", "06:30", 74.45)]
+        with mock.patch.object(eng, "_closed_trades_memory", mem), mock.patch.object(pt.db, "_enabled", False):
+            summ = eng.get_summary()
+        g = {x["key"]: x["total_trades"] for x in summ["reentry_breakdown"]["groups"]}
+        self.assertEqual(g["after_win_1h"], 1, "即時模擬單的統計也有這張表")
+        self.assertEqual(g["rest"], 1)

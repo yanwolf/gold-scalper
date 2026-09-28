@@ -29,7 +29,7 @@ from app import smc_structure
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
-from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown
+from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown, compute_reentry_breakdown
 from app import daily_smc
 
 logger = logging.getLogger("backtest")
@@ -702,6 +702,7 @@ def run_backtest(
         "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
         "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數
         "daily_smc_breakdown": compute_daily_smc_breakdown(closed_trades),
+        "reentry_breakdown": compute_reentry_breakdown(closed_trades),   # r93：出場後多快再進場
         "daily_smc_error": daily_smc_error,
         "daily_smc_candle_count": len(daily_close_times),
         "daily_smc_against_weight": daily_smc_against_weight if daily_smc_filter_mode == 3 else None,

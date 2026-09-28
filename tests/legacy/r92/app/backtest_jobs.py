@@ -44,13 +44,43 @@ def _iso(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat() if ms is not None else None
 
 
+# r91：清單上要分得出哪個任務是哪組設定——summary 帶這幾個關鍵參數
+LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
+                    "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier")
+
+
+def _label_params(job):
+    """關鍵參數：以第一段實際用到的值為準(留空＝沿用正式設定時，結果裡才有實際值)，沒有就用送出時的參數。"""
+    params = job.get("params") or {}
+    out = {k: params.get(k) for k in LABEL_PARAM_KEYS}
+    for w in job.get("window_results") or []:
+        res = w.get("result") if isinstance(w, dict) else None
+        if isinstance(res, dict) and not res.get("error"):
+            for k in LABEL_PARAM_KEYS:
+                if res.get(k) is not None:
+                    out[k] = res[k]
+            break
+    return out
+
+
+def _headline(job):
+    rows = [w for w in (job.get("window_results") or []) if isinstance(w, dict) and not w.get("error")]
+    if job.get("windows") != 1 or not rows:
+        return None
+    w = rows[0]
+    return {k: w.get(k) for k in ("total_trades", "total_pnl_points", "profit_factor", "max_drawdown_points")}
+
+
 def _summary_of(job):
     """給清單/資料庫 summary 欄位用的精簡版(不含每段完整結果)。"""
     return {
+        "label_params": _label_params(job),
         "job_id": job["job_id"], "created_at": job["created_at"], "status": job["status"],
         "finished_at": job.get("finished_at"), "error": job.get("error"),
         "days": job["days"], "windows": job["windows"], "end_date": job.get("end_date"),
         "label": job.get("label"), "aggregate": job.get("aggregate"),
+        # r92：只跑一段的任務沒有合計，清單上用那一段的結果當摘要
+        "headline": _headline(job),
     }
 
 
@@ -241,6 +271,11 @@ def list_jobs(limit=10):
                 if s.get("job_id") and s["job_id"] not in out:
                     if s.get("status") in ("queued", "running"):
                         s["status"] = "interrupted"
+                    if "label_params" not in s:
+                        # r91 以前存的任務：summary 沒有參數，從完整內容補(最多 limit 筆，只會發生在舊任務)
+                        full = get_job(s["job_id"])
+                        if isinstance(full, dict) and full.get("job_id"):
+                            s["label_params"] = _label_params(full)
                     out[s["job_id"]] = s
     except Exception as e:
         logger.warning(f"讀取回測任務清單失敗: {e}")
