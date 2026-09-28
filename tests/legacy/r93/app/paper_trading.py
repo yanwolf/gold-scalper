@@ -33,6 +33,7 @@ from app import alert_cadence
 from app import execution as execution_module
 from app import risk_guard
 from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact, compute_daily_smc_breakdown
+from app import trading_stats
 from app import daily_smc
 from app.analysis import trend_filter_allows
 
@@ -2136,6 +2137,8 @@ class PaperTradingEngine:
         slippage_impact = compute_slippage_impact(stats_trades)
         # r89：依開倉時的日線SMC結構分組(同一批stats_trades，口徑一致)
         daily_smc_breakdown = compute_daily_smc_breakdown(stats_trades)
+        # r93：出場後多快再進場(同一批stats_trades)
+        reentry_breakdown = trading_stats.compute_reentry_breakdown(stats_trades)
 
         with self._lock:
             position = self._position
@@ -2171,6 +2174,7 @@ class PaperTradingEngine:
             "assumed_spread_points": spread_points,
             "slippage_impact": slippage_impact,
             "daily_smc_breakdown": daily_smc_breakdown,
+            "reentry_breakdown": reentry_breakdown,
         }
 
 

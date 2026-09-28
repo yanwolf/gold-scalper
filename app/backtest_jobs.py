@@ -46,7 +46,7 @@ def _iso(ms):
 
 # r91：清單上要分得出哪個任務是哪組設定——summary 帶這幾個關鍵參數
 LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
-                    "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier")
+                    "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours")
 
 
 def _label_params(job):
@@ -99,7 +99,8 @@ def _window_row(idx, res, start_ms, end_ms):
         row["error"] = (res or {}).get("error") if isinstance(res, dict) else "回測沒有結果"
         return row
     for k in ("total_trades", "win_rate", "total_pnl_points", "profit_factor", "max_drawdown_points",
-              "daily_bias_days", "daily_smc_breakdown", "skipped_daily_smc", "skipped_trend", "daily_smc_error"):
+              "daily_bias_days", "daily_smc_breakdown", "skipped_daily_smc", "skipped_trend", "daily_smc_error",
+              "skipped_cooldown"):
         row[k] = res.get(k)
     return row
 

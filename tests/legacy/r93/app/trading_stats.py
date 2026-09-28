@@ -9,6 +9,9 @@
 不再是這裡固定讀一次環境變數的常數，改參數不用重新部署就會生效。
 """
 
+from datetime import datetime, timezone
+
+
 
 def real_usd_summary(trades):
     """
@@ -270,3 +273,81 @@ def compute_daily_smc_breakdown(trades):
                                    and t["daily_smc"].get("confirmed")),
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# 出場後多快再進場(r93)：6 月回撤裡看到「大賺出場後立刻在更低處再追、隨即被反彈掃掉」，
+# 這裡把所有交易依「上一筆的結果＋間隔多久」分組，看這個模式在整段資料裡是不是普遍成立
+# ---------------------------------------------------------------------------
+REENTRY_WINDOWS_HOURS = (1, 3, 6)
+
+
+def _to_dt(v):
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, str) and v:
+        try:
+            d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def compute_reentry_breakdown(trades, windows_hours=REENTRY_WINDOWS_HOURS):
+    """
+    依開倉時間排序，每一筆看「上一筆」：上一筆賺還是賠、上一筆出場到這一筆進場隔了多久。
+    回傳的分組(同一筆可能同時在 ≤1h、≤3h、≤6h 裡，是「以內」的累計)：
+      after_win_{h}h  ：上一筆獲利出場後 h 小時內再進場
+      after_loss_{h}h ：上一筆虧損出場後 h 小時內再進場
+      rest            ：上一筆出場超過最長視窗才進場，或是第一筆
+    另外 same_dir_ratio：該組裡跟上一筆同方向的比例(追同一波的程度)。
+    時間讀不懂的交易略過(不猜)，略過幾筆放在 skipped。
+    """
+    rows = []
+    for t in trades or []:
+        et, xt = _to_dt(t.get("entry_time")), _to_dt(t.get("exit_time"))
+        if et is None or xt is None:
+            continue
+        rows.append((et, xt, t))
+    skipped = len(trades or []) - len(rows)
+    rows.sort(key=lambda r: r[0])
+    longest = max(windows_hours) if windows_hours else 0
+    groups = {}
+    for h in windows_hours:
+        groups[f"after_win_{h}h"] = []
+        groups[f"after_loss_{h}h"] = []
+    groups["rest"] = []
+    same_dir = {k: 0 for k in groups}
+    for i, (et, _xt, t) in enumerate(rows):
+        prev = rows[i - 1] if i > 0 else None
+        gap_h = (et - prev[1]).total_seconds() / 3600 if prev else None
+        if prev is None or gap_h is None or gap_h < 0 or gap_h > longest:
+            groups["rest"].append(t)
+            continue
+        prev_pnl = prev[2].get("pnl_points")
+        kind = "after_win" if (prev_pnl or 0) > 0 else "after_loss"
+        for h in windows_hours:
+            if gap_h <= h:
+                key = f"{kind}_{h}h"
+                groups[key].append(t)
+                if prev[2].get("direction") == t.get("direction"):
+                    same_dir[key] += 1
+    out = []
+    # 顯示順序：賺後各視窗 → 賠後各視窗 → 其他
+    for kind, word in (("after_win", "獲利"), ("after_loss", "虧損")):
+        for h in windows_hours:
+            out.append((f"{kind}_{h}h", f"{word}出場後 {h} 小時內再進場"))
+    out.append(("rest", f"其他(間隔超過 {longest} 小時或第一筆)"))
+    result = []
+    for key, label in out:
+        st = compute_stats(groups[key])
+        n = st["total_trades"]
+        result.append({
+            "key": key, "label": label, "total_trades": n, "win_rate": st["win_rate"],
+            "total_pnl_points": st["total_pnl_points"], "profit_factor": st["profit_factor"],
+            "profit_factor_infinite": st["profit_factor"] is None and n > 0,
+            "avg_pnl_points": round(st["total_pnl_points"] / n, 2) if n else None,
+            "same_dir_ratio": round(same_dir.get(key, 0) / n * 100, 1) if n and key != "rest" else None,
+        })
+    return {"groups": result, "skipped": skipped, "windows_hours": list(windows_hours)}

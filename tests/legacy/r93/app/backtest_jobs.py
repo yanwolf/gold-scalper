@@ -63,6 +63,14 @@ def _label_params(job):
     return out
 
 
+def _headline(job):
+    rows = [w for w in (job.get("window_results") or []) if isinstance(w, dict) and not w.get("error")]
+    if job.get("windows") != 1 or not rows:
+        return None
+    w = rows[0]
+    return {k: w.get(k) for k in ("total_trades", "total_pnl_points", "profit_factor", "max_drawdown_points")}
+
+
 def _summary_of(job):
     """給清單/資料庫 summary 欄位用的精簡版(不含每段完整結果)。"""
     return {
@@ -71,6 +79,8 @@ def _summary_of(job):
         "finished_at": job.get("finished_at"), "error": job.get("error"),
         "days": job["days"], "windows": job["windows"], "end_date": job.get("end_date"),
         "label": job.get("label"), "aggregate": job.get("aggregate"),
+        # r92：只跑一段的任務沒有合計，清單上用那一段的結果當摘要
+        "headline": _headline(job),
     }
 
 
@@ -104,7 +114,9 @@ def _aggregate(results):
             "profit_factor": st["profit_factor"],
             "profit_factor_infinite": st["profit_factor"] is None and st["total_trades"] > 0,
             "max_drawdown_points": st["max_drawdown_points"],
-            "daily_smc_breakdown": trading_stats.compute_daily_smc_breakdown(trades)}
+            "daily_smc_breakdown": trading_stats.compute_daily_smc_breakdown(trades),
+            # r93：各段交易接起來算(段與段首尾相接，第二段第一筆的「上一筆」是第一段最後一筆)
+            "reentry_breakdown": trading_stats.compute_reentry_breakdown(trades)}
 
 
 def _set_progress(job_id, **kw):

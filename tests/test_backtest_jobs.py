@@ -423,3 +423,61 @@ class Reentry(unittest.TestCase):
         g = {x["key"]: x["total_trades"] for x in summ["reentry_breakdown"]["groups"]}
         self.assertEqual(g["after_win_1h"], 1, "即時模擬單的統計也有這張表")
         self.assertEqual(g["rest"], 1)
+
+
+class Cooldown(unittest.TestCase):
+    """r94：出場後冷卻 N 小時(只存在回測)。"""
+    def _run(self, cooldown, days=2):
+        closes = _path_up_then_down()
+        start = T0 + len(closes) * DAY
+        with mock.patch.object(B, "compute_signal_from_trades", return_value={**FAKE, "direction": "bearish"}):
+            return B.run_backtest(days=days, interval_seconds=900, klines=_klines_1m(days, start), daily_klines=_raw(closes),
+                                  trend_filter_mode=0, use_chop_filter=False, block_market_closed=False, min_atr_points=0,
+                                  use_atr=False, sl_points=0.3, trail_trigger_points=50, trail_distance_points=50,
+                                  reversal_confirm_count=3, cooldown_hours=cooldown)
+
+    def test_no_entry_within_cooldown_after_any_exit(self):
+        base = self._run(0)
+        cd = self._run(3)
+        self.assertGreater(base["total_trades"], 8, "前提：不冷卻時進出很頻繁")
+        self.assertLess(cd["total_trades"], base["total_trades"])
+        self.assertGreater(cd["skipped_cooldown"], 0, "前提：冷卻真的擋了東西")
+        self.assertEqual(cd["cooldown_hours"], 3.0)
+        trades = sorted(cd["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertGreater(len(trades), 1, "前提：冷卻後還是有好幾筆，才驗得到間隔")
+        for prev, cur in zip(trades, trades[1:]):
+            gap = (datetime.fromisoformat(cur["entry_time"]) - datetime.fromisoformat(prev["exit_time"])).total_seconds()
+            self.assertGreaterEqual(gap, 3 * 3600, f"{prev['exit_time']} 出場、{cur['entry_time']} 就進場")
+
+    def test_zero_is_unchanged(self):
+        a = self._run(0)
+        b = self._run(None)
+        self.assertEqual(a["total_trades"], b["total_trades"])
+        self.assertEqual(a["total_pnl_points"], b["total_pnl_points"])
+        self.assertEqual(a["skipped_cooldown"], 0)
+
+    def test_invalid_is_rejected(self):
+        self.assertIn("error", self._run(-1))
+        self.assertIn("error", self._run(100))
+        self.assertIn("error", self._run("abc"))
+
+    def test_job_passes_it_through_and_label_shows_it(self):
+        rec = []
+        J._jobs.clear()
+        J._order.clear()
+        with mock.patch.object(J.backtest_module, "run_backtest", side_effect=_fake_run_factory(rec)), \
+             mock.patch.object(db, "_enabled", False):
+            from fastapi.testclient import TestClient
+            import app.main as m
+            body = TestClient(m.app).post("/backtest/jobs?days=30&windows=1&cooldown_hours=6").json()
+            self.assertTrue(J.wait_idle(10))
+            listed = {j["job_id"]: j for j in J.list_jobs()}
+        self.assertEqual(rec[0]["params"]["cooldown_hours"], 6.0)
+        self.assertEqual(listed[body["job_id"]]["label_params"]["cooldown_hours"], 6.0)
+
+    def test_not_a_live_setting(self):
+        """冷卻只存在回測：正式設定裡沒有這個欄位，即時引擎也不讀它。"""
+        import inspect
+        from app import settings as S, paper_trading as pt
+        self.assertFalse(any("cooldown" in k for k in S.get_settings().keys()))
+        self.assertNotIn("cooldown_hours", inspect.getsource(pt))

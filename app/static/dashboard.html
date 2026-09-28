@@ -846,6 +846,17 @@
         <label>逆日線結構的下單比例(只在「下部分量」時有效)</label>
         <input type="number" id="backtestDailySmcWeight" placeholder="留空=0.5(半量)" step="0.1" min="0" max="1" />
       </div>
+      <div class="settings-field">
+        <label>出場後冷卻(小時，只存在回測，不會套用到引擎)</label>
+        <select id="backtestCooldown">
+          <option value="">不冷卻</option>
+          <option value="1">1 小時</option>
+          <option value="2">2 小時</option>
+          <option value="3">3 小時</option>
+          <option value="6">6 小時</option>
+          <option value="12">12 小時</option>
+        </select>
+      </div>
     </div>
   </div>
 
@@ -1237,6 +1248,7 @@ const els = {
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
   backtestDailySmcMode: document.getElementById('backtestDailySmcMode'),
   backtestDailySmcWeight: document.getElementById('backtestDailySmcWeight'),
+  backtestCooldown: document.getElementById('backtestCooldown'),
   backtestEndDate: document.getElementById('backtestEndDate'),
   backtestWindows: document.getElementById('backtestWindows'),
   backtestJobList: document.getElementById('backtestJobList'),
@@ -3250,6 +3262,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
   addIfPresent('daily_smc_filter_mode', els.backtestDailySmcMode);
   addIfPresent('daily_smc_against_weight', els.backtestDailySmcWeight);
+  addIfPresent('cooldown_hours', els.backtestCooldown);
   addIfPresent('smc_touch_window', els.backtestSmcTouchWindow);
   addIfPresent('smc_wt_level', els.backtestSmcWtLevel);
   addIfPresent('smc_confirm_bos', els.backtestSmcConfirmBos);
@@ -3276,6 +3289,7 @@ function renderBacktestResult(data, el){
         ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_cfg ? ` ／ SMC參數：視窗${data.smc_cfg.touch_window}、WT門檻${data.smc_cfg.wt_level}、BOS${data.smc_cfg.confirm_bos}、EMA${data.smc_cfg.require_ema ? '要' : '不要'}、出場${data.smc_cfg.exit_mode == 1 ? '結構停利' : '移動停損'}${data.smc_cfg.exit_mode == 1 ? '(RR≥' + data.smc_cfg.min_rr + ')' : ''}` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
         ${data.daily_smc_filter_mode == 3 ? `／ 日線SMC：逆日線結構下 ${data.daily_smc_against_weight} 倍量(損益、回撤都已照比例折算)` : (data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : '')}
+        ${data.cooldown_hours ? `／ 出場後冷卻 ${data.cooldown_hours} 小時，只被冷卻擋掉 ${data.skipped_cooldown || 0} 次` : ''}
         ${data.daily_bias_days ? `／ 這段期間日線：偏多 ${data.daily_bias_days.bullish} 天、偏空 ${data.daily_bias_days.bearish} 天${data.daily_bias_days.none ? `、未定 ${data.daily_bias_days.none} 天` : ''}` : ''}
         ${data.daily_smc_error ? `／ ⚠️ 日線標記沒有資料(${data.daily_smc_error})，分組全部記為未知` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
@@ -3302,6 +3316,7 @@ function renderBacktestResult(data, el){
           會把上面「目前策略設定」卡片顯示的全部參數(停損/濾網，SMC策略再加上SMC專屬參數)寫成該引擎的專屬覆寫，需要設定密碼；
           該引擎的績效統計會從套用那一刻重新分界。真實下單槽位(execution_*)不會被動到。
         </div>
+        ${(data.cooldown_hours || data.daily_smc_filter_mode) ? `<div style="font-size:11px; color:var(--gold); margin-top:4px;">🟡 這次回測開了${[data.daily_smc_filter_mode ? '日線SMC濾網' : '', data.cooldown_hours ? '出場後冷卻' : ''].filter(Boolean).join('、')}：這些只存在回測，套用時不會帶過去，引擎實際跑出來會跟這次回測不同。</div>` : ''}
         <div id="backtestApplyResult" class="notify-result"></div>
       </div>
       <div id="backtestDrawdownPeriod"></div>
@@ -3397,6 +3412,7 @@ function btParamLabel(p){
   if(p.trend_filter_mode == null) parts.push('趨勢:沿用設定');
   else if(Number(p.trend_filter_mode) === 0) parts.push('趨勢:關');
   else parts.push(`趨勢:${Number(p.trend_filter_mode) === 2 ? '嚴格' : '擋逆勢'}${p.trend_interval_seconds ? ' ' + p.trend_interval_seconds/3600 + 'h' : ''}${p.trend_slow_multiplier ? ' ' + p.trend_slow_multiplier + 'x' : ''}`);
+  if(Number(p.cooldown_hours) > 0) parts.push(`冷卻${Number(p.cooldown_hours)}h`);
   return parts.join('・');
 }
 
@@ -3405,7 +3421,7 @@ function btLabelParamsOf(job){
   const p = Object.assign({}, job.params || {});
   const first = (job.window_results || []).find(w => w.result && !w.result.error);
   if(first){
-    ['trend_filter_mode', 'trend_interval_seconds', 'trend_slow_multiplier', 'strategy_type', 'daily_smc_filter_mode', 'daily_smc_against_weight']
+    ['trend_filter_mode', 'trend_interval_seconds', 'trend_slow_multiplier', 'strategy_type', 'daily_smc_filter_mode', 'daily_smc_against_weight', 'cooldown_hours']
       .forEach(k => { if(first.result[k] != null) p[k] = first.result[k]; });
   }
   return p;
