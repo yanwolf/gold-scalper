@@ -289,13 +289,13 @@ def start_refresher(symbol="XAUUSDT"):
 # ---------------------------------------------------------------------------
 # 回測用
 # ---------------------------------------------------------------------------
-def backtest_series(symbol, days, fetcher, now_ms=None):
+def backtest_series(symbol, days, fetcher, now_ms=None, end_key=None):
     """
     回測用：抓「回測視窗 + warmup」的日K，回傳(已收盤日K收盤時間清單, 每根的方向序列, 日期清單)。
     fetcher(symbol, days) 回傳幣安原始日K。同一組(symbol, days)10 分鐘內共用快取(參數掃描用)。
     抓不到時拋例外，由呼叫端決定怎麼處理。
     """
-    key = (symbol, int(days))
+    key = (symbol, int(days), end_key)   # r90：回測結束時間不同就是不同的資料
     now = time.time()
     hit = _bt_cache.get(key)
     if hit and now - hit[0] < BACKTEST_CACHE_SECONDS:

@@ -19,7 +19,7 @@ import functools
 import threading
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -39,6 +39,7 @@ from app import role as role_module
 from app import risk_guard
 from app import preflight as preflight_module
 from app import daily_smc
+from app import backtest_jobs
 
 logger = logging.getLogger("main")
 
@@ -1118,6 +1119,68 @@ async def backtest_run(
         smc_min_rr=smc_min_rr,
         daily_smc_filter_mode=daily_smc_filter_mode,
     )
+
+
+def _backtest_job_params(
+    symbol: str = "XAUUSDT",
+    interval_seconds: int = 300,
+    bucket_size: float = 1.0,
+    trade_limit: int = 3000,
+    sl_points: Optional[float] = None,
+    trail_trigger_points: Optional[float] = None,
+    trail_distance_points: Optional[float] = None,
+    reversal_confirm_count: Optional[int] = None,
+    use_atr: Optional[bool] = None,
+    atr_sl_multiplier: Optional[float] = None,
+    atr_trigger_multiplier: Optional[float] = None,
+    atr_trail_multiplier: Optional[float] = None,
+    use_chop_filter: Optional[bool] = None,
+    chop_threshold: Optional[float] = None,
+    block_market_closed: Optional[bool] = None,
+    min_atr_points: Optional[float] = None,
+    trend_filter_mode: Optional[int] = None,
+    trend_interval_seconds: Optional[int] = None,
+    trend_slow_multiplier: Optional[float] = None,
+    strategy_type: Optional[str] = None,
+    resonance_min_conditions: int = 4,
+    target_step_count: Optional[int] = None,
+    smc_touch_window: Optional[int] = None,
+    smc_wt_level: Optional[float] = None,
+    smc_confirm_bos: Optional[int] = None,
+    smc_require_ema: Optional[int] = None,
+    smc_exit_mode: Optional[int] = None,
+    smc_min_rr: Optional[float] = None,
+    daily_smc_filter_mode: int = 0,
+    daily_smc_against_weight: float = 0.5,
+):
+    """背景回測任務的參數：跟 /backtest/run 同一組(天數、結束日期、段數另外給)。"""
+    return dict(locals())
+
+
+@app.post("/backtest/jobs")
+async def backtest_job_start(days: int = 30, end_date: Optional[str] = None, windows: int = 1,
+                             params: dict = Depends(_backtest_job_params)):
+    """
+    r90：送出背景回測，立刻回傳 job_id(不等回測跑完，避免手機瀏覽器/代理逾時)。
+    end_date：UTC 日期 YYYY-MM-DD，回測到那一天結束(留空＝現在)；windows：從結束日期往回連續跑幾段、每段 days 天。
+    之後用 GET /backtest/jobs/{job_id} 查進度與結果；結果有資料庫時會保存，重新整理頁面也查得到。
+    """
+    return backtest_jobs.start_job(params, days=days, windows=windows, end_date=end_date)
+
+
+@app.get("/backtest/jobs")
+async def backtest_job_list(limit: int = 10):
+    """最近的背景回測任務(新→舊，精簡資訊)。"""
+    return {"jobs": backtest_jobs.list_jobs(limit=max(1, min(int(limit), 30)))}
+
+
+@app.get("/backtest/jobs/{job_id}")
+async def backtest_job_status(job_id: str):
+    """背景回測的進度與結果。服務重啟前還沒跑完的會標成「中斷」。"""
+    job = await asyncio.to_thread(backtest_jobs.get_job, job_id)
+    if job is None:
+        return {"error": "找不到這個回測任務(job_id 錯誤，或已經超過保留筆數被清掉)"}
+    return job
 
 
 @app.post("/backtest/sweep")

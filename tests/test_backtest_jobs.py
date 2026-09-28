@@ -266,6 +266,20 @@ class Jobs(unittest.TestCase):
         self.assertEqual(got[0]["label_params"]["daily_smc_filter_mode"], 1)
         self.assertEqual(got[0]["label_params"]["trend_filter_mode"], 2)
 
+    def test_single_window_job_has_headline_in_list(self):
+        """r92：只跑一段的任務沒有合計，清單上用那一段的結果當摘要。"""
+        rec = []
+        with mock.patch.object(J.backtest_module, "run_backtest", side_effect=_fake_run_factory(rec)), \
+             mock.patch.object(db, "_enabled", False):
+            one = J.start_job({}, days=7, windows=1)
+            multi = J.start_job({}, days=7, windows=2)
+            self.assertTrue(J.wait_idle(10))
+            listed = {j["job_id"]: j for j in J.list_jobs()}
+        self.assertEqual(listed[one["job_id"]]["headline"]["total_trades"], 1)
+        self.assertEqual(listed[one["job_id"]]["headline"]["total_pnl_points"], 10.0)
+        self.assertIsNone(listed[multi["job_id"]]["headline"], "多段的用合計，不另外給")
+        self.assertIsNotNone(listed[multi["job_id"]]["aggregate"])
+
     def test_unknown_job(self):
         with mock.patch.object(db, "_enabled", False):
             self.assertIsNone(J.get_job("does-not-exist"))
@@ -316,3 +330,21 @@ class DailyCacheKey(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MobileLayout(unittest.TestCase):
+    """r92：iOS 的下拉選單寬度＝最長選項，選項一長整頁就被撐寬(手機會整頁縮小)。這裡只能靜態檢查；
+    實際排版是用無頭瀏覽器在 390px 寬、把下拉選單設成「寬度＝最長選項」模擬 iOS 量過的(r91 撐到 698px、r92 維持 390px)。"""
+    def setUp(self):
+        import os
+        self.html = open(os.path.join(os.path.dirname(__file__), "..", "app", "static", "dashboard.html"), encoding="utf-8").read()
+
+    def test_recent_jobs_is_not_a_select(self):
+        self.assertIn('id="backtestJobList" class="bt-job-list"', self.html)
+        self.assertNotIn('<select id="backtestJobList"', self.html)
+
+    def test_form_controls_cannot_exceed_container(self):
+        self.assertIn("select, input{ max-width: 100%; }", self.html)
+
+    def test_no_undefined_border_variable(self):
+        self.assertNotIn("var(--border)", self.html, "沒有這個 CSS 變數(r90 用了、邊框沒顯示)")

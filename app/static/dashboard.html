@@ -53,6 +53,20 @@
     background: var(--panel); border: 1px solid var(--grid); color: var(--text);
     padding: 7px 10px; border-radius: 6px; font-size: 13px;
   }
+  /* r92：iOS Safari 的下拉選單寬度＝最長的選項，選項一長就把整頁撐寬(手機會整頁縮小)；一律不准超過容器 */
+  select, input{ max-width: 100%; }
+  .controls > *{ min-width: 0; }
+  /* r92：日期欄位沒填時 iOS 會畫成一條白色空膠囊，改成跟其他欄位一樣的深色框 */
+  .controls input[type="date"]{
+    -webkit-appearance: none; appearance: none;
+    background: var(--panel); border: 1px solid var(--grid); color: var(--text); color-scheme: dark;
+    padding: 7px 10px; border-radius: 6px; font-size: 13px; min-height: 34px; min-width: 150px;
+  }
+  .bt-job-list{ margin-top: 4px; }
+  .bt-job-row{ border:1px solid var(--grid); border-radius:8px; padding:7px 10px; margin-top:6px; cursor:pointer; font-size:12px; }
+  .bt-job-row.current{ border-color: var(--gold); }
+  .bt-job-row .meta{ color: var(--muted); font-size:11.5px; }
+  .bt-job-row .res{ margin-top:3px; font-size:12px; }
 
   .panel{
     background: var(--panel); border: 1px solid var(--grid); border-radius: 10px;
@@ -633,6 +647,7 @@
   <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
     <label style="font-size:12px; color:var(--muted);">結束日期(UTC)</label>
     <input type="date" id="backtestEndDate" />
+    <button type="button" id="backtestEndDateClear" class="btn-secondary" style="font-size:12px; padding:6px 10px;">到現在</button>
     <select id="backtestWindows">
       <option value="1" selected>只跑這一段</option>
       <option value="2">往回連續 2 段</option>
@@ -837,9 +852,9 @@
   <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
-  <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
-    <select id="backtestJobList"><option value="">最近的回測…</option></select>
-    <button id="backtestJobOpenBtn" class="btn-secondary">打開</button>
+  <div style="margin-top:10px;">
+    <div style="font-size:12px; color:var(--muted);">最近的回測（點一下打開）</div>
+    <div id="backtestJobList" class="bt-job-list"></div>
   </div>
   <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
     <select id="backtestLoadSource"></select>
@@ -1225,7 +1240,7 @@ const els = {
   backtestEndDate: document.getElementById('backtestEndDate'),
   backtestWindows: document.getElementById('backtestWindows'),
   backtestJobList: document.getElementById('backtestJobList'),
-  backtestJobOpenBtn: document.getElementById('backtestJobOpenBtn'),
+  backtestEndDateClear: document.getElementById('backtestEndDateClear'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -3429,6 +3444,10 @@ async function pollBacktestJob(jobId){
       return;
     }
     renderBacktestJob(job);
+    if(backtestCurrentJobId !== jobId){
+      backtestCurrentJobId = jobId;
+      els.backtestJobList.querySelectorAll('.bt-job-row').forEach(r => r.classList.toggle('current', r.dataset.id === jobId));
+    }
     if(job.status === 'queued' || job.status === 'running'){
       setBacktestBusy(true);
       backtestPollTimer = setTimeout(() => pollBacktestJob(jobId), 3000);
@@ -3447,27 +3466,49 @@ function setBacktestBusy(busy){
   els.backtestRunBtn.textContent = busy ? '回測中…(可以先離開)' : '執行回測';
 }
 
+let backtestCurrentJobId = null;
+
 async function loadBacktestJobList(){
   try{
     const res = await fetch('/backtest/jobs?limit=10');
     if(!res.ok) return;
     const data = await res.json();
     const statusText = {queued:'排隊中', running:'執行中', done:'完成', error:'失敗', interrupted:'中斷'};
-    els.backtestJobList.innerHTML = '<option value="">最近的回測…</option>' + (data.jobs || []).map(j => {
+    const jobs = data.jobs || [];
+    if(!jobs.length){
+      els.backtestJobList.innerHTML = '<div style="font-size:11.5px; color:var(--muted); margin-top:4px;">還沒有回測紀錄</div>';
+      return;
+    }
+    // r92：改成一筆一列(手機上會自動換行)，不用下拉選單——iOS 的下拉選單會被長選項撐寬整頁
+    const SHOW = 4;   // 預設只列最近 4 筆，其餘收起來(一筆約兩三行，10 筆在手機上太長)
+    els.backtestJobList.innerHTML = jobs.map((j, idx) => {
       const when = j.created_at ? new Date(j.created_at).toLocaleString('zh-TW', {hour12:false, month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '';
-      const ag = j.aggregate;
-      return `<option value="${j.job_id}">${when}｜${btParamLabel(j.label_params)}｜${j.days}天×${j.windows}段${j.end_date ? '(至' + j.end_date + ')' : ''}｜${statusText[j.status] || j.status}${ag ? `｜損益${btNum(ag.total_pnl_points, 0)} PF ${btPf(ag)}` : ''}</option>`;
-    }).join('');
+      const h = j.aggregate || j.headline;
+      const res = h && h.total_trades != null
+        ? `${h.total_trades}筆　損益 <span class="mono ${h.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(h.total_pnl_points, 1)}</span>　PF <span class="mono">${btPf(h)}</span>${h.max_drawdown_points != null ? `　回撤 <span class="mono">${Number(h.max_drawdown_points).toFixed(1)}</span>` : ''}`
+        : '';
+      return `<div class="bt-job-row ${j.job_id === backtestCurrentJobId ? 'current' : ''}" data-id="${j.job_id}" ${idx >= SHOW ? 'data-extra="1" style="display:none;"' : ''}>
+        <div class="meta">${when}・${statusText[j.status] || j.status}・${j.days}天×${j.windows}段${j.end_date ? '(至' + j.end_date + ')' : ''}</div>
+        <span class="bt-param-label">${btParamLabel(j.label_params)}</span>
+        ${res ? `<div class="res">${res}</div>` : ''}
+      </div>`;
+    }).join('') + (jobs.length > SHOW ? `<button type="button" id="backtestJobMore" class="btn-secondary" style="margin-top:6px; font-size:12px; padding:5px 10px;">再顯示 ${jobs.length - SHOW} 筆</button>` : '');
+    const more = document.getElementById('backtestJobMore');
+    if(more) more.addEventListener('click', () => {
+      els.backtestJobList.querySelectorAll('.bt-job-row[data-extra]').forEach(r => { r.style.display = ''; });
+      more.remove();
+    });
+    els.backtestJobList.querySelectorAll('.bt-job-row').forEach(row => row.addEventListener('click', () => {
+      const id = row.dataset.id;
+      try{ localStorage.setItem(BT_JOB_KEY, id); }catch(e){}
+      els.backtestResult.innerHTML = '<div class="loading-spinner">讀取中…</div>';
+      pollBacktestJob(id);
+      els.backtestResult.scrollIntoView({behavior: 'smooth', block: 'start'});
+    }));
   }catch(err){ /* 清單拿不到不影響回測本身 */ }
 }
 
-els.backtestJobOpenBtn.addEventListener('click', () => {
-  const id = els.backtestJobList.value;
-  if(!id) return;
-  try{ localStorage.setItem(BT_JOB_KEY, id); }catch(e){}
-  els.backtestResult.innerHTML = '<div class="loading-spinner">讀取中…</div>';
-  pollBacktestJob(id);
-});
+els.backtestEndDateClear.addEventListener('click', () => { els.backtestEndDate.value = ''; });
 
 els.backtestRunBtn.addEventListener('click', async () => {
   const days = els.backtestDays.value;

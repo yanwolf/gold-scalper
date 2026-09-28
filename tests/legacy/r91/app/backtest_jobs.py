@@ -63,14 +63,6 @@ def _label_params(job):
     return out
 
 
-def _headline(job):
-    rows = [w for w in (job.get("window_results") or []) if isinstance(w, dict) and not w.get("error")]
-    if job.get("windows") != 1 or not rows:
-        return None
-    w = rows[0]
-    return {k: w.get(k) for k in ("total_trades", "total_pnl_points", "profit_factor", "max_drawdown_points")}
-
-
 def _summary_of(job):
     """給清單/資料庫 summary 欄位用的精簡版(不含每段完整結果)。"""
     return {
@@ -79,8 +71,6 @@ def _summary_of(job):
         "finished_at": job.get("finished_at"), "error": job.get("error"),
         "days": job["days"], "windows": job["windows"], "end_date": job.get("end_date"),
         "label": job.get("label"), "aggregate": job.get("aggregate"),
-        # r92：只跑一段的任務沒有合計，清單上用那一段的結果當摘要
-        "headline": _headline(job),
     }
 
 
