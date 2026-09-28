@@ -100,6 +100,23 @@ FILL_BACKFILL_DELAYS = (3, 10, 30, 90)
 # 部分出場狀態(第15條r74)：這幾個欄位一變就整份寫進資料庫，重啟後還原
 PARTIAL_STATE_KEYS = ("partial_realized_usd", "usd_estimated", "partial_pnl_unknown",
                       "unanchored_reduce_qty", "unanchored_est_usd")
+# 執行時才長出來、重啟後還要用的部位欄位(第8條r85)：跟部分出場狀態存在同一欄(partial_state，JSON)。
+# 寫的時候只寫這份清單裡的——清單漏列就是「存了也讀不回來」的同一種坑，tests/check_tests 靜態比對
+RUNTIME_STATE_KEYS = PARTIAL_STATE_KEYS + (
+    "pending_close", "close_fail_count",                # 待平倉：已經決定出場、還沒平完(丟了就不再重試)
+    "partial_close_filled", "close_orig_qty",           # 分段平倉：最後出場價兩段加權、真實損益用整筆數量
+    "tp_price",                                         # SMC 結構停利(以前註明「純記憶體」，r85 起存)
+    "pending_reversal_direction", "pending_reversal_count",   # 反轉出場的連續確認計數
+    "backstop_price", "backstop_hedge",                 # 交易所停損的觸發價與下單時的持倉模式(撤舊單要用)
+)
+# 刻意不存的(寫明理由；靜態檢查要求每個執行時長出來的鍵不是在上面、就是在這裡)
+NOT_RESTORED_KEYS = {
+    "gone_checks": "交易所部位不見的連續次數：重啟後從 0 重數，只會更晚判定平倉(保守)",
+    "backstop_missing": "停損守衛連續查不到的次數：同上，重來只會更晚補掛",
+    "backstop_fail_count": "掛停損失敗次數(告警節奏)：重來最多多發一則告警",
+    "real_open_pending_until": "開倉回應不明的確認期限：r33 起缺期限就當成已逾時、立刻逐幣確認",
+    "real_qty_for_pnl": "平倉當下才設、同一次結帳就用完",
+}
 
 
 def _start_backfill_thread(fn):
@@ -836,8 +853,23 @@ class PaperTradingEngine:
 
     @staticmethod
     def _save_partial_state(position):
-        """部分出場狀態寫進資料庫(r74)：只在記憶體裡的話，重啟後「還沒認領」的那段會被最後出場混進去。"""
-        db.update_paper_trade_partial_state(position.get("id"), {k: position[k] for k in PARTIAL_STATE_KEYS if k in position})
+        """
+        部位的執行狀態寫進資料庫(r74 部分出場；r85 擴大成 RUNTIME_STATE_KEYS)：只在記憶體裡的話重啟就丟了，
+        而且不會報錯——待平倉丟了就不再重試平倉、分段平倉的加權與數量也錯。寫成功才記下內容(下次沒變就不重寫)。
+        """
+        state = {k: position[k] for k in RUNTIME_STATE_KEYS if k in position}
+        js = json.dumps(state, ensure_ascii=False, sort_keys=True, default=str)
+        if db.update_paper_trade_partial_state(position.get("id"), state):
+            position["_saved_state_json"] = js
+
+    def _persist_runtime_state(self):
+        """每輪結束：帳上部位的執行狀態有變就寫(r85)。反轉確認計數、結構停利、交易所停損價都是在一輪裡長出來的。"""
+        pos = self._position
+        if not pos or pos.get("id") is None:
+            return
+        state = {k: pos[k] for k in RUNTIME_STATE_KEYS if k in pos}
+        if json.dumps(state, ensure_ascii=False, sort_keys=True, default=str) != pos.get("_saved_state_json"):
+            self._save_partial_state(pos)
 
     def _schedule_reduce_backfill(self, position):
         """部分出場(App減碼/ADL)估算之後排背景補登(r72)：那段成交出現時換成實際損益、推進界線。"""
@@ -1028,6 +1060,11 @@ class PaperTradingEngine:
         position["close_fail_count"] = n
         position["pending_close"] = {"reason": exit_reason, "price": exit_price}
         position.pop("_closing", None)
+        # r85：待平倉當場就存(不等這一輪結束)——這時候當掉，重啟後才知道還要平
+        try:
+            self._save_partial_state(position)
+        except Exception as e:
+            logger.error(f"待平倉狀態寫不進資料庫({self.label}): {e}")
         with self._lock:
             self._position = position
         if alert_cadence.should_alert(n):
@@ -1219,6 +1256,7 @@ class PaperTradingEngine:
     def _loop_once(self):
         """背景迴圈的一輪(第8條r23/r24)：tick本身出錯也要照節奏推播、恢復時通知，不能只寫日誌。"""
         self._run_step("每輪判斷", self._tick)
+        self._run_step("存部位狀態", self._persist_runtime_state)   # r85：tick 出錯也照樣存(各自一步)
 
     def _run_forever(self):
         while not self._stop_flag.is_set():

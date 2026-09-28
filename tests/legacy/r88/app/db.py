@@ -513,19 +513,21 @@ def update_paper_trade_partial_state(trade_id, state):
     unanchored_reduce_qty(還沒認領的減少量)、unanchored_est_usd。每次變動整份覆寫；trade_id是None時跳過。
     """
     if not _enabled or trade_id is None:
-        return
+        return False
     try:
         conn = _pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE paper_trades SET partial_state = %s WHERE id = %s;",
-                            (json.dumps(state or {}, ensure_ascii=False), trade_id))
+                            (json.dumps(state or {}, ensure_ascii=False, default=str), trade_id))
             conn.commit()
-            _db_write_ok("記錄部分出場狀態")
+            _db_write_ok("記錄部位執行狀態")
+            return True
         finally:
             _pool.putconn(conn)
     except Exception as e:
-        _db_write_error("記錄部分出場狀態", e)
+        _db_write_error("記錄部位執行狀態", e)
+        return False
 
 
 _BACKFILL_COLUMNS = {"open": "open_backfill", "close": "exit_backfill"}

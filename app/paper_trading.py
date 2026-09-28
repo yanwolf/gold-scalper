@@ -32,7 +32,8 @@ from app import notifier as notifier_module
 from app import alert_cadence
 from app import execution as execution_module
 from app import risk_guard
-from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact
+from app.trading_stats import compute_stats, assess_readiness, compute_slippage_impact, compute_daily_smc_breakdown
+from app import daily_smc
 from app.analysis import trend_filter_allows
 
 logger = logging.getLogger("paper_trading")
@@ -1439,6 +1440,9 @@ class PaperTradingEngine:
         )
         position["interval_seconds"] = self.interval_seconds
         position["engine_id"] = self.engine_id
+        # r89：開倉當下的日線SMC結構(只讀快取、不打網路、不拋例外)。純參考：不影響這次要不要開、怎麼開，
+        # 只存進交易紀錄，之後分組統計「順／逆日線結構」的績效
+        position["daily_smc"] = daily_smc.tag_for_trade()
         if self.strategy_type == "smc_structure":
             smc = signal_result.get("smc") or {}
             s_ = settings_module.get_settings(engine_id=self.engine_id)
@@ -2130,6 +2134,8 @@ class PaperTradingEngine:
         # 跟上面用假設固定值的版本並列，讓使用者用真實數字決定該擋極端值
         # 還是壓平均(修正記錄見README)。同一批stats_trades，口徑一致。
         slippage_impact = compute_slippage_impact(stats_trades)
+        # r89：依開倉時的日線SMC結構分組(同一批stats_trades，口徑一致)
+        daily_smc_breakdown = compute_daily_smc_breakdown(stats_trades)
 
         with self._lock:
             position = self._position
@@ -2164,6 +2170,7 @@ class PaperTradingEngine:
             "readiness_spread_adjusted": readiness_spread_adjusted,
             "assumed_spread_points": spread_points,
             "slippage_impact": slippage_impact,
+            "daily_smc_breakdown": daily_smc_breakdown,
         }
 
 

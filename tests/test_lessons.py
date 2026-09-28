@@ -1368,7 +1368,7 @@ class Lesson34(ExecHarness):
     # 8d：重啟後從資料庫還原開倉單號與界線
     def test_t8d_restore_includes_order_id_and_boundary(self):
         row = (7, "bullish", 4390.0, None, 4380.0, 4395.0, True, "c", "p", 900, "chan_profile_900",
-               True, 0.1, "B1", False, 0.0, 9001, 202, 4391.2, None, None)   # r74：進場成交價、部分出場狀態；r78：進場補登記號
+               True, 0.1, "B1", False, 0.0, 9001, 202, 4391.2, None, None, None)   # r74：進場成交價、部分出場狀態；r78：進場補登記號；r89：日線標記
         class Cur:
             def __enter__(s): return s
             def __exit__(s, *a): return False
@@ -1996,7 +1996,9 @@ def _sqlite_pool():
             "interval_seconds INTEGER", "backstop_algo_id TEXT", "backstop_used_legacy INTEGER", "real_open_baseline REAL",
             "real_open_order_id INTEGER", "fill_boundary_id INTEGER", "partial_state TEXT",
             # r76：背景補登還沒完成的記號(進場／出場各一欄)
-            "open_backfill TEXT", "exit_backfill TEXT"]
+            "open_backfill TEXT", "exit_backfill TEXT",
+            # r89：開倉時的日線SMC結構標記(舊版程式不讀這欄，多一欄不影響舊版重跑)
+            "daily_smc TEXT"]
     conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
     conn.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")   # r85：緊急停止狀態
     conn.create_function("now", 0, lambda: "2026-09-26T00:00:00+00:00")

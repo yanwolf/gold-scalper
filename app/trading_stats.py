@@ -230,3 +230,43 @@ def assess_readiness(stats):
         "ready": all_pass,
         "checks": checks,
     }
+
+
+# ---------------------------------------------------------------------------
+# 日線SMC結構分組(r89)：開倉時記下的日線方向(daily_smc.tag_for_trade)跟這筆單的方向比對
+# ---------------------------------------------------------------------------
+DAILY_SMC_GROUPS = (
+    ("aligned", "順日線結構"),
+    ("against", "逆日線結構"),
+    ("unknown", "日線未知"),
+)
+
+
+def daily_smc_alignment(tag, direction):
+    """'aligned'／'against'／'unknown'。沒有標記、方向未定、資料過期都算 unknown(不硬猜)。"""
+    if not isinstance(tag, dict) or not tag.get("bias") or tag.get("stale") or direction not in ("bullish", "bearish"):
+        return "unknown"
+    return "aligned" if tag["bias"] == direction else "against"
+
+
+def compute_daily_smc_breakdown(trades):
+    """
+    依開倉時的日線結構把交易分成 順／逆／未知 三組，各算一次績效(跟 compute_stats 同一套口徑)。
+    即時模擬單與回測共用。r89 以前的交易沒有標記，一律在「未知」那組。
+    """
+    groups = {key: [] for key, _ in DAILY_SMC_GROUPS}
+    for t in trades or []:
+        groups[daily_smc_alignment(t.get("daily_smc"), t.get("direction"))].append(t)
+    out = []
+    for key, label in DAILY_SMC_GROUPS:
+        st = compute_stats(groups[key])
+        out.append({
+            "key": key, "label": label,
+            "total_trades": st["total_trades"], "win_rate": st["win_rate"],
+            "total_pnl_points": st["total_pnl_points"], "profit_factor": st["profit_factor"],
+            "profit_factor_infinite": st["profit_factor"] is None and st["total_trades"] > 0,   # 全勝時 compute_stats 回 None
+            "max_drawdown_points": st["max_drawdown_points"],
+            "confirmed_count": sum(1 for t in groups[key] if isinstance(t.get("daily_smc"), dict)
+                                   and t["daily_smc"].get("confirmed")),
+        })
+    return out

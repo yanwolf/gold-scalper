@@ -790,6 +790,14 @@
         <label>趨勢濾網慢線ATR倍數(快線固定1.0)</label>
         <input type="number" id="backtestTrendSlowMult" placeholder="留空=沿用正式設定" step="0.5" min="1.5" max="6" />
       </div>
+      <div class="settings-field">
+        <label>日線SMC結構濾網(只存在回測，不會套用到引擎)</label>
+        <select id="backtestDailySmcMode">
+          <option value="">關閉(只分組統計)</option>
+          <option value="1">只擋逆日線結構</option>
+          <option value="2">嚴格(逆勢和日線未定都擋)</option>
+        </select>
+      </div>
     </div>
   </div>
 
@@ -1175,6 +1183,7 @@ const els = {
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
+  backtestDailySmcMode: document.getElementById('backtestDailySmcMode'),
   backtestRunBtn: document.getElementById('backtestRunBtn'),
   backtestResult: document.getElementById('backtestResult'),
   settingsLockedView: document.getElementById('settingsLockedView'),
@@ -1484,7 +1493,91 @@ function renderSignal(data){
       </div>
     `);
   }
+  if(data.daily_smc){
+    parts.push(dailySmcSignalHtml(data.daily_smc, direction));
+  }
   els.signalReasons.innerHTML = parts.join('');
+}
+
+// r89：日線SMC結構參考(已收盤日K，純參考，不參與進出場)
+function fmtUtcDay(d){
+  if(!d) return '?';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d);
+  return m ? `${Number(m[2])}/${Number(m[3])}` : d;
+}
+function fmtZone(z){
+  const side = z.side === 'bullish' ? '多方' : '空方';
+  return `${side}${z.kind} ${Number(z.bot).toFixed(0)}–${Number(z.top).toFixed(0)}`;
+}
+function dailySmcSignalHtml(d, signalDirection){
+  if(!d.available){
+    return `<div class="signal-reason"><div class="src-label">日線結構(SMC，純參考)</div><div>${d.reason || '日線資料還沒抓到'}</div></div>`;
+  }
+  const bias = d.bias === 'bullish' ? 'bullish' : (d.bias === 'bearish' ? 'bearish' : '');
+  const label = d.bias === 'bullish' ? '偏多' : (d.bias === 'bearish' ? '偏空' : '中性');
+  const state = !d.bias ? '' : (d.confirmed ? `・已確認(CHoCH 後 ${d.bos_after_choch} 次 BOS)` : '・CHoCH 待確認(還沒有同方向 BOS)');
+  const lines = [];
+  if(d.choch){
+    let t = `CHoCH ${fmtUtcDay(d.choch.date)} @ ${Number(d.choch.price).toFixed(2)}`;
+    if(d.last_break && d.bos_after_choch > 0) t += ` → 最近 BOS ${fmtUtcDay(d.last_break.date)} @ ${Number(d.last_break.price).toFixed(2)}`;
+    lines.push(t);
+  }else if(d.reason){
+    lines.push(d.reason);
+  }
+  const lv = [];
+  if(d.break_up_level != null) lv.push(`收盤站上 ${Number(d.break_up_level).toFixed(2)} ＝ 往上破結構`);
+  if(d.break_down_level != null) lv.push(`收盤跌破 ${Number(d.break_down_level).toFixed(2)} ＝ 往下破結構`);
+  if(lv.length) lines.push(lv.join('；'));
+  const zs = [];
+  if((d.zones_inside || []).length) zs.push(`現價在 ${d.zones_inside.map(fmtZone).join('、')} 裡`);
+  if((d.zones_above || []).length) zs.push(`上方 ${d.zones_above.slice(0, 2).map(fmtZone).join('、')}`);
+  if((d.zones_below || []).length) zs.push(`下方 ${d.zones_below.slice(0, 2).map(fmtZone).join('、')}`);
+  if(zs.length) lines.push(zs.join('；'));
+  if(d.intraday_note) lines.push(`🟡 ${d.intraday_note}`);
+  if(d.stale) lines.push('⚠️ 日線資料過期(超過 30 小時沒更新)，開倉標記會記成「未知」' + (d.last_error ? `：${d.last_error}` : ''));
+  const conflict = signalDirection && d.bias && !d.stale && d.bias !== signalDirection ? '　與目前訊號方向相反(僅參考，不會擋單)' : '';
+  return `
+    <div class="signal-reason ${bias}">
+      <div class="src-label">日線結構(SMC，${d.candle_count ?? '?'}根已收盤日K至 ${fmtUtcDay(d.as_of)} UTC，純參考)：${label}${state}${conflict}</div>
+      <div>${lines.join('<br/>')}</div>
+    </div>
+  `;
+}
+
+function dailySmcTagText(tag){
+  if(!tag || !tag.bias) return '日線未知';
+  return `日線${tag.bias === 'bullish' ? '偏多' : '偏空'}${tag.confirmed ? '(已確認)' : '(CHoCH待確認)'}${tag.stale ? '・過期' : ''}`;
+}
+
+function dailySmcBreakdownHtml(rows, title){
+  if(!rows || !rows.length) return '';
+  const total = rows.reduce((a, r) => a + (r.total_trades || 0), 0);
+  if(!total) return '';
+  const body = rows.map(r => {
+    const pf = r.total_trades ? (r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : (r.profit_factor_infinite ? '∞' : '--')) : '--';
+    const pnlClass = r.total_pnl_points >= 0 ? 'positive' : 'negative';
+    return `<tr>
+      <td>${r.label}</td>
+      <td class="mono">${r.total_trades}</td>
+      <td class="mono">${r.total_trades ? r.win_rate + '%' : '--'}</td>
+      <td class="mono ${r.total_trades ? pnlClass : ''}">${r.total_trades ? Number(r.total_pnl_points).toFixed(2) : '--'}</td>
+      <td class="mono">${pf}</td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="spread-adjusted-card" style="margin-top:10px;">
+      <div class="spread-adjusted-title">${title}</div>
+      <div style="overflow-x:auto;">
+        <table style="width:100%; font-size:12px; border-collapse:collapse;">
+          <thead><tr style="color:var(--muted); text-align:left;"><th>分組</th><th>筆數</th><th>勝率</th><th>損益(points)</th><th>獲利因子</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+      <div style="font-size:11px; color:var(--muted); margin-top:4px; line-height:1.5;">
+        依開倉當下最後一根已收盤日K的結構方向分組；樣本少時差異可能只是運氣，先看筆數再看數字。
+      </div>
+    </div>
+  `;
 }
 
 /*
@@ -2555,6 +2648,7 @@ function renderPaperTrading(data, t){
         <span>
           <span class="dir-label">開倉中 ${dirLabel}</span> @ ${p.entry_price.toFixed(2)}
           <br/><span style="font-size:11px;">${trailBadge}</span>
+          ${p.daily_smc !== undefined ? `<br/><span style="font-size:11px; color:var(--muted);">開倉時${dailySmcTagText(p.daily_smc)}</span>` : ''}
         </span>
         <span class="mono">停損 ${p.sl_price.toFixed(2)} / 峰值 ${p.peak_price.toFixed(2)}</span>
       </div>
@@ -2581,6 +2675,10 @@ function renderPaperTrading(data, t){
   renderSlippageImpact(t.paperSlippageImpact, data.slippage_impact, data);
 
   renderDrawdownPeriod(document.getElementById(t.drawdownPeriodId), data);
+  const ddEl = document.getElementById(t.drawdownPeriodId);
+  if(ddEl && data.daily_smc_breakdown){
+    ddEl.innerHTML += dailySmcBreakdownHtml(data.daily_smc_breakdown, '依開倉時日線SMC結構分組（純參考，不影響下單）');
+  }
 
   renderTradeList(t.paperTradeList, data.recent_trades, data.settings_changed_at);
 }
@@ -3050,6 +3148,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
+  addIfPresent('daily_smc_filter_mode', els.backtestDailySmcMode);
   addIfPresent('smc_touch_window', els.backtestSmcTouchWindow);
   addIfPresent('smc_wt_level', els.backtestSmcWtLevel);
   addIfPresent('smc_confirm_bos', els.backtestSmcConfirmBos);
@@ -3091,6 +3190,8 @@ els.backtestRunBtn.addEventListener('click', async () => {
         ／ 訊號用 ${data.signal_interval_seconds ? data.signal_interval_seconds/60 : 1}分K 共 ${data.signal_kline_count ?? data.kline_count} 根，實際檢查 ${data.replay_step_count} 根${data.replay_stride > 1 ? `(每 ${data.replay_stride} 根檢查一次訊號，天數較長時自動降低精細度)` : '(每根都檢查)'}
         ／ 停損/移動停損以${data.stop_kline_interval === '15m' ? '15分K' : '1分K'}高低價逐根檢查${data.intrabar_stop_checks ? `(${data.intrabar_stop_checks} 次)` : ''}${data.smc_cfg ? ` ／ SMC參數：視窗${data.smc_cfg.touch_window}、WT門檻${data.smc_cfg.wt_level}、BOS${data.smc_cfg.confirm_bos}、EMA${data.smc_cfg.require_ema ? '要' : '不要'}、出場${data.smc_cfg.exit_mode == 1 ? '結構停利' : '移動停損'}${data.smc_cfg.exit_mode == 1 ? '(RR≥' + data.smc_cfg.min_rr + ')' : ''}` : ''}${data.smc_funnel ? ` ／ SMC訊號漏斗：${Object.entries(data.smc_funnel).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join('、')}` : ''}
         ${(data.skipped_market_closed || data.skipped_low_atr || data.skipped_trend) ? `／ 濾網擋掉的進場訊號：休市 ${data.skipped_market_closed || 0} 次、ATR過小 ${data.skipped_low_atr || 0} 次、趨勢濾網 ${data.skipped_trend || 0} 次` : ''}
+        ${data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : ''}
+        ${data.daily_smc_error ? `／ ⚠️ 日線標記沒有資料(${data.daily_smc_error})，分組全部記為未知` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
       </div>
       <div id="backtestActiveConfig"></div>
@@ -3103,6 +3204,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
         <div class="stat"><div class="lbl">最大回撤</div><div class="val mono">${data.total_trades ? data.max_drawdown_points.toFixed(2) : '--'}</div></div>
       </div>
       <div id="backtestSpreadAdjusted"></div>
+      <div id="backtestDailySmc"></div>
       <div class="settings-group" style="margin-top:12px;">
         <div style="font-size:12px; color:var(--gold); margin-bottom:6px;">把這組回測參數套用到模擬引擎</div>
         <div class="controls">
@@ -3128,6 +3230,8 @@ els.backtestRunBtn.addEventListener('click', async () => {
     `;
 
     renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
+    document.getElementById('backtestDailySmc').innerHTML = dailySmcBreakdownHtml(
+      data.daily_smc_breakdown, `依開倉時日線SMC結構分組${data.daily_smc_filter_mode ? '（已開日線濾網：被擋的單不在這裡）' : '（沒開日線濾網：順勢那組≈開濾網的近似結果）'}`);
 
     // 回測回傳的是扁平欄位(sl_points/use_atr等)，不是像/paper-trading/summary
     // 那樣包在active_settings裡，這裡轉換成同樣格式重用renderActiveConfig()，

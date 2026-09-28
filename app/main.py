@@ -38,6 +38,7 @@ from app import db
 from app import role as role_module
 from app import risk_guard
 from app import preflight as preflight_module
+from app import daily_smc
 
 logger = logging.getLogger("main")
 
@@ -76,6 +77,8 @@ async def startup_event():
     for engine in PAPER_TRADING_ENGINES.values():
         engine.start()  # 依角色載入的引擎平行啟動，各自獨立追蹤
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
+    # r89：日線SMC結構參考，背景每30分鐘刷新一次(交易迴圈只讀快取，不會被網路卡住)
+    daily_smc.start_refresher(symbol=execution_module.DEFAULT_SYMBOL)
     # 開機跑一次交易所相容性自檢(BINANCE_LESSONS.md)，異常發Telegram，
     # 不要等到真的下單才發現API又改了。丟背景thread避免拖慢啟動。
     threading.Thread(target=lambda: preflight_module.run_and_report(send=True, force=True), daemon=True).start()
@@ -1042,6 +1045,7 @@ async def backtest_run(
     smc_require_ema: Optional[int] = None,
     smc_exit_mode: Optional[int] = None,
     smc_min_rr: Optional[float] = None,
+    daily_smc_filter_mode: int = 0,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -1112,6 +1116,7 @@ async def backtest_run(
         smc_require_ema=smc_require_ema,
         smc_exit_mode=smc_exit_mode,
         smc_min_rr=smc_min_rr,
+        daily_smc_filter_mode=daily_smc_filter_mode,
     )
 
 
@@ -1312,7 +1317,31 @@ async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, t
     if result.get("trend_filter") is not None:
         result["trend_filter"]["filter_mode"] = int(s.get("paper_trend_filter_mode", 0) or 0)
         result["trend_filter"]["settings_engine_id"] = engine_id
+    # r89：日線SMC結構參考(讀快取，不打網路；純顯示，不影響上面的訊號)
+    try:
+        result["daily_smc"] = daily_smc.get_snapshot(current_price=result.get("current_price"))
+    except Exception as e:
+        logger.warning(f"日線SMC快照讀取失敗: {e}")
+        result["daily_smc"] = None
     return result
+
+
+@app.get("/analysis/daily-smc")
+async def analysis_daily_smc(refresh: bool = False):
+    """
+    日線SMC結構參考(r89)：目前方向、最近一次CHoCH/BOS、上下最近的OB/FVG區。
+    只用已收盤日K判斷，純參考，不參與任何進出場。refresh=true 會立刻重抓一次(丟背景執行緒，不卡事件循環)。
+    """
+    if refresh:
+        await asyncio.to_thread(daily_smc.refresh, execution_module.DEFAULT_SYMBOL)
+    price = None
+    try:
+        tick = binance_streamer.get_latest()
+        if isinstance(tick, dict) and tick.get("bid") and tick.get("ask"):
+            price = (float(tick["bid"]) + float(tick["ask"])) / 2
+    except (TypeError, ValueError):
+        price = None   # 報價還沒到或格式不對：區域改用最後一根日K收盤價分上下
+    return daily_smc.get_snapshot(current_price=price)
 
 
 @app.websocket("/ws/price")
