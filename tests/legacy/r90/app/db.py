@@ -246,11 +246,27 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS exit_backfill TEXT;
                 """)
+                # r89：開倉當下的日線SMC結構標記(JSON，daily_smc.tag_for_trade)，只做分組統計參考，不參與進出場
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS daily_smc TEXT;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
                         value TEXT NOT NULL,
                         updated_at TIMESTAMPTZ DEFAULT now()
+                    );
+                """)
+                # r90：背景回測任務的結果(網頁關掉、重新整理後用job_id再查得到；只給研究端用，跟交易無關)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS backtest_jobs (
+                        id TEXT PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        status TEXT NOT NULL,
+                        summary TEXT,
+                        payload TEXT
                     );
                 """)
                 cur.execute("""
@@ -407,6 +423,27 @@ def load_recent_trades(limit=100000):
 # 模擬單(paper trading)持久化函式
 # ---------------------------------------------------------------------------
 
+def _dump_daily_smc(tag):
+    """r89：日線結構標記轉 JSON 存進資料庫。沒有標記或轉不了就存 NULL(統計歸「未知」)，不影響開倉。"""
+    if not isinstance(tag, dict):
+        return None
+    try:
+        return json.dumps(tag, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_daily_smc(raw):
+    """r89：讀回日線結構標記。讀不懂就回 None(統計歸「未知」)。"""
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def insert_open_paper_trade(position):
     """
     新增一筆開倉中的模擬單。position需含 direction, entry_price, entry_time(ISO字串),
@@ -437,8 +474,9 @@ def insert_open_paper_trade(position):
                     INSERT INTO paper_trades
                         (direction, entry_price, entry_time, sl_price, peak_price, trailing_active,
                          chan_reason, profile_reason, status, interval_seconds, engine_id,
-                         entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
+                         entry_expected_price, entry_actual_price, entry_slippage_points, entry_spread_points,
+                         daily_smc)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -448,6 +486,7 @@ def insert_open_paper_trade(position):
                         position.get("interval_seconds", 60), position.get("engine_id", "chan_profile_60"),
                         position.get("entry_expected_price"), position.get("entry_actual_price"),
                         position.get("entry_slippage_points"), position.get("entry_spread_points"),
+                        _dump_daily_smc(position.get("daily_smc")),
                     ),
                 )
                 new_id = cur.fetchone()[0]
@@ -748,7 +787,8 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
                            chan_reason, profile_reason, interval_seconds, engine_id,
                            real_open_executed, real_open_quantity,
                            backstop_algo_id, backstop_used_legacy, real_open_baseline,
-                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state, open_backfill
+                           real_open_order_id, fill_boundary_id, entry_actual_price, partial_state, open_backfill,
+                           daily_smc
                     FROM paper_trades
                     WHERE status = 'open' AND engine_id = %s
                     ORDER BY entry_time DESC
@@ -773,6 +813,8 @@ def load_open_paper_trade(engine_id="chan_profile_60"):
             "real_open_order_id": row[16], "fill_boundary_id": row[17],
             # r74：進場成交價以前沒還原——重啟後算部分出場／最後出場的實際損益、判斷重開都用得到
             "entry_actual_price": row[18],
+            # r89：開倉時的日線結構標記(網頁顯示、平倉後分組統計)
+            "daily_smc": _parse_daily_smc(row[21]),
         }
         pos.update(_parse_partial_state(row[19]))   # r74：部分出場狀態(含還沒認領的減少量)
         # r78：進場補登記號的狀態(從來沒有／還沒完成／已結束)——舊紀錄的重排規則只給「從來沒有」的
@@ -809,7 +851,7 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                            entry_book_stale, exit_book_stale,
                            real_open_executed, real_open_quantity,
                            entry_actual_price, exit_actual_price,
-                           sl_price, peak_price, trailing_active, pnl_estimated
+                           sl_price, peak_price, trailing_active, pnl_estimated, daily_smc
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -844,6 +886,7 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                     if r[15] and r[17] and r[18] and r[16] else None
                 ),
                 "pnl_estimated": bool(r[22]),
+                "daily_smc": _parse_daily_smc(r[23]),   # r89：開倉時的日線結構(分組統計用)
                 # 真實成交價缺漏時的推估值(使用者決定2026-09-22)：點數×張數，網頁標「估」、照算、分開計數
                 "real_pnl_usd_est": (
                     round(r[6] * r[16], 2)
@@ -1315,3 +1358,77 @@ def get_settings_audit(limit=50):
     except Exception as e:
         logger.error(f"讀取審計紀錄失敗: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# r90：背景回測任務(backtest_jobs.py)。跟交易無關：寫失敗只影響「重新整理後還查不查得到」，不推播、不計入資料庫健康
+# ---------------------------------------------------------------------------
+BACKTEST_JOBS_KEEP = 30
+
+
+def save_backtest_job(job_id, status, summary_json, payload_json):
+    """新增或更新一筆回測任務，並只保留最近 BACKTEST_JOBS_KEEP 筆。沒資料庫時回 False。"""
+    if not _enabled:
+        return False
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO backtest_jobs (id, status, summary, payload) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, summary = EXCLUDED.summary,
+                        payload = EXCLUDED.payload, updated_at = NOW();
+                    """,
+                    (job_id, status, summary_json, payload_json),
+                )
+                cur.execute(
+                    """
+                    DELETE FROM backtest_jobs WHERE id NOT IN
+                        (SELECT id FROM backtest_jobs ORDER BY created_at DESC LIMIT %s);
+                    """,
+                    (BACKTEST_JOBS_KEEP,),
+                )
+            conn.commit()
+            return True
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"寫入回測任務失敗: {e}")
+        return False
+
+
+def load_backtest_job(job_id):
+    """(ok, payload字串或None)。沒資料庫＝(True, None)。"""
+    if not _enabled:
+        return True, None
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT payload FROM backtest_jobs WHERE id = %s;", (job_id,))
+                row = cur.fetchone()
+        finally:
+            _pool.putconn(conn)
+        return True, (row[0] if row else None)
+    except Exception as e:
+        logger.warning(f"讀取回測任務失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+def list_backtest_jobs(limit=10):
+    """(ok, [summary字串...])，新→舊。"""
+    if not _enabled:
+        return True, []
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT summary FROM backtest_jobs ORDER BY created_at DESC LIMIT %s;", (int(limit),))
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+        return True, [r[0] for r in rows if r[0]]
+    except Exception as e:
+        logger.warning(f"讀取回測任務清單失敗: {e}")
+        return False, f"{type(e).__name__}: {e}"

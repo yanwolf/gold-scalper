@@ -232,6 +232,40 @@ class Jobs(unittest.TestCase):
         self.assertIn("重啟", stuck["error"])
         self.assertEqual(listed["deadbeef"]["status"], "interrupted")
 
+    def test_list_shows_key_params_using_actual_values(self):
+        """r91：清單要分得出哪個是哪組設定；參數留空(沿用正式設定)時用回測實際用到的值。"""
+        rec = []
+        base = _fake_run_factory(rec)
+
+        def run(**kw):
+            r = base(**kw)
+            r.update({"trend_filter_mode": 2, "trend_interval_seconds": 14400, "trend_slow_multiplier": 3.0,
+                      "daily_smc_filter_mode": kw.get("daily_smc_filter_mode", 0), "strategy_type": "chan_profile"})
+            return r
+        with mock.patch.object(J.backtest_module, "run_backtest", side_effect=run), mock.patch.object(db, "_enabled", False):
+            a = J.start_job({"interval_seconds": 900, "daily_smc_filter_mode": 0}, days=7, windows=2)
+            b = J.start_job({"interval_seconds": 900, "daily_smc_filter_mode": 3, "daily_smc_against_weight": 0.5}, days=7, windows=2)
+            self.assertTrue(J.wait_idle(10))
+            listed = {j["job_id"]: j["label_params"] for j in J.list_jobs()}
+        self.assertEqual(listed[a["job_id"]]["daily_smc_filter_mode"], 0)
+        self.assertEqual(listed[b["job_id"]]["daily_smc_filter_mode"], 3)
+        self.assertEqual(listed[b["job_id"]]["daily_smc_against_weight"], 0.5)
+        self.assertEqual(listed[a["job_id"]]["trend_filter_mode"], 2, "送出時沒指定，要顯示回測實際用到的")
+        self.assertEqual(listed[a["job_id"]]["trend_interval_seconds"], 14400)
+        self.assertEqual(listed[a["job_id"]]["interval_seconds"], 900)
+
+    def test_old_summary_without_params_is_backfilled(self):
+        """r90 存進資料庫的任務 summary 沒有參數：清單要從完整內容補上，舊的三個任務才分得出來。"""
+        import json
+        full = {"job_id": "old1", "status": "done", "created_at": "2026-09-28T11:26:59", "params": {"interval_seconds": 900,
+                "daily_smc_filter_mode": 1}, "window_results": [{"result": {"trend_filter_mode": 2}}]}
+        summary = {"job_id": "old1", "status": "done", "created_at": "2026-09-28T11:26:59"}
+        with mock.patch.object(db, "list_backtest_jobs", return_value=(True, [json.dumps(summary)])), \
+             mock.patch.object(db, "load_backtest_job", return_value=(True, json.dumps(full))):
+            got = J.list_jobs()
+        self.assertEqual(got[0]["label_params"]["daily_smc_filter_mode"], 1)
+        self.assertEqual(got[0]["label_params"]["trend_filter_mode"], 2)
+
     def test_unknown_job(self):
         with mock.patch.object(db, "_enabled", False):
             self.assertIsNone(J.get_job("does-not-exist"))

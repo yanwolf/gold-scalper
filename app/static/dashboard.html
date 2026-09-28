@@ -65,6 +65,18 @@
   .stat.poc .val{ color: var(--gold); }
   .val.positive{ color: var(--support); }
   .val.negative{ color: var(--resistance); }
+  /* r91：多段回測改成一段一張小卡(手機上數字不會黏在一起) */
+  .bt-pos{ color: var(--support); }
+  .bt-neg{ color: var(--resistance); }
+  .bt-win{ border:1px solid var(--grid); border-radius:8px; padding:8px 10px; margin-top:8px; cursor:pointer; }
+  .bt-win.total{ cursor:default; border-color: var(--gold); }
+  .bt-win-head{ display:flex; justify-content:space-between; gap:8px; font-size:12.5px; }
+  .bt-win-head .bias{ color: var(--muted); font-size:11.5px; white-space:nowrap; }
+  .bt-win-nums{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:4px 10px; margin-top:6px; }
+  .bt-win-nums .lbl{ font-size:10.5px; color: var(--muted); }
+  .bt-win-nums .num{ font-size:13px; white-space:nowrap; }
+  .bt-win-split{ font-size:11.5px; color: var(--muted); margin-top:5px; }
+  .bt-param-label{ display:inline-block; margin-top:4px; padding:2px 8px; border-radius:6px; border:1px solid var(--gold); color: var(--gold); font-size:11.5px; }
 
   .spread-adjusted-card{
     border: 1px dashed var(--grid); border-radius: 8px; padding: 12px 14px;
@@ -3297,10 +3309,60 @@ function btPf(r){
   return r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : (r.profit_factor_infinite || r.total_pnl_points > 0 ? '∞' : '--');
 }
 
-function btBreakdownCell(bd, key){
-  const r = (bd || []).find(x => x.key === key);
-  if(!r || !r.total_trades) return '<span style="color:var(--muted);">0</span>';
-  return `${r.total_trades}筆 ${Number(r.total_pnl_points).toFixed(0)}`;
+function btNum(v, digits){
+  if(v == null || isNaN(v)) return '--';
+  const n = Number(v);
+  return (n > 0 ? '+' : '') + n.toFixed(digits == null ? 1 : digits);
+}
+
+function btSplitText(bd){
+  const part = (key, name) => {
+    const r = (bd || []).find(x => x.key === key);
+    if(!r || !r.total_trades) return `${name} 0筆`;
+    const cls = r.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg';
+    return `${name} ${r.total_trades}筆 <span class="mono ${cls}">${btNum(r.total_pnl_points, 0)}</span>`;
+  };
+  return `${part('aligned', '順日線')} ／ ${part('against', '逆日線')}`;
+}
+
+// r91：這個任務是哪一組設定——任務標題、最近的回測清單都顯示
+function btParamLabel(p){
+  if(!p) return '參數不明';
+  const parts = [];
+  if(p.interval_seconds) parts.push(p.interval_seconds >= 3600 ? `${p.interval_seconds/3600}小時K` : `${p.interval_seconds/60}分K`);
+  if(p.strategy_type === 'smc_structure') parts.push('SMC');
+  else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');
+  const dm = Number(p.daily_smc_filter_mode || 0);
+  parts.push(dm === 3 ? `日線:逆勢×${p.daily_smc_against_weight ?? 0.5}` : ({0:'日線:不濾', 1:'日線:擋逆勢', 2:'日線:嚴格'}[dm] || `日線:模式${dm}`));
+  if(p.trend_filter_mode == null) parts.push('趨勢:沿用設定');
+  else if(Number(p.trend_filter_mode) === 0) parts.push('趨勢:關');
+  else parts.push(`趨勢:${Number(p.trend_filter_mode) === 2 ? '嚴格' : '擋逆勢'}${p.trend_interval_seconds ? ' ' + p.trend_interval_seconds/3600 + 'h' : ''}${p.trend_slow_multiplier ? ' ' + p.trend_slow_multiplier + 'x' : ''}`);
+  return parts.join('・');
+}
+
+function btLabelParamsOf(job){
+  // 以第一段實際用到的值為準(留空＝沿用正式設定時才看得到實際值)
+  const p = Object.assign({}, job.params || {});
+  const first = (job.window_results || []).find(w => w.result && !w.result.error);
+  if(first){
+    ['trend_filter_mode', 'trend_interval_seconds', 'trend_slow_multiplier', 'strategy_type', 'daily_smc_filter_mode', 'daily_smc_against_weight']
+      .forEach(k => { if(first.result[k] != null) p[k] = first.result[k]; });
+  }
+  return p;
+}
+
+function btWinCard(title, bias, r, extraClass, idx){
+  const pnlCls = r.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg';
+  return `<div class="bt-win ${extraClass || ''}" ${idx != null ? `data-idx="${idx}"` : ''}>
+    <div class="bt-win-head"><span>${title}</span>${bias ? `<span class="bias">${bias}</span>` : ''}</div>
+    <div class="bt-win-nums">
+      <div><div class="lbl">筆數</div><div class="num mono">${r.total_trades}</div></div>
+      <div><div class="lbl">損益</div><div class="num mono ${r.total_trades ? pnlCls : ''}">${r.total_trades ? btNum(r.total_pnl_points) : '--'}</div></div>
+      <div><div class="lbl">PF</div><div class="num mono">${btPf(r)}</div></div>
+      <div><div class="lbl">回撤</div><div class="num mono">${r.total_trades ? Number(r.max_drawdown_points).toFixed(1) : '--'}</div></div>
+    </div>
+    <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
+  </div>`;
 }
 
 function renderBacktestJob(job){
@@ -3313,6 +3375,7 @@ function renderBacktestJob(job){
       回測任務 <span class="mono">${job.job_id}</span>：${statusText}
       ${job.status === 'running' || job.status === 'queued' ? `／ 第 ${pg.window || 0}/${pg.windows || job.windows} 段，${pg.phase || ''}${pg.steps ? ` ${pct}%` : ''}` : ''}
       ／ 每段 ${job.days} 天、共 ${job.windows} 段，結束於 ${job.end_time ? new Date(job.end_time).toLocaleString('zh-TW', {hour12:false}) : '現在'}
+      <br/><span class="bt-param-label">${btParamLabel(btLabelParamsOf(job))}</span>
       ${job.error ? `<br/>⚠️ ${job.error}` : ''}
     </div>`;
   const wins = job.window_results || [];
@@ -3325,40 +3388,26 @@ function renderBacktestJob(job){
     }
     return;
   }
-  const rows = wins.map((w, i) => {
-    if(w.error) return `<tr><td>${new Date(w.start).toLocaleDateString('zh-TW')}～${new Date(w.end).toLocaleDateString('zh-TW')}</td><td colspan="6" style="color:var(--muted);">${w.error}</td></tr>`;
+  const fmtDay = iso => new Date(iso).toLocaleDateString('zh-TW', {month:'numeric', day:'numeric'});
+  const cards = wins.map((w, i) => {
+    const title = `${new Date(w.start).getFullYear()} ${fmtDay(w.start)}～${fmtDay(w.end)}`;
+    if(w.error) return `<div class="bt-win"><div class="bt-win-head"><span>${title}</span></div><div class="bt-win-split">⚠️ ${w.error}</div></div>`;
     const bd = w.daily_bias_days || {};
-    const pnlClass = w.total_pnl_points >= 0 ? 'positive' : 'negative';
-    return `<tr class="bt-win-row" data-idx="${i}" style="cursor:pointer;">
-      <td>${new Date(w.start).toLocaleDateString('zh-TW')}～${new Date(w.end).toLocaleDateString('zh-TW')}</td>
-      <td class="mono">${bd.bullish ?? '-'}/${bd.bearish ?? '-'}</td>
-      <td class="mono">${w.total_trades}</td>
-      <td class="mono ${w.total_trades ? pnlClass : ''}">${w.total_trades ? Number(w.total_pnl_points).toFixed(1) : '--'}</td>
-      <td class="mono">${btPf(w)}</td>
-      <td class="mono">${w.total_trades ? Number(w.max_drawdown_points).toFixed(1) : '--'}</td>
-      <td class="mono" style="font-size:11px;">順 ${btBreakdownCell(w.daily_smc_breakdown, 'aligned')}<br/>逆 ${btBreakdownCell(w.daily_smc_breakdown, 'against')}</td>
-    </tr>`;
+    return btWinCard(title, `日線 多${bd.bullish ?? '-'}／空${bd.bearish ?? '-'}天`, w, '', i);
   }).join('');
   const ag = job.aggregate;
-  const agRow = ag ? `<tr style="font-weight:600; border-top:1px solid var(--border);">
-      <td>合計</td><td></td><td class="mono">${ag.total_trades}</td>
-      <td class="mono ${ag.total_pnl_points >= 0 ? 'positive' : 'negative'}">${Number(ag.total_pnl_points).toFixed(1)}</td>
-      <td class="mono">${btPf(ag)}</td><td class="mono">${Number(ag.max_drawdown_points).toFixed(1)}</td>
-      <td class="mono" style="font-size:11px;">順 ${btBreakdownCell(ag.daily_smc_breakdown, 'aligned')}<br/>逆 ${btBreakdownCell(ag.daily_smc_breakdown, 'against')}</td>
-    </tr>` : '';
   el.innerHTML = head + `
-    <div style="overflow-x:auto; margin-top:8px;">
-      <table style="width:100%; font-size:12px; border-collapse:collapse;">
-        <thead><tr style="color:var(--muted); text-align:left;"><th>期間</th><th>日線多/空天數</th><th>筆數</th><th>損益</th><th>PF</th><th>回撤</th><th>日線分組(筆數 損益)</th></tr></thead>
-        <tbody>${rows}${agRow}</tbody>
-      </table>
-    </div>
-    <div style="font-size:11px; color:var(--muted); margin-top:4px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
+    ${cards}
+    ${ag ? btWinCard('<b>合計</b>', '', ag, 'total', null) : ''}
+    <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
     ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
     <div id="backtestDetail" style="margin-top:12px;"></div>`;
-  el.querySelectorAll('.bt-win-row').forEach(tr => tr.addEventListener('click', () => {
-    const w = wins[Number(tr.dataset.idx)];
-    if(w && w.result) renderBacktestResult(w.result, document.getElementById('backtestDetail'));
+  el.querySelectorAll('.bt-win[data-idx]').forEach(card => card.addEventListener('click', () => {
+    const w = wins[Number(card.dataset.idx)];
+    if(w && w.result){
+      renderBacktestResult(w.result, document.getElementById('backtestDetail'));
+      document.getElementById('backtestDetail').scrollIntoView({behavior: 'smooth', block: 'start'});
+    }
   }));
 }
 
@@ -3407,7 +3456,7 @@ async function loadBacktestJobList(){
     els.backtestJobList.innerHTML = '<option value="">最近的回測…</option>' + (data.jobs || []).map(j => {
       const when = j.created_at ? new Date(j.created_at).toLocaleString('zh-TW', {hour12:false, month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '';
       const ag = j.aggregate;
-      return `<option value="${j.job_id}">${when}｜${j.days}天×${j.windows}段${j.end_date ? '(至' + j.end_date + ')' : ''}｜${statusText[j.status] || j.status}${ag ? `｜PF ${btPf(ag)}` : ''}</option>`;
+      return `<option value="${j.job_id}">${when}｜${btParamLabel(j.label_params)}｜${j.days}天×${j.windows}段${j.end_date ? '(至' + j.end_date + ')' : ''}｜${statusText[j.status] || j.status}${ag ? `｜損益${btNum(ag.total_pnl_points, 0)} PF ${btPf(ag)}` : ''}</option>`;
     }).join('');
   }catch(err){ /* 清單拿不到不影響回測本身 */ }
 }
