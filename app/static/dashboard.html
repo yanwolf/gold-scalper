@@ -3369,6 +3369,7 @@ function renderBacktestResult(data, el){
         ${data.daily_smc_filter_mode == 3 ? `／ 日線SMC：逆日線結構下 ${data.daily_smc_against_weight} 倍量(損益、回撤都已照比例折算)` : (data.daily_smc_filter_mode ? `／ 日線SMC濾網：${data.daily_smc_filter_mode == 2 ? '嚴格' : '只擋逆勢'}，只被它擋掉 ${data.skipped_daily_smc || 0} 次` : '')}
         ${data.cooldown_hours ? `／ 出場後冷卻 ${data.cooldown_hours} 小時，只被冷卻擋掉 ${data.skipped_cooldown || 0} 次` : ''}
         ${data.data_gap_note ? `／ 🟡 ${data.data_gap_note}` : ''}
+        ${data.warmup_error ? `／ 🟡 ${data.warmup_error}` : ''}
         ${data.daily_bias_days ? `／ 這段期間日線：偏多 ${data.daily_bias_days.bullish} 天、偏空 ${data.daily_bias_days.bearish} 天${data.daily_bias_days.none ? `、未定 ${data.daily_bias_days.none} 天` : ''}` : ''}
         ${data.daily_smc_error ? `／ ⚠️ 日線標記沒有資料(${data.daily_smc_error})，分組全部記為未知` : ''}
         ${data.data_end_time ? `／ 資料截至 ${new Date(data.data_end_time).toLocaleString('zh-TW', {hour12:false})}` : ''}
@@ -3563,6 +3564,7 @@ function renderBacktestJob(job){
   el.innerHTML = head + `
     ${cards}
     ${ag ? btWinCard('<b>合計</b>', '', ag, 'total', null) : ''}
+    ${ag && ag.missing_windows ? `<div style="font-size:11px; color:var(--gold); margin-top:6px;">🟡 有 ${ag.missing_windows} 段出錯沒算進合計，合計只代表跑完的段落。</div>` : ''}
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
     ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
     ${ag ? reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場') : ''}
@@ -3889,6 +3891,8 @@ async function pollSweep(jobId){
     if(job.error){
       els.sweepResult.innerHTML = `<div class="error">${job.error}</div>`;
       clearInterval(sweepPollTimer);
+      els.sweepStartBtn.disabled = false;   // r98：出錯(例如限流中止)後按鈕要能再按
+      els.sweepStartBtn.textContent = '開始掃描';
       return;
     }
     renderSweepResults(job);

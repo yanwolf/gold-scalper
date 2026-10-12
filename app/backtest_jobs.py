@@ -98,6 +98,7 @@ def _window_row(idx, res, start_ms, end_ms):
     if not isinstance(res, dict) or res.get("error"):
         row["error"] = (res or {}).get("error") if isinstance(res, dict) else "回測沒有結果"
         row["no_data"] = bool(isinstance(res, dict) and res.get("no_data"))   # r95：沒有資料(不是暫時性錯誤)
+        row["rate_limited"] = bool(isinstance(res, dict) and res.get("rate_limited"))   # r98：幣安限流(暫時性)
         return row
     for k in ("total_trades", "win_rate", "total_pnl_points", "profit_factor", "max_drawdown_points",
               "daily_bias_days", "daily_smc_breakdown", "skipped_daily_smc", "skipped_trend", "daily_smc_error",
@@ -148,8 +149,14 @@ def _run(job_id):
             def cb(i, total, _jid=job_id):
                 _set_progress(_jid, step=i, steps=total, phase="重播計算")
 
+            rate_limited = False
             try:
                 res = backtest_module.run_backtest(days=days, end_time_ms=w_end, progress_cb=cb, **params)
+            except backtest_module.BinanceRateLimited as e:
+                # r98(BINANCE_LESSONS 第 6 條 r98 第 4 點)：限流時整個任務讓開，後面的段不再各自等、各自重試
+                logger.warning(f"回測任務第 {n + 1} 段被幣安限流，後面的段不跑: {e}")
+                res = {"error": f"幣安限流：{e}", "rate_limited": True}
+                rate_limited = True
             except Exception as e:
                 logger.error(f"回測任務第 {n + 1} 段出錯: {type(e).__name__}: {e}")
                 res = {"error": f"{type(e).__name__}: {e}"}
@@ -157,9 +164,27 @@ def _run(job_id):
             with _lock:
                 job["window_results"].append({**_window_row(n, res, w_start, w_end), "result": res})
             _persist(job)
+            if rate_limited:
+                for m, kk in enumerate(range(k - 1, -1, -1), start=n + 1):
+                    e2 = end_ms - kk * days * DAY_MS
+                    skipped = {"error": "前一段被幣安限流，這段沒跑", "rate_limited": True, "skipped": True}
+                    with _lock:
+                        job["window_results"].append({**_window_row(m, skipped, e2 - days * DAY_MS + 1, e2),
+                                                      "result": skipped})
+                break
+        failed = [r for r in results if not isinstance(r, dict) or r.get("error")]
         with _lock:
-            job["aggregate"] = _aggregate(results) if windows > 1 else None
-            job["status"] = "done"
+            if any(isinstance(r, dict) and r.get("rate_limited") for r in results):
+                # 限流的任務不算合計：少了哪幾段、偏掉多少都說不清楚，不能跟完整的任務放在一起比
+                job["aggregate"] = None
+                job["status"] = "error"
+                job["error"] = "幣安限流，任務中止：已跑完的段落照常顯示，但不算合計。等 1～2 分鐘再重送整個任務"
+            else:
+                agg = _aggregate(results) if windows > 1 else None
+                if agg is not None and failed:
+                    agg["missing_windows"] = len(failed)   # 有段落出錯(非限流)：合計照算，但標出少了幾段
+                job["aggregate"] = agg
+                job["status"] = "done"
             job["finished_at"] = _now_iso()
     except Exception as e:   # 防禦：外層出錯也要把任務結束掉，不能永遠停在「執行中」
         logger.error(f"回測任務出錯: {type(e).__name__}: {e}")

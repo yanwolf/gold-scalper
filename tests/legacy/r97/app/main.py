@@ -1048,6 +1048,15 @@ async def backtest_run(
     smc_min_rr: Optional[float] = None,
     daily_smc_filter_mode: int = 0,
     cooldown_hours: float = 0,
+    mr_setups: Optional[int] = None,
+    mr_rsi_level: Optional[float] = None,
+    mr_stretch_atr: Optional[float] = None,
+    mr_touch_atr: Optional[float] = None,
+    mr_tp_mode: Optional[int] = None,
+    mr_tp_atr: Optional[float] = None,
+    mr_sl_atr: Optional[float] = None,
+    mr_trail_atr: Optional[float] = None,
+    mr_max_hold_hours: Optional[int] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -1120,6 +1129,9 @@ async def backtest_run(
         smc_min_rr=smc_min_rr,
         daily_smc_filter_mode=daily_smc_filter_mode,
         cooldown_hours=cooldown_hours,
+        mr_setups=mr_setups, mr_rsi_level=mr_rsi_level, mr_stretch_atr=mr_stretch_atr,
+        mr_touch_atr=mr_touch_atr, mr_tp_mode=mr_tp_mode, mr_tp_atr=mr_tp_atr, mr_sl_atr=mr_sl_atr,
+        mr_trail_atr=mr_trail_atr, mr_max_hold_hours=mr_max_hold_hours,
     )
 
 
@@ -1155,6 +1167,15 @@ def _backtest_job_params(
     daily_smc_filter_mode: int = 0,
     daily_smc_against_weight: float = 0.5,
     cooldown_hours: float = 0,
+    mr_setups: Optional[int] = None,
+    mr_rsi_level: Optional[float] = None,
+    mr_stretch_atr: Optional[float] = None,
+    mr_touch_atr: Optional[float] = None,
+    mr_tp_mode: Optional[int] = None,
+    mr_tp_atr: Optional[float] = None,
+    mr_sl_atr: Optional[float] = None,
+    mr_trail_atr: Optional[float] = None,
+    mr_max_hold_hours: Optional[int] = None,
 ):
     """背景回測任務的參數：跟 /backtest/run 同一組(天數、結束日期、段數另外給)。"""
     return dict(locals())
