@@ -20,6 +20,8 @@
 import bisect
 import os
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -37,6 +39,53 @@ logger = logging.getLogger("backtest")
 
 BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 MAX_KLINES_PER_REQUEST = 1500
+
+# r97：抓K線的限流保護(BINANCE_LESSONS.md 第 6 條 r97)。klines limit=1500 一次權重 10，
+# IP 每分鐘上限 2400；30 天 × 6 段的回測連跑幾個，一分鐘內就超過 → 429，繼續打會變 418 封 IP。
+# 整個程序的K線請求排隊(回測任務、參數掃描、即時端回填共用)，用回應標頭的已用權重踩煞車。
+KLINES_WEIGHT_PAUSE_AT = 1200     # 已用權重到這裡就等到下一分鐘(上限的一半，留給同 IP 的其他服務)
+KLINES_429_MAX_RETRIES = 3
+KLINES_429_DEFAULT_WAIT = 60      # 沒有 Retry-After 時等幾秒
+KLINES_429_MAX_WAIT = 120
+_klines_lock = threading.Lock()
+_sleep = time.sleep               # 測試換掉
+
+
+class BinanceRateLimited(RuntimeError):
+    """幣安限流(429 重試後仍失敗)或封 IP(418)：暫時性，跟「這段期間沒有資料」不同。"""
+
+
+def _get_klines_page(params):
+    """抓一頁K線：429 照 Retry-After 等完重試；418(已封 IP)不重試、立刻停；已用權重偏高時先等下一分鐘。"""
+    with _klines_lock:
+        for attempt in range(KLINES_429_MAX_RETRIES + 1):
+            resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+            status = getattr(resp, "status_code", 200)
+            if status == 418:
+                raise BinanceRateLimited("幣安已暫時封鎖這個 IP(418)：先前請求太密集。不要再重試，"
+                                         "等幾分鐘到幾小時(看 Retry-After)；同 IP 的即時服務也可能受影響，請檢查正式端")
+            if status == 429:
+                if attempt >= KLINES_429_MAX_RETRIES:
+                    raise BinanceRateLimited(f"幣安限流(429)：重試 {KLINES_429_MAX_RETRIES} 次仍被擋。"
+                                             "這是暫時性的，等 1～2 分鐘再跑(跟「沒有資料」不同)")
+                try:
+                    wait = float((getattr(resp, "headers", None) or {}).get("Retry-After") or KLINES_429_DEFAULT_WAIT)
+                except (TypeError, ValueError):
+                    wait = KLINES_429_DEFAULT_WAIT
+                wait = min(max(wait, 1.0), KLINES_429_MAX_WAIT)
+                logger.warning(f"抓K線遇到 429，等 {wait:.0f} 秒後重試(第 {attempt + 1} 次)")
+                _sleep(wait)
+                continue
+            resp.raise_for_status()
+            try:
+                used = int((getattr(resp, "headers", None) or {}).get("X-MBX-USED-WEIGHT-1M") or 0)
+            except (TypeError, ValueError):
+                used = 0
+            if used >= KLINES_WEIGHT_PAUSE_AT:
+                wait = 61 - datetime.now(timezone.utc).second   # 權重以分鐘重算，等到下一分鐘
+                logger.info(f"K線已用權重 {used}，先等 {wait} 秒")
+                _sleep(wait)
+            return resp.json()
 
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
@@ -110,9 +159,7 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
             "endTime": end_time,
             "limit": MAX_KLINES_PER_REQUEST,
         }
-        resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        batch = resp.json()
+        batch = _get_klines_page(params)
 
         if not batch:
             break
