@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-09-26r88"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-10-12r98"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -72,6 +72,36 @@ def entry_price_check(account):
             "msg": "；".join(lines) if lines else "持倉的帳上成交價都跟交易所均價一致(或沒有實單持倉)"}
 
 
+def ip_weight_check(symbol="XAUUSDT"):
+    """
+    r98(BINANCE_LESSONS.md 第 6 條 r98 第 5 點)：IP 權重(K線)。抓一根 1 分K(權重 1)讀 X-MBX-USED-WEIGHT-1M，
+    列出這一分鐘已用、累計 429／418 與等待次數。封鎖中(418)為 fail，而且不送探測(再打只會延長封鎖)；
+    冷卻中(429)為 warn，一樣不送。
+    """
+    from app import binance_weight as W
+    item = "IP 權重（K 線）"
+
+    def tail():
+        s = W.snapshot()
+        return (f"累計 429 {s['count_429']} 次、418 {s['count_418']} 次；回測等待 {s['waits']} 次共 {s['wait_seconds']:.0f} 秒；"
+                f"即時端因冷卻/封鎖略過 {s['skipped_live']} 次"
+                + (f"；最近一次被擋：{s['last_limit_source']}" if s.get("last_limit_source") else ""))
+    kind, left = W.blocked()
+    if kind == "banned":
+        return {"item": item, "status": "fail", "msg": f"封鎖中(418)，還要約 {left:.0f} 秒，不送探測。{tail()}"[:200]}
+    if kind == "cooldown":
+        return {"item": item, "status": "warn", "msg": f"限流冷卻中(429)，還要約 {left:.0f} 秒，不送探測。{tail()}"[:200]}
+    try:
+        W.get_klines({"symbol": symbol, "interval": "1m", "limit": 1}, mode="live", source="preflight")
+    except W.BinanceRateLimited as e:
+        return {"item": item, "status": "fail" if W.blocked()[0] == "banned" else "warn", "msg": f"{e}；{tail()}"[:200]}
+    except Exception as e:
+        return {"item": item, "status": "warn", "msg": f"探測失敗：{type(e).__name__}: {e}"[:200]}
+    used = W.used_this_minute()
+    return {"item": item, "status": "ok" if used < W.PAUSE_AT else "warn",
+            "msg": f"這一分鐘已用 {used}/{W.WEIGHT_LIMIT_1M}(回測到 {W.PAUSE_AT} 就讓路)；{tail()}"[:200]}
+
+
 def check(account=None, symbol=None):
     """
     對「一個帳戶」跑完整自檢，回傳[(項目, 狀態, 說明), ...]。
@@ -81,6 +111,10 @@ def check(account=None, symbol=None):
     account = account or execution_module.DEFAULT_ACCOUNT
     symbol = symbol or execution_module.DEFAULT_SYMBOL
     out = [notify_check()]
+    try:
+        out.append(ip_weight_check(symbol))
+    except Exception as e:
+        out.append({"item": "IP 權重（K 線）", "status": "warn", "msg": f"檢查失敗：{type(e).__name__}: {e}"})
     try:
         out.append(entry_price_check(account))
     except Exception as e:

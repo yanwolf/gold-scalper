@@ -404,7 +404,8 @@ class BinanceGoldStreamer:
         """用幣安REST抓最近N天的1分K轉成minute bar格式，回傳時間遞增list；失敗回傳[]。"""
         try:
             from app.backtest import fetch_historical_klines
-            klines = fetch_historical_klines(symbol=SYMBOL.upper(), days=days)
+            # r98：即時端回填走 live：不排研究端的隊、不因權重過半等待；冷卻/封鎖中直接不抓(回[]，下次再補)
+            klines = fetch_historical_klines(symbol=SYMBOL.upper(), days=days, mode="live")
         except Exception as e:
             logger.warning(f"REST回填1分K失敗: {e}")
             return []

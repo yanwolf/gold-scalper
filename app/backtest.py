@@ -27,6 +27,7 @@ import requests
 from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
 from app import smc_structure
 from app import mean_reversion
+from app import pullback_resume
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -75,7 +76,9 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 
 
 SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
-HOURLY_STRATEGIES = ("smc_structure", "mean_reversion")  # r96：訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+# r99：只存在回測、介面相同的1小時K策略(build_cfg / precompute / evaluate_at，結果放在 "mr")
+HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume}
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
 
 
@@ -208,6 +211,13 @@ def run_backtest(
     mr_sl_atr=None,
     mr_trail_atr=None,
     mr_max_hold_hours=None,
+    pr_sides=None,
+    pr_trend=None,
+    pr_mode=None,
+    pr_min_pullback_bars=None,
+    pr_min_pullback_atr=None,
+    pr_sl_mode=None,
+    pr_hold_bars=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -299,6 +309,15 @@ def run_backtest(
         if mr_err:
             return {"error": mr_err}
         interval_seconds = 3600
+    # r99：回拉轉強(pullback_resume.py，只存在回測)。一樣固定1小時訊號步；持有時間到出場、不看反向訊號
+    if strategy_type == "pullback_resume":
+        mr_cfg, mr_err = pullback_resume.build_cfg({
+            "sides": pr_sides, "trend": pr_trend, "mode": pr_mode, "min_pullback_bars": pr_min_pullback_bars,
+            "min_pullback_atr": pr_min_pullback_atr, "sl_mode": pr_sl_mode, "hold_bars": pr_hold_bars})
+        if mr_err:
+            return {"error": mr_err}
+        interval_seconds = 3600
+        reversal_confirm_count = 10 ** 6   # 「賺賠都走」：只用持有時間出場，反向訊號不提前出場
 
     # klines可由呼叫端預先抓好傳進來(參數掃描用：十幾組回測共用同一份資料，
     # 對照組和每一組實驗才是在完全相同的K線上比較，也省掉重複抓資料的時間)
@@ -483,8 +502,8 @@ def run_backtest(
             hist = [c for c in hist if c["bucket_start"] < local_hourly[0]["bucket_start"]]
         smc_hourly = smc_structure.merge_hourly_candles(hist, local_hourly)
         smc_close_times = [c["bucket_start"] + smc_structure.SMC_INTERVAL_SECONDS * 1000 - 1 for c in smc_hourly]
-        if strategy_type == "mean_reversion":
-            mr_pre = mean_reversion.precompute(smc_hourly)
+        if strategy_type in HR_MODULES:
+            mr_pre = HR_MODULES[strategy_type].precompute(smc_hourly)
     if strategy_type == "smc_structure":
         # 整段只算一次結構快照/EMA/WaveTrend(全部是因果計算，第i根只用<=i的資料)，
         # 每個訊號步直接查表；原本每步重算一次，365天要跑幾十秒、逼近瀏覽器/閘道逾時
@@ -575,12 +594,12 @@ def run_backtest(
         current_price = trades_so_far[-1]["price"]
 
         mr_bar = None
-        if strategy_type == "mean_reversion":
+        if strategy_type in HR_MODULES:
             idx = bisect.bisect_right(smc_close_times, step_time)  # 已收盤的1小時K數
             if idx <= 0:
                 continue
             mr_bar = idx - 1
-            result = mean_reversion.evaluate_at(mr_pre, mr_bar, mr_cfg, current_price=current_price)
+            result = HR_MODULES[strategy_type].evaluate_at(mr_pre, mr_bar, mr_cfg, current_price=current_price)
             recent = smc_hourly[max(0, idx - 120):idx]
             result["strategy_type"] = strategy_type
             result["atr"] = compute_atr(recent)
@@ -644,7 +663,7 @@ def run_backtest(
                 step_sl_points = suggested
 
         # r96：均值回歸的停損/移動停損一律用1小時K的ATR倍數(不吃正式設定的點數)
-        if strategy_type == "mean_reversion":
+        if strategy_type in HR_MODULES:
             _atr_h = (result.get("mr") or {}).get("atr") or atr
             if result.get("mr"):
                 step_sl_points = result["mr"]["sl_points"]
@@ -667,10 +686,10 @@ def run_backtest(
                 reversal_confirm_count=reversal_confirm_count,
                 current_ema9=current_ema9,
             )
-            if (not exit_reason and strategy_type == "mean_reversion" and int(mr_cfg["max_hold_hours"]) > 0
+            if (not exit_reason and strategy_type in HR_MODULES and int(mr_cfg["max_hold_hours"]) > 0
                     and step_time - datetime.fromisoformat(position["entry_time"]).timestamp() * 1000
                     >= int(mr_cfg["max_hold_hours"]) * 3600 * 1000):
-                exit_reason = "超過持有時間"
+                exit_reason = "持有時間到" if strategy_type == "pullback_resume" else "超過持有時間"
             if exit_reason:
                 exit_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
                 closed = trading_core.close_position(position, current_price, exit_reason, exit_time_iso)
@@ -684,9 +703,9 @@ def run_backtest(
             # resonance_fvg策略的震盪濾網已經內建在訊號判斷本身裡，這裡不重複套用
             # chan_profile專用的use_chop_filter設定，避免兩套濾網門檻不一致互相打架。
             choppiness_index = result.get("choppiness_index")
-            # 均值回歸本來就是做震盪盤，震盪濾網對它沒有意義，一樣不套用
+            # 只存在回測的1小時K策略(均值回歸、回拉轉強)照使用者描述的規則跑，不套用震盪濾網
             is_choppy = (
-                strategy_type not in ("resonance_fvg", "mean_reversion")
+                strategy_type not in ("resonance_fvg",) + tuple(HR_MODULES)
                 and use_chop_filter
                 and choppiness_index is not None
                 and choppiness_index >= chop_threshold
@@ -724,7 +743,7 @@ def run_backtest(
                     cooldown_ok = False
                     if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
                         skipped_cooldown += 1   # 只數「其他濾網都放行、只被冷卻擋下」的
-            same_bar = strategy_type == "mean_reversion" and mr_bar is not None and mr_bar == mr_last_entry_bar
+            same_bar = strategy_type in HR_MODULES and mr_bar is not None and mr_bar == mr_last_entry_bar
             if (not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok
                     and not same_bar):
                 entry_time_iso = step_dt.isoformat()
@@ -739,8 +758,9 @@ def run_backtest(
                 position["daily_smc"] = daily_tag
                 if size_weight != 1.0:
                     position["size_weight"] = size_weight
-                if strategy_type == "mean_reversion":
-                    position["tp_price"] = float(result["mr"]["tp_price"])
+                if strategy_type in HR_MODULES:
+                    if result["mr"].get("tp_price") is not None:
+                        position["tp_price"] = float(result["mr"]["tp_price"])
                     position["mr_setup"] = result["mr"]["setup"]
                     mr_last_entry_bar = mr_bar
                 if strategy_type == "smc_structure" and int(smc_cfg.get("exit_mode", 0)) == 1:

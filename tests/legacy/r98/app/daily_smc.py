@@ -75,11 +75,9 @@ def klines_to_closed_candles(raw, now_ms=None):
 
 def fetch_daily_klines(symbol="XAUUSDT", limit=DAILY_HISTORY_LIMIT):
     """抓幣安期貨日K(公開資料，不用 API key)。回傳原始格式，失敗拋例外(呼叫端處理)。"""
-    import requests
-    resp = requests.get("https://fapi.binance.com/fapi/v1/klines",
-                        params={"symbol": symbol, "interval": "1d", "limit": int(limit)}, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
+    from app import binance_weight   # r98：即時路徑走 live(不排隊、不等；冷卻/封鎖中這輪不抓，沿用上次快照)
+    data = binance_weight.get_klines({"symbol": symbol, "interval": "1d", "limit": int(limit)},
+                                     mode="live", source="klines-daily")
     if not isinstance(data, list):
         raise ValueError(f"日K回傳格式不對: {str(data)[:120]}")
     return data

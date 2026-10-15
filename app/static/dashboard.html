@@ -671,6 +671,7 @@
       <option value="resonance_fvg">多條件共振+FVG(實驗性)</option>
       <option value="smc_structure">SMC市場結構+WaveTrend(1小時K，實驗性)</option>
       <option value="mean_reversion">均值回歸(1小時K，只有回測)</option>
+      <option value="pullback_resume">回拉轉強(1小時K，持有一根，只有回測)</option>
     </select>
     <select id="backtestResonanceThreshold">
       <option value="4" selected>4/4項條件(嚴格AND)</option>
@@ -828,6 +829,54 @@
       <div class="settings-field">
         <label>最長持有(小時，0=不限)</label>
         <input type="number" id="backtestMrMaxHold" placeholder="留空=12" step="1" min="0" max="240" />
+      </div>
+
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">回拉轉強參數(只在策略選回拉轉強時有效，留空=預設值；上面的停損點數、移動停損這個策略不用)</div>
+      <div class="settings-field">
+        <label>方向</label>
+        <select id="backtestPrSides">
+          <option value="">預設(多空都做)</option>
+          <option value="1">只做多</option>
+          <option value="2">只做空</option>
+          <option value="3">多空都做</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>趨勢線</label>
+        <select id="backtestPrTrend">
+          <option value="">預設(EMA20)</option>
+          <option value="0">EMA20(收盤在線上、線往上)</option>
+          <option value="1">布林中軌(SMA20)</option>
+          <option value="2">不看趨勢</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>測試對象</label>
+        <select id="backtestPrMode">
+          <option value="">預設(回拉轉強型態)</option>
+          <option value="0">回拉轉強型態</option>
+          <option value="1">基準組：趨勢裡任何一根同色K就進</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>回拉至少幾根反色K</label>
+        <input type="number" id="backtestPrMinBars" placeholder="留空=1" step="1" min="1" max="6" />
+      </div>
+      <div class="settings-field">
+        <label>回拉幅度至少幾倍ATR(0=不限)</label>
+        <input type="number" id="backtestPrMinAtr" placeholder="留空=0" step="0.25" min="0" max="5" />
+      </div>
+      <div class="settings-field">
+        <label>保護停損</label>
+        <select id="backtestPrSlMode">
+          <option value="">預設(不設，持有到時間)</option>
+          <option value="0">不設，持有到時間</option>
+          <option value="1">停損在回拉低點(空單：反彈高點)</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>持有幾根1小時K</label>
+        <input type="number" id="backtestPrHoldBars" placeholder="留空=1" step="1" min="1" max="6" />
       </div>
 
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">通用參數</div>
@@ -1298,6 +1347,13 @@ const els = {
   backtestMrSlAtr: document.getElementById('backtestMrSlAtr'),
   backtestMrTrailAtr: document.getElementById('backtestMrTrailAtr'),
   backtestMrMaxHold: document.getElementById('backtestMrMaxHold'),
+  backtestPrSides: document.getElementById('backtestPrSides'),
+  backtestPrTrend: document.getElementById('backtestPrTrend'),
+  backtestPrMode: document.getElementById('backtestPrMode'),
+  backtestPrMinBars: document.getElementById('backtestPrMinBars'),
+  backtestPrMinAtr: document.getElementById('backtestPrMinAtr'),
+  backtestPrSlMode: document.getElementById('backtestPrSlMode'),
+  backtestPrHoldBars: document.getElementById('backtestPrHoldBars'),
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
@@ -2720,7 +2776,7 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
   // 不然兩組SMC回測(移動停損 vs 結構停利)的設定卡長得一模一樣，分不出哪張是哪張
   let strategyHtml = '';
   if(s._strategy_type){
-    const stratLabel = {chan_profile:'纏論+分價量表', resonance_fvg:'多條件共振+FVG', smc_structure:'SMC市場結構+WaveTrend(1小時K)', mean_reversion:'均值回歸(1小時K)'}[s._strategy_type] || s._strategy_type;
+    const stratLabel = {chan_profile:'纏論+分價量表', resonance_fvg:'多條件共振+FVG', smc_structure:'SMC市場結構+WaveTrend(1小時K)', mean_reversion:'均值回歸(1小時K)', pullback_resume:'回拉轉強(1小時K)'}[s._strategy_type] || s._strategy_type;
     strategyHtml = `<div class="cfg-row"><span class="cfg-label">策略</span><span class="cfg-value on">${stratLabel}</span></div>`
       + (s._symbol ? `<div class="cfg-row"><span class="cfg-label">商品</span><span class="cfg-value">${s._symbol}</span></div>` : '');
     const c = s._smc_cfg;
@@ -2729,7 +2785,14 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
       strategyHtml += `<div class="cfg-row"><span class="cfg-label">SMC出場模式</span><span class="cfg-value ${Number(c.exit_mode) === 1 ? 'on' : ''}">${exitLabel}</span></div>`
         + `<div class="cfg-row"><span class="cfg-label">SMC訊號條件</span><span class="cfg-value">視窗${c.touch_window}根 / WT門檻${c.wt_level} / BOS${c.confirm_bos}次 / EMA排列${c.require_ema ? '要' : '不要'}</span></div>`;
     }
-    const m = s._mr_cfg;
+    const m = s._strategy_type === 'mean_reversion' ? s._mr_cfg : null;
+    const pr = s._strategy_type === 'pullback_resume' ? s._mr_cfg : null;
+    if(pr){
+      strategyHtml += `<div class="cfg-row"><span class="cfg-label">回拉轉強</span><span class="cfg-value on">${Number(pr.mode) === 1 ? '基準組(趨勢裡任何同色K)' : '回拉轉強型態'}／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(pr.sides)]}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">條件</span><span class="cfg-value">趨勢${{0:'EMA20', 1:'布林中軌', 2:'不看'}[Number(pr.trend)]}／回拉≥${pr.min_pullback_bars}根${Number(pr.min_pullback_atr) > 0 ? '、≥' + pr.min_pullback_atr + '×ATR' : ''}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">持有${pr.hold_bars}根後收盤出場／${Number(pr.sl_mode) === 1 ? '停損在回拉低點' : '不設停損'}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">注意</span><span class="cfg-value">下面的停損點數/ATR倍數這個策略不用</span></div>`;
+    }
     if(m){
       const setupLabel = {1:'只做A(拉開過頭)', 2:'只做B(碰慢線)', 3:'A＋B'}[Number(m.setups)] || m.setups;
       strategyHtml += `<div class="cfg-row"><span class="cfg-label">均值回歸進場</span><span class="cfg-value on">${setupLabel}</span></div>`
@@ -3347,6 +3410,16 @@ function buildBacktestParamOverrides(){
     addIfPresent('mr_trail_atr', els.backtestMrTrailAtr);
     addIfPresent('mr_max_hold_hours', els.backtestMrMaxHold);
   }
+  // r99：回拉轉強參數只有選這個策略才送
+  if(els.backtestStrategy.value === 'pullback_resume'){
+    addIfPresent('pr_sides', els.backtestPrSides);
+    addIfPresent('pr_trend', els.backtestPrTrend);
+    addIfPresent('pr_mode', els.backtestPrMode);
+    addIfPresent('pr_min_pullback_bars', els.backtestPrMinBars);
+    addIfPresent('pr_min_pullback_atr', els.backtestPrMinAtr);
+    addIfPresent('pr_sl_mode', els.backtestPrSlMode);
+    addIfPresent('pr_hold_bars', els.backtestPrHoldBars);
+  }
   return params.toString();
 }
 
@@ -3386,7 +3459,7 @@ function renderBacktestResult(data, el){
       <div id="backtestSpreadAdjusted"></div>
       <div id="backtestDailySmc"></div>
       <div id="backtestReentry"></div>
-      ${data.strategy_type === 'mean_reversion' ? `<div style="font-size:11px; color:var(--gold); margin-top:12px;">🟡 均值回歸只存在回測，沒有對應的模擬引擎，不能套用。結果請先看「扣價差」那組數字：這種策略每筆賺得少，最容易被成本吃掉。</div>` : `
+      ${(data.strategy_type === 'mean_reversion' || data.strategy_type === 'pullback_resume') ? `<div style="font-size:11px; color:var(--gold); margin-top:12px;">🟡 這個策略只存在回測，沒有對應的模擬引擎，不能套用。結果請先看「扣價差」那組數字：這種策略每筆賺得少，最容易被成本吃掉。</div>` : `
       <div class="settings-group" style="margin-top:12px;">
         <div style="font-size:12px; color:var(--gold); margin-bottom:6px;">把這組回測參數套用到模擬引擎</div>
         <div class="controls">
@@ -3490,6 +3563,7 @@ function btParamLabel(p){
   if(p.strategy_type === 'smc_structure') parts.push('SMC');
   else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');
   else if(p.strategy_type === 'mean_reversion') parts.push('均值回歸' + ({1:'A', 2:'B'}[Number(p.mr_setups)] || ''));
+  else if(p.strategy_type === 'pullback_resume') parts.push('回拉轉強' + (Number(p.pr_mode) === 1 ? '基準組' : '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '') + ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || ''));
   const dm = Number(p.daily_smc_filter_mode || 0);
   parts.push(dm === 3 ? `日線:逆勢×${p.daily_smc_against_weight ?? 0.5}` : ({0:'日線:不濾', 1:'日線:擋逆勢', 2:'日線:嚴格'}[dm] || `日線:模式${dm}`));
   if(p.trend_filter_mode == null) parts.push('趨勢:沿用設定');
@@ -3506,7 +3580,10 @@ function btLabelParamsOf(job){
   if(first){
     ['trend_filter_mode', 'trend_interval_seconds', 'trend_slow_multiplier', 'strategy_type', 'daily_smc_filter_mode', 'daily_smc_against_weight', 'cooldown_hours']
       .forEach(k => { if(first.result[k] != null) p[k] = first.result[k]; });
-    if(first.result.mr_cfg) p.mr_setups = first.result.mr_cfg.setups;
+    if(first.result.mr_cfg && first.result.strategy_type === 'mean_reversion') p.mr_setups = first.result.mr_cfg.setups;
+    if(first.result.mr_cfg && first.result.strategy_type === 'pullback_resume'){
+      p.pr_mode = first.result.mr_cfg.mode; p.pr_sides = first.result.mr_cfg.sides; p.pr_trend = first.result.mr_cfg.trend;
+    }
   }
   return p;
 }

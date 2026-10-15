@@ -32,11 +32,20 @@ from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown, compute_reentry_breakdown
 from app import daily_smc
+from app import binance_weight
 
 logger = logging.getLogger("backtest")
 
 BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 MAX_KLINES_PER_REQUEST = 1500
+
+# r97／r98：抓K線的限流保護搬到 binance_weight.py(BINANCE_LESSONS.md 第 6 條 r97／r98)：
+# 回測、參數掃描走 batch(排隊、權重過半讓路、429 等完重試)；即時端回填走 live(不排隊、不等、被擋就這輪不抓)。
+BinanceRateLimited = binance_weight.BinanceRateLimited
+
+
+def _get_klines_page(params, mode="batch"):
+    return binance_weight.get_klines(params, mode=mode)
 
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
@@ -85,7 +94,7 @@ def resolve_end_time_ms(end_date=None, now=None):
     return min(end, now_aligned)
 
 
-def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None, end_time_ms=None):
+def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None, end_time_ms=None, mode="batch"):
     """
     分頁抓取Binance期貨歷史K線，回傳由舊到新排序的原始K線資料。
     公開市場資料，不需要API Key。max_days不指定時上限是MAX_BACKTEST_DAYS(1分K的合理上限)，
@@ -110,9 +119,7 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
             "endTime": end_time,
             "limit": MAX_KLINES_PER_REQUEST,
         }
-        resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        batch = resp.json()
+        batch = _get_klines_page(params, mode=mode)   # 任何一頁失敗(含限流)整個拋出：不回傳抓一半的資料
 
         if not batch:
             break
@@ -413,6 +420,8 @@ def run_backtest(
                 symbol, days, lambda sym, d: fetch_historical_klines(symbol=sym, interval="1d", days=d, max_days=d,
                                                                       end_time_ms=end_time_ms),
                 end_key=end_time_ms)
+    except BinanceRateLimited:
+        raise   # r98：限流不能當成「日線未知」照跑——整段中止，由呼叫端決定後面要不要繼續
     except Exception as e:
         daily_smc_error = f"日K抓取失敗：{type(e).__name__}: {e}"
         logger.warning(f"回測日線SMC標記失敗: {e}")
@@ -453,6 +462,7 @@ def run_backtest(
     # 重播時用bisect只切「step_time之前」的K棒餵給訊號函式，跟趨勢濾網一樣不看未來。
     smc_hourly, smc_close_times, smc_cfg = [], [], {}
     mr_pre = None
+    warmup_error = None
     if strategy_type in HOURLY_STRATEGIES:
         minute_candles = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
@@ -463,9 +473,12 @@ def run_backtest(
                                           max_days=SMC_MAX_BACKTEST_DAYS + 40, end_time_ms=end_time_ms)
             hist = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in raw]
+        except BinanceRateLimited:
+            raise   # r98：限流時不能悄悄少了warmup照跑(結果會跟正常時不同、又看不出來)
         except Exception as e:
-            logger.warning(f"SMC回測warmup 1小時K抓取失敗，只用視窗內資料: {e}")
+            logger.warning(f"1小時K回測warmup抓取失敗，只用視窗內資料: {e}")
             hist = []
+            warmup_error = f"1小時K warmup 抓取失敗，只用視窗內資料(前段訊號可能偏少)：{type(e).__name__}: {e}"
         if local_hourly:
             hist = [c for c in hist if c["bucket_start"] < local_hourly[0]["bucket_start"]]
         smc_hourly = smc_structure.merge_hourly_candles(hist, local_hourly)
@@ -788,7 +801,8 @@ def run_backtest(
         "stop_kline_interval": SMC_LONG_RANGE_STOP_INTERVAL if smc_long_range else "1m",  # 停損步用的K線週期
         "smc_funnel": smc_funnel or None,
         "smc_cfg": smc_cfg if strategy_type == "smc_structure" else None,
-        "mr_cfg": mr_cfg,              # r96：均值回歸實際用的參數(其他策略是 None)
+        "mr_cfg": mr_cfg,
+        "warmup_error": warmup_error,  # r98：1小時K warmup 抓不到(非限流)時照跑但標出來              # r96：均值回歸實際用的參數(其他策略是 None)
         "mr_funnel": mr_funnel or None,  # 這次回測實際用的SMC參數  # SMC策略：各訊號步落在哪個階段/理由(診斷訊號稀疏用)
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),

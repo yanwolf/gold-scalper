@@ -98,12 +98,10 @@ HIST_REFRESH_SECONDS = 600  # 最多10分鐘重抓一次(每根1小時K收盤後
 
 def fetch_hourly_klines(symbol="XAUUSDT", limit=SMC_HISTORY_LIMIT):
     """抓幣安期貨1小時K(公開資料，不用API key)，轉成專案標準K棒格式，時間遞增。"""
-    import requests
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    resp = requests.get(url, params={"symbol": symbol, "interval": "1h", "limit": limit}, timeout=15)
-    resp.raise_for_status()
+    from app import binance_weight   # r98：即時路徑走 live(不排隊、不等；冷卻/封鎖中這輪不抓，沿用快取)
     out = []
-    for k in resp.json():
+    for k in binance_weight.get_klines({"symbol": symbol, "interval": "1h", "limit": limit},
+                                       mode="live", source="klines-1h"):
         try:
             out.append({"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                         "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
