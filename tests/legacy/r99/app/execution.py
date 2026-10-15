@@ -44,6 +44,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from app import binance_weight
+
 logger = logging.getLogger("execution")
 
 MAINNET_BASE_URL = "https://fapi.binance.com"
@@ -116,6 +118,15 @@ def use_testnet(account=DEFAULT_ACCOUNT):
     return os.getenv("BINANCE_USE_TESTNET", "1") != "0"
 
 
+def _record_weight(resp, source, account):
+    """r98：正式網的回應記進 IP 權重(K線據此讓路)。測試網是另一台伺服器、另一套計數，不能混進來。"""
+    try:
+        if not use_testnet(account):
+            binance_weight.record(resp, source)
+    except Exception as e:   # 記錄失敗不能影響下單路徑
+        logger.warning(f"記錄幣安權重標頭失敗: {e}")
+
+
 def _base_url(account=DEFAULT_ACCOUNT):
     return TESTNET_BASE_URL if use_testnet(account) else MAINNET_BASE_URL
 
@@ -166,6 +177,7 @@ def _signed_request(method, path, params=None, account=DEFAULT_ACCOUNT, return_s
 
     try:
         resp = requests.request(method, url, headers=headers, params=signed_params, timeout=10)
+        _record_weight(resp, f"signed {path}", account)   # r98：下單/查部位的權重標頭與 429/418 也要記(K線據此讓路)
         try:
             data = resp.json()
         except Exception:
@@ -212,6 +224,7 @@ def get_symbol_filters(symbol=None, account=DEFAULT_ACCOUNT):
     }
     try:
         resp = requests.get(f"{_base_url(account)}/fapi/v1/exchangeInfo", timeout=10)
+        _record_weight(resp, "exchangeInfo", account)
         data = resp.json()
         for s in data.get("symbols", []):
             if s["symbol"] != symbol:
@@ -298,6 +311,7 @@ def get_mark_price(symbol, account=DEFAULT_ACCOUNT):
     """
     try:
         resp = requests.get(f"{_base_url(account)}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
+        _record_weight(resp, "ticker/price", account)
         data = resp.json()
         if "price" in data:
             return True, float(data["price"])
@@ -316,6 +330,7 @@ def get_book_ticker(symbol, account=DEFAULT_ACCOUNT):
     """
     try:
         resp = requests.get(f"{_base_url(account)}/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, timeout=10)
+        _record_weight(resp, "ticker/bookTicker", account)
         data = resp.json()
         if "bidPrice" in data and "askPrice" in data:
             return True, {"bid": float(data["bidPrice"]), "ask": float(data["askPrice"])}

@@ -241,3 +241,47 @@ class Isolation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R100Labels(unittest.TestCase):
+    """r100：沒有資料的段落不算「出錯」；清單標籤分得出回拉轉強有沒有開保護停損、持有幾根。"""
+
+    def _job(self, side_effect, params=None):
+        from app import backtest_jobs as J
+        with mock.patch.object(B, "run_backtest", side_effect=side_effect), \
+             mock.patch.object(J.db, "save_backtest_job", return_value=None):
+            out = J.start_job(dict({"interval_seconds": 3600}, **(params or {})), days=1, windows=len(side_effect))
+            self.assertTrue(J.wait_idle(10))
+            return J.get_job(out["job_id"]), J
+
+    NO_DATA = {"error": "這段期間幣安沒有 XAUUSDT 的K線資料", "no_data": True}
+    GOOD = {"total_trades": 0, "recent_trades": []}
+
+    def test_no_data_is_not_counted_as_error(self):
+        job, _ = self._job([dict(self.NO_DATA), dict(self.GOOD), dict(self.GOOD)])
+        ag = job["aggregate"]
+        self.assertNotIn("missing_windows", ag)
+        self.assertEqual(ag["no_data_windows"], 1)
+
+    def test_no_data_and_error_are_separate(self):
+        job, _ = self._job([dict(self.NO_DATA), RuntimeError("x"), dict(self.GOOD)])
+        ag = job["aggregate"]
+        self.assertEqual((ag["missing_windows"], ag["no_data_windows"]), (1, 1))
+
+    def test_label_params_take_actual_pr_cfg(self):
+        res = dict(self.GOOD, strategy_type="pullback_resume",
+                   mr_cfg={"mode": 0, "sides": 3, "trend": 0, "sl_mode": 1, "hold_bars": 2})
+        job, J = self._job([res], params={"strategy_type": "pullback_resume"})
+        lp = J._label_params(job)
+        self.assertEqual((lp["pr_sl_mode"], lp["pr_hold_bars"], lp["pr_mode"]), (1, 2, 0))
+
+    def test_label_params_fall_back_to_sent_params(self):
+        job, J = self._job([RuntimeError("x")], params={"strategy_type": "pullback_resume", "pr_sl_mode": 1})
+        self.assertEqual(J._label_params(job)["pr_sl_mode"], 1)
+
+    def test_dashboard_shows_stop_and_no_data_note(self):
+        with open(os.path.join(ROOT, "app/static/dashboard.html"), encoding="utf-8") as f:
+            h = f.read()
+        self.assertIn("'・回拉低點停損' : '・無停損'", h)
+        self.assertIn("p.pr_sl_mode = first.result.mr_cfg.sl_mode", h)
+        self.assertIn("ag.no_data_windows", h)

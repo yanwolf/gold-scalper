@@ -20,8 +20,6 @@
 import bisect
 import os
 import logging
-import threading
-import time
 from datetime import datetime, timezone
 
 import requests
@@ -29,63 +27,26 @@ import requests
 from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
 from app import smc_structure
 from app import mean_reversion
+from app import pullback_resume
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
 from app.trading_stats import compute_stats, assess_readiness, compute_daily_smc_breakdown, compute_reentry_breakdown
 from app import daily_smc
+from app import binance_weight
 
 logger = logging.getLogger("backtest")
 
 BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 MAX_KLINES_PER_REQUEST = 1500
 
-# r97：抓K線的限流保護(BINANCE_LESSONS.md 第 6 條 r97)。klines limit=1500 一次權重 10，
-# IP 每分鐘上限 2400；30 天 × 6 段的回測連跑幾個，一分鐘內就超過 → 429，繼續打會變 418 封 IP。
-# 整個程序的K線請求排隊(回測任務、參數掃描、即時端回填共用)，用回應標頭的已用權重踩煞車。
-KLINES_WEIGHT_PAUSE_AT = 1200     # 已用權重到這裡就等到下一分鐘(上限的一半，留給同 IP 的其他服務)
-KLINES_429_MAX_RETRIES = 3
-KLINES_429_DEFAULT_WAIT = 60      # 沒有 Retry-After 時等幾秒
-KLINES_429_MAX_WAIT = 120
-_klines_lock = threading.Lock()
-_sleep = time.sleep               # 測試換掉
+# r97／r98：抓K線的限流保護搬到 binance_weight.py(BINANCE_LESSONS.md 第 6 條 r97／r98)：
+# 回測、參數掃描走 batch(排隊、權重過半讓路、429 等完重試)；即時端回填走 live(不排隊、不等、被擋就這輪不抓)。
+BinanceRateLimited = binance_weight.BinanceRateLimited
 
 
-class BinanceRateLimited(RuntimeError):
-    """幣安限流(429 重試後仍失敗)或封 IP(418)：暫時性，跟「這段期間沒有資料」不同。"""
-
-
-def _get_klines_page(params):
-    """抓一頁K線：429 照 Retry-After 等完重試；418(已封 IP)不重試、立刻停；已用權重偏高時先等下一分鐘。"""
-    with _klines_lock:
-        for attempt in range(KLINES_429_MAX_RETRIES + 1):
-            resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
-            status = getattr(resp, "status_code", 200)
-            if status == 418:
-                raise BinanceRateLimited("幣安已暫時封鎖這個 IP(418)：先前請求太密集。不要再重試，"
-                                         "等幾分鐘到幾小時(看 Retry-After)；同 IP 的即時服務也可能受影響，請檢查正式端")
-            if status == 429:
-                if attempt >= KLINES_429_MAX_RETRIES:
-                    raise BinanceRateLimited(f"幣安限流(429)：重試 {KLINES_429_MAX_RETRIES} 次仍被擋。"
-                                             "這是暫時性的，等 1～2 分鐘再跑(跟「沒有資料」不同)")
-                try:
-                    wait = float((getattr(resp, "headers", None) or {}).get("Retry-After") or KLINES_429_DEFAULT_WAIT)
-                except (TypeError, ValueError):
-                    wait = KLINES_429_DEFAULT_WAIT
-                wait = min(max(wait, 1.0), KLINES_429_MAX_WAIT)
-                logger.warning(f"抓K線遇到 429，等 {wait:.0f} 秒後重試(第 {attempt + 1} 次)")
-                _sleep(wait)
-                continue
-            resp.raise_for_status()
-            try:
-                used = int((getattr(resp, "headers", None) or {}).get("X-MBX-USED-WEIGHT-1M") or 0)
-            except (TypeError, ValueError):
-                used = 0
-            if used >= KLINES_WEIGHT_PAUSE_AT:
-                wait = 61 - datetime.now(timezone.utc).second   # 權重以分鐘重算，等到下一分鐘
-                logger.info(f"K線已用權重 {used}，先等 {wait} 秒")
-                _sleep(wait)
-            return resp.json()
+def _get_klines_page(params, mode="batch"):
+    return binance_weight.get_klines(params, mode=mode)
 
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
@@ -115,7 +76,9 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 
 
 SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
-HOURLY_STRATEGIES = ("smc_structure", "mean_reversion")  # r96：訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+# r99：只存在回測、介面相同的1小時K策略(build_cfg / precompute / evaluate_at，結果放在 "mr")
+HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume}
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
 
 
@@ -134,7 +97,7 @@ def resolve_end_time_ms(end_date=None, now=None):
     return min(end, now_aligned)
 
 
-def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None, end_time_ms=None):
+def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=None, end_time_ms=None, mode="batch"):
     """
     分頁抓取Binance期貨歷史K線，回傳由舊到新排序的原始K線資料。
     公開市場資料，不需要API Key。max_days不指定時上限是MAX_BACKTEST_DAYS(1分K的合理上限)，
@@ -159,7 +122,7 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
             "endTime": end_time,
             "limit": MAX_KLINES_PER_REQUEST,
         }
-        batch = _get_klines_page(params)
+        batch = _get_klines_page(params, mode=mode)   # 任何一頁失敗(含限流)整個拋出：不回傳抓一半的資料
 
         if not batch:
             break
@@ -248,6 +211,13 @@ def run_backtest(
     mr_sl_atr=None,
     mr_trail_atr=None,
     mr_max_hold_hours=None,
+    pr_sides=None,
+    pr_trend=None,
+    pr_mode=None,
+    pr_min_pullback_bars=None,
+    pr_min_pullback_atr=None,
+    pr_sl_mode=None,
+    pr_hold_bars=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -339,6 +309,15 @@ def run_backtest(
         if mr_err:
             return {"error": mr_err}
         interval_seconds = 3600
+    # r99：回拉轉強(pullback_resume.py，只存在回測)。一樣固定1小時訊號步；持有時間到出場、不看反向訊號
+    if strategy_type == "pullback_resume":
+        mr_cfg, mr_err = pullback_resume.build_cfg({
+            "sides": pr_sides, "trend": pr_trend, "mode": pr_mode, "min_pullback_bars": pr_min_pullback_bars,
+            "min_pullback_atr": pr_min_pullback_atr, "sl_mode": pr_sl_mode, "hold_bars": pr_hold_bars})
+        if mr_err:
+            return {"error": mr_err}
+        interval_seconds = 3600
+        reversal_confirm_count = 10 ** 6   # 「賺賠都走」：只用持有時間出場，反向訊號不提前出場
 
     # klines可由呼叫端預先抓好傳進來(參數掃描用：十幾組回測共用同一份資料，
     # 對照組和每一組實驗才是在完全相同的K線上比較，也省掉重複抓資料的時間)
@@ -460,6 +439,8 @@ def run_backtest(
                 symbol, days, lambda sym, d: fetch_historical_klines(symbol=sym, interval="1d", days=d, max_days=d,
                                                                       end_time_ms=end_time_ms),
                 end_key=end_time_ms)
+    except BinanceRateLimited:
+        raise   # r98：限流不能當成「日線未知」照跑——整段中止，由呼叫端決定後面要不要繼續
     except Exception as e:
         daily_smc_error = f"日K抓取失敗：{type(e).__name__}: {e}"
         logger.warning(f"回測日線SMC標記失敗: {e}")
@@ -500,6 +481,7 @@ def run_backtest(
     # 重播時用bisect只切「step_time之前」的K棒餵給訊號函式，跟趨勢濾網一樣不看未來。
     smc_hourly, smc_close_times, smc_cfg = [], [], {}
     mr_pre = None
+    warmup_error = None
     if strategy_type in HOURLY_STRATEGIES:
         minute_candles = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
@@ -510,15 +492,18 @@ def run_backtest(
                                           max_days=SMC_MAX_BACKTEST_DAYS + 40, end_time_ms=end_time_ms)
             hist = [{"bucket_start": int(k[0]), "open": float(k[1]), "high": float(k[2]),
                      "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in raw]
+        except BinanceRateLimited:
+            raise   # r98：限流時不能悄悄少了warmup照跑(結果會跟正常時不同、又看不出來)
         except Exception as e:
-            logger.warning(f"SMC回測warmup 1小時K抓取失敗，只用視窗內資料: {e}")
+            logger.warning(f"1小時K回測warmup抓取失敗，只用視窗內資料: {e}")
             hist = []
+            warmup_error = f"1小時K warmup 抓取失敗，只用視窗內資料(前段訊號可能偏少)：{type(e).__name__}: {e}"
         if local_hourly:
             hist = [c for c in hist if c["bucket_start"] < local_hourly[0]["bucket_start"]]
         smc_hourly = smc_structure.merge_hourly_candles(hist, local_hourly)
         smc_close_times = [c["bucket_start"] + smc_structure.SMC_INTERVAL_SECONDS * 1000 - 1 for c in smc_hourly]
-        if strategy_type == "mean_reversion":
-            mr_pre = mean_reversion.precompute(smc_hourly)
+        if strategy_type in HR_MODULES:
+            mr_pre = HR_MODULES[strategy_type].precompute(smc_hourly)
     if strategy_type == "smc_structure":
         # 整段只算一次結構快照/EMA/WaveTrend(全部是因果計算，第i根只用<=i的資料)，
         # 每個訊號步直接查表；原本每步重算一次，365天要跑幾十秒、逼近瀏覽器/閘道逾時
@@ -609,12 +594,12 @@ def run_backtest(
         current_price = trades_so_far[-1]["price"]
 
         mr_bar = None
-        if strategy_type == "mean_reversion":
+        if strategy_type in HR_MODULES:
             idx = bisect.bisect_right(smc_close_times, step_time)  # 已收盤的1小時K數
             if idx <= 0:
                 continue
             mr_bar = idx - 1
-            result = mean_reversion.evaluate_at(mr_pre, mr_bar, mr_cfg, current_price=current_price)
+            result = HR_MODULES[strategy_type].evaluate_at(mr_pre, mr_bar, mr_cfg, current_price=current_price)
             recent = smc_hourly[max(0, idx - 120):idx]
             result["strategy_type"] = strategy_type
             result["atr"] = compute_atr(recent)
@@ -678,7 +663,7 @@ def run_backtest(
                 step_sl_points = suggested
 
         # r96：均值回歸的停損/移動停損一律用1小時K的ATR倍數(不吃正式設定的點數)
-        if strategy_type == "mean_reversion":
+        if strategy_type in HR_MODULES:
             _atr_h = (result.get("mr") or {}).get("atr") or atr
             if result.get("mr"):
                 step_sl_points = result["mr"]["sl_points"]
@@ -701,10 +686,10 @@ def run_backtest(
                 reversal_confirm_count=reversal_confirm_count,
                 current_ema9=current_ema9,
             )
-            if (not exit_reason and strategy_type == "mean_reversion" and int(mr_cfg["max_hold_hours"]) > 0
+            if (not exit_reason and strategy_type in HR_MODULES and int(mr_cfg["max_hold_hours"]) > 0
                     and step_time - datetime.fromisoformat(position["entry_time"]).timestamp() * 1000
                     >= int(mr_cfg["max_hold_hours"]) * 3600 * 1000):
-                exit_reason = "超過持有時間"
+                exit_reason = "持有時間到" if strategy_type == "pullback_resume" else "超過持有時間"
             if exit_reason:
                 exit_time_iso = datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat()
                 closed = trading_core.close_position(position, current_price, exit_reason, exit_time_iso)
@@ -718,9 +703,9 @@ def run_backtest(
             # resonance_fvg策略的震盪濾網已經內建在訊號判斷本身裡，這裡不重複套用
             # chan_profile專用的use_chop_filter設定，避免兩套濾網門檻不一致互相打架。
             choppiness_index = result.get("choppiness_index")
-            # 均值回歸本來就是做震盪盤，震盪濾網對它沒有意義，一樣不套用
+            # 只存在回測的1小時K策略(均值回歸、回拉轉強)照使用者描述的規則跑，不套用震盪濾網
             is_choppy = (
-                strategy_type not in ("resonance_fvg", "mean_reversion")
+                strategy_type not in ("resonance_fvg",) + tuple(HR_MODULES)
                 and use_chop_filter
                 and choppiness_index is not None
                 and choppiness_index >= chop_threshold
@@ -758,7 +743,7 @@ def run_backtest(
                     cooldown_ok = False
                     if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
                         skipped_cooldown += 1   # 只數「其他濾網都放行、只被冷卻擋下」的
-            same_bar = strategy_type == "mean_reversion" and mr_bar is not None and mr_bar == mr_last_entry_bar
+            same_bar = strategy_type in HR_MODULES and mr_bar is not None and mr_bar == mr_last_entry_bar
             if (not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok
                     and not same_bar):
                 entry_time_iso = step_dt.isoformat()
@@ -773,8 +758,9 @@ def run_backtest(
                 position["daily_smc"] = daily_tag
                 if size_weight != 1.0:
                     position["size_weight"] = size_weight
-                if strategy_type == "mean_reversion":
-                    position["tp_price"] = float(result["mr"]["tp_price"])
+                if strategy_type in HR_MODULES:
+                    if result["mr"].get("tp_price") is not None:
+                        position["tp_price"] = float(result["mr"]["tp_price"])
                     position["mr_setup"] = result["mr"]["setup"]
                     mr_last_entry_bar = mr_bar
                 if strategy_type == "smc_structure" and int(smc_cfg.get("exit_mode", 0)) == 1:
@@ -835,7 +821,8 @@ def run_backtest(
         "stop_kline_interval": SMC_LONG_RANGE_STOP_INTERVAL if smc_long_range else "1m",  # 停損步用的K線週期
         "smc_funnel": smc_funnel or None,
         "smc_cfg": smc_cfg if strategy_type == "smc_structure" else None,
-        "mr_cfg": mr_cfg,              # r96：均值回歸實際用的參數(其他策略是 None)
+        "mr_cfg": mr_cfg,
+        "warmup_error": warmup_error,  # r98：1小時K warmup 抓不到(非限流)時照跑但標出來              # r96：均值回歸實際用的參數(其他策略是 None)
         "mr_funnel": mr_funnel or None,  # 這次回測實際用的SMC參數  # SMC策略：各訊號步落在哪個階段/理由(診斷訊號稀疏用)
         "data_start_time": int(klines[0][0]),  # 這次回測實際用到的資料視窗，兩次回測比對前先確認視窗一致
         "data_end_time": int(klines[-1][6]),

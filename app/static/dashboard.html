@@ -3563,7 +3563,8 @@ function btParamLabel(p){
   if(p.strategy_type === 'smc_structure') parts.push('SMC');
   else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');
   else if(p.strategy_type === 'mean_reversion') parts.push('均值回歸' + ({1:'A', 2:'B'}[Number(p.mr_setups)] || ''));
-  else if(p.strategy_type === 'pullback_resume') parts.push('回拉轉強' + (Number(p.pr_mode) === 1 ? '基準組' : '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '') + ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || ''));
+  else if(p.strategy_type === 'pullback_resume') parts.push('回拉轉強' + (Number(p.pr_mode) === 1 ? '基準組' : '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '') + ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || '')
+    + (Number(p.pr_sl_mode) === 1 ? '・回拉低點停損' : '・無停損') + (Number(p.pr_hold_bars) > 1 ? `・持有${Number(p.pr_hold_bars)}根` : ''));
   const dm = Number(p.daily_smc_filter_mode || 0);
   parts.push(dm === 3 ? `日線:逆勢×${p.daily_smc_against_weight ?? 0.5}` : ({0:'日線:不濾', 1:'日線:擋逆勢', 2:'日線:嚴格'}[dm] || `日線:模式${dm}`));
   if(p.trend_filter_mode == null) parts.push('趨勢:沿用設定');
@@ -3583,6 +3584,7 @@ function btLabelParamsOf(job){
     if(first.result.mr_cfg && first.result.strategy_type === 'mean_reversion') p.mr_setups = first.result.mr_cfg.setups;
     if(first.result.mr_cfg && first.result.strategy_type === 'pullback_resume'){
       p.pr_mode = first.result.mr_cfg.mode; p.pr_sides = first.result.mr_cfg.sides; p.pr_trend = first.result.mr_cfg.trend;
+      p.pr_sl_mode = first.result.mr_cfg.sl_mode; p.pr_hold_bars = first.result.mr_cfg.hold_bars;
     }
   }
   return p;
@@ -3642,6 +3644,7 @@ function renderBacktestJob(job){
     ${cards}
     ${ag ? btWinCard('<b>合計</b>', '', ag, 'total', null) : ''}
     ${ag && ag.missing_windows ? `<div style="font-size:11px; color:var(--gold); margin-top:6px;">🟡 有 ${ag.missing_windows} 段出錯沒算進合計，合計只代表跑完的段落。</div>` : ''}
+    ${ag && ag.no_data_windows ? `<div style="font-size:11px; color:var(--muted); margin-top:6px;">ⓘ 有 ${ag.no_data_windows} 段沒有資料(合約上市前)，合計只算有資料的段落。</div>` : ''}
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
     ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
     ${ag ? reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場') : ''}

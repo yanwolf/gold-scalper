@@ -176,6 +176,15 @@ def _run_sweep(job_id, combos, days, interval_seconds, context=None):
     # 比較，也不會因為每組各自抓資料、視窗逐漸位移而彼此對不上
     try:
         shared_klines = backtest_module.fetch_historical_klines(symbol=symbol, days=days)
+    except backtest_module.BinanceRateLimited as e:
+        # r98：限流時整個掃描讓開，不讓每一組各自再抓、各自等
+        logger.warning(f"參數掃描抓歷史資料被幣安限流，整個掃描中止: {e}")
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = f"幣安限流，掃描中止(沒有跑任何一組)：{e}"
+        return
     except Exception as e:
         logger.error(f"參數掃描抓歷史資料失敗: {e}")
         shared_klines = None
@@ -223,6 +232,14 @@ def _run_sweep(job_id, combos, days, interval_seconds, context=None):
                 "replay_step_count": result.get("replay_step_count"),
                 "error": result.get("error"),
             }
+        except backtest_module.BinanceRateLimited as e:
+            logger.warning(f"參數掃描被幣安限流，剩下的組不跑: {e}")
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job:
+                    job["status"] = "error"
+                    job["error"] = f"幣安限流，掃描中止(已完成 {job['completed']} 組，剩下的沒跑；結果不完整，不要拿來比較)：{e}"
+            return
         except Exception as e:
             logger.error(f"參數掃描其中一組失敗({combo['label']}): {e}")
             summary = {"label": combo["label"], "params": combo["params"], "error": str(e)}
