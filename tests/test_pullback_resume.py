@@ -225,8 +225,11 @@ class Isolation(unittest.TestCase):
             return f.read()
 
     def test_live_paths_do_not_use_it(self):
-        for rel in ("app/paper_trading.py", "app/execution.py", "app/signal_engine.py", "app/notifier.py"):
+        # r102 起 lab 的前瞻引擎(band_touch)透過 signal_engine 用同一支判斷；下單、通知、引擎本身仍然不碰它
+        for rel in ("app/paper_trading.py", "app/execution.py", "app/notifier.py"):
             self.assertNotIn("pullback_resume", self._src(rel), rel)
+        se = self._src("app/signal_engine.py")
+        self.assertIn('build_cfg({"mode": 2, "exit_mode": 1, "sides": 3})', se, "即時端只用回測通過的那一組")
 
     def test_endpoints_and_dashboard(self):
         from app import main

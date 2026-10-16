@@ -296,6 +296,10 @@ def run_backtest(
         trend_slow_multiplier = float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0)
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
+    if strategy_type == "band_touch":
+        # r102：band_touch 是即時引擎的策略名(會抓即時 REST 1小時K，回測用會偷看未來)。
+        # 回測請用 pullback_resume + pr_mode=2 + pr_exit_mode=1，規則完全一樣
+        return {"error": "band_touch 只給即時引擎用；回測請選「回拉轉強」、測試對象「布林觸軌轉強」、出場「回到布林中軌」"}
     if spread_cost_points is None:
         spread_cost_points = s.get("execution_assumed_spread_points", 0.0)
 

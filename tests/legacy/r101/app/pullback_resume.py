@@ -13,6 +13,11 @@
   4. 進場：這根收盤(回測迴圈在1小時K收盤那一步用當下價格進場)。
   5. 出場：持有 hold_bars 根(預設 1)後，在那根收盤出場，賺賠都走。可選保護停損＝回拉段的最低點。
 
+布林觸軌轉強(mode=2，r101)：不看趨勢；回拉段(連續反色K)裡至少一根的低點碰到布林下軌(BOLL 20,2；空單：高點碰上軌)，
+接著同樣的轉強K收回前一根開盤才進場。停損一律放在回拉段的極值(這個模式不管 sl_mode，規則事先定死)。
+出場可選 exit_mode：0=持有 hold_bars 根；1=回到布林中軌(訊號那根的中軌，停利價固定)，最長持有 MID_MAX_HOLD 根。
+中軌不在進場價的獲利方向時，沒有停利價，只靠時間出場。
+
 基準組(mode=1)：同樣的趨勢條件，「任何一根陽線收盤就買、持有一樣久」(空單：任何陰線就賣)。
 拿來判斷賺的是「回拉＋轉強」這個型態，還是只是趨勢本身的漂移。要看純漂移，把趨勢設成「不看」再跑一次基準組。
 
@@ -22,6 +27,8 @@
 from app.mean_reversion import _ema_series, _atr_series
 
 TREND_PERIOD = 20
+BB_PERIOD, BB_K = 20, 2.0
+MID_MAX_HOLD = 12     # exit_mode=1(回中軌)時最長持有幾根
 SLOPE_BARS = 3
 PRE_BARS = 5           # 回拉幅度：從回拉開始前幾根的最高點量起
 MAX_PULLBACK_BARS = 12  # 往回數陰線最多數幾根
@@ -30,7 +37,8 @@ WARMUP_BARS = TREND_PERIOD + SLOPE_BARS + PRE_BARS
 DEFAULT_CFG = {
     "sides": 3,               # 1=只做多 2=只做空 3=多空都做
     "trend": 0,               # 0=EMA20 1=布林中軌(SMA20) 2=不看趨勢
-    "mode": 0,                # 0=回拉轉強型態 1=基準組(趨勢裡任何一根同色K)
+    "mode": 0,                # 0=回拉轉強型態 1=基準組(趨勢裡任何一根同色K) 2=布林觸軌轉強(r101)
+    "exit_mode": 0,           # 0=持有 hold_bars 根 1=回到布林中軌(最長 MID_MAX_HOLD 根)
     "min_pullback_bars": 1,
     "min_pullback_atr": 0.0,  # 0=不限回拉幅度
     "sl_mode": 0,             # 0=不設停損(持有到時間) 1=停損在回拉段低點(空單：反彈段高點)
@@ -42,7 +50,8 @@ DEFAULT_CFG = {
 CFG_LIMITS = {
     "sides": (1, 3, int),
     "trend": (0, 2, int),
-    "mode": (0, 1, int),
+    "mode": (0, 2, int),
+    "exit_mode": (0, 1, int),
     "min_pullback_bars": (1, 6, int),
     "min_pullback_atr": (0.0, 5.0, float),
     "sl_mode": (0, 1, int),
@@ -70,7 +79,8 @@ def build_cfg(overrides=None):
         if not lo <= val <= hi:
             return None, f"回拉轉強參數 {k} 要在 {lo}～{hi} 之間，收到 {v}"
         cfg[k] = val
-    cfg["max_hold_hours"] = int(cfg["hold_bars"])   # 回測迴圈用這個欄位做時間出場
+    # 回測迴圈用這個欄位做時間出場
+    cfg["max_hold_hours"] = MID_MAX_HOLD if int(cfg["exit_mode"]) == 1 else int(cfg["hold_bars"])
     return cfg, None
 
 
@@ -81,12 +91,25 @@ def _sma_series(vals, n):
     return out
 
 
+def _bollinger(closes, n=BB_PERIOD, k=BB_K):
+    """布林通道(母體標準差，跟 MT5／TradingView 一樣)：(中軌, 上軌, 下軌)。"""
+    mid, up, lo = [None] * len(closes), [None] * len(closes), [None] * len(closes)
+    for i in range(n - 1, len(closes)):
+        w = closes[i - n + 1:i + 1]
+        m = sum(w) / n
+        sd = (sum((x - m) ** 2 for x in w) / n) ** 0.5
+        mid[i], up[i], lo[i] = m, m + k * sd, m - k * sd
+    return mid, up, lo
+
+
 def precompute(candles):
     closes = [c["close"] for c in candles]
+    bb_mid, bb_up, bb_lo = _bollinger(closes)
     return {"candles": candles,
             "ema": _ema_series(closes, TREND_PERIOD),
             "sma": _sma_series(closes, TREND_PERIOD),
-            "atr": _atr_series(candles)}
+            "atr": _atr_series(candles),
+            "bb_mid": bb_mid, "bb_up": bb_up, "bb_lo": bb_lo}
 
 
 def _neutral(reason):
@@ -123,9 +146,13 @@ def _check_side(pre, i, cfg, sign):
     bar = c[i]
     if _color(bar) != sign:
         return False, "這根不是" + ("陽線" if sign > 0 else "陰線"), None
-    ok, why = _trend_ok(pre, i, cfg, sign)
-    if not ok:
-        return False, why, None
+    band_mode = int(cfg["mode"]) == 2
+    if band_mode:
+        why = "不看趨勢(布林觸軌)"
+    else:
+        ok, why = _trend_ok(pre, i, cfg, sign)
+        if not ok:
+            return False, why, None
     if int(cfg["mode"]) == 1:   # 基準組：趨勢裡任何一根同色K
         ref = bar["low"] if sign > 0 else bar["high"]
         return True, f"基準組：{why}，任何{'陽' if sign > 0 else '陰'}線收盤進場", ref
@@ -140,6 +167,13 @@ def _check_side(pre, i, cfg, sign):
     if not (sign * (bar["close"] - last_pb["open"]) > 0):
         return False, "沒有收回前一根的開盤", None
     pb = c[i - k:i]
+    if band_mode:
+        band = pre["bb_lo"] if sign > 0 else pre["bb_up"]
+        touched = any(band[j] is not None and sign * (c[j]["low" if sign > 0 else "high"] - band[j]) <= 0
+                      for j in range(i - k, i))
+        if not touched:
+            return False, f"回拉段沒有碰到布林{'下' if sign > 0 else '上'}軌", None
+        why = f"碰布林{'下' if sign > 0 else '上'}軌後轉{'強' if sign > 0 else '弱'}"
     pre_seg = c[max(0, i - k - PRE_BARS):i - k]
     atr = pre["atr"][i]
     if sign > 0:
@@ -176,14 +210,22 @@ def evaluate_at(pre, i, cfg, current_price=None):
         return _neutral("；".join(reasons) or "這個方向不做")
     sign, why, ref = hit
     entry = float(current_price) if current_price is not None else c[i]["close"]
-    if int(cfg["sl_mode"]) == 1 and ref is not None and sign * (entry - ref) > 0:
+    band_mode = int(cfg["mode"]) == 2
+    if (int(cfg["sl_mode"]) == 1 or band_mode) and ref is not None and sign * (entry - ref) > 0:
         sl_points, sl_note = sign * (entry - ref), f"停損在{'回拉低點' if sign > 0 else '反彈高點'} {ref:.2f}"
     else:
         sl_points, sl_note = NO_STOP_POINTS, "不設停損"
-    setup = ("基準" if int(cfg["mode"]) == 1 else "型態") + ("多" if sign > 0 else "空")
+    setup = {0: "型態", 1: "基準", 2: "觸軌"}[int(cfg["mode"])] + ("多" if sign > 0 else "空")
+    tp_price, exit_note = None, f"持有 {int(cfg['hold_bars'])} 根1小時K後收盤出場"
+    if int(cfg["exit_mode"]) == 1:
+        mid = pre["bb_mid"][i]
+        if mid is not None and sign * (mid - entry) > 0:
+            tp_price, exit_note = mid, f"回到布林中軌 {mid:.2f} 停利，最長 {MID_MAX_HOLD} 根"
+        else:
+            exit_note = f"中軌不在獲利方向，沒有停利價，最長 {MID_MAX_HOLD} 根"
     return {
         "stage": "訊號", "direction": "bullish" if sign > 0 else "bearish",
         "chan": {"reason": why},
-        "profile": {"reason": f"持有 {int(cfg['hold_bars'])} 根1小時K後收盤出場；{sl_note}"},
-        "mr": {"setup": setup, "sl_points": sl_points, "tp_price": None, "atr": atr},
+        "profile": {"reason": f"{exit_note}；{sl_note}"},
+        "mr": {"setup": setup, "sl_points": sl_points, "tp_price": tp_price, "atr": atr},
     }
