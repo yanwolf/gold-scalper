@@ -46,7 +46,13 @@ def _iso(ms):
 
 # r91：清單上要分得出哪個任務是哪組設定——summary 帶這幾個關鍵參數
 LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
-                    "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours")
+                    "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
+                    # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
+                    "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars")
+# 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
+_MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
+                 "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",
+                                     "sl_mode": "pr_sl_mode", "hold_bars": "pr_hold_bars"}}
 
 
 def _label_params(job):
@@ -59,6 +65,10 @@ def _label_params(job):
             for k in LABEL_PARAM_KEYS:
                 if res.get(k) is not None:
                     out[k] = res[k]
+            cfg = res.get("mr_cfg") if isinstance(res.get("mr_cfg"), dict) else {}
+            for src, dst in _MR_CFG_LABEL.get(res.get("strategy_type"), {}).items():
+                if cfg.get(src) is not None:
+                    out[dst] = cfg[src]
             break
     return out
 
@@ -172,7 +182,9 @@ def _run(job_id):
                         job["window_results"].append({**_window_row(m, skipped, e2 - days * DAY_MS + 1, e2),
                                                       "result": skipped})
                 break
-        failed = [r for r in results if not isinstance(r, dict) or r.get("error")]
+        # r100：「沒有資料」(合約上市前，r95)不是出錯，分開算；合計本來就只算有資料的段落
+        no_data_n = sum(1 for r in results if isinstance(r, dict) and r.get("no_data"))
+        failed = [r for r in results if not isinstance(r, dict) or (r.get("error") and not r.get("no_data"))]
         with _lock:
             if any(isinstance(r, dict) and r.get("rate_limited") for r in results):
                 # 限流的任務不算合計：少了哪幾段、偏掉多少都說不清楚，不能跟完整的任務放在一起比
@@ -183,6 +195,8 @@ def _run(job_id):
                 agg = _aggregate(results) if windows > 1 else None
                 if agg is not None and failed:
                     agg["missing_windows"] = len(failed)   # 有段落出錯(非限流)：合計照算，但標出少了幾段
+                if agg is not None and no_data_n:
+                    agg["no_data_windows"] = no_data_n
                 job["aggregate"] = agg
                 job["status"] = "done"
             job["finished_at"] = _now_iso()

@@ -218,6 +218,7 @@ def run_backtest(
     pr_min_pullback_atr=None,
     pr_sl_mode=None,
     pr_hold_bars=None,
+    pr_exit_mode=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -313,7 +314,8 @@ def run_backtest(
     if strategy_type == "pullback_resume":
         mr_cfg, mr_err = pullback_resume.build_cfg({
             "sides": pr_sides, "trend": pr_trend, "mode": pr_mode, "min_pullback_bars": pr_min_pullback_bars,
-            "min_pullback_atr": pr_min_pullback_atr, "sl_mode": pr_sl_mode, "hold_bars": pr_hold_bars})
+            "min_pullback_atr": pr_min_pullback_atr, "sl_mode": pr_sl_mode, "hold_bars": pr_hold_bars,
+            "exit_mode": pr_exit_mode})
         if mr_err:
             return {"error": mr_err}
         interval_seconds = 3600

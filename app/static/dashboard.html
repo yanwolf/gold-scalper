@@ -856,6 +856,7 @@
           <option value="">預設(回拉轉強型態)</option>
           <option value="0">回拉轉強型態</option>
           <option value="1">基準組：趨勢裡任何一根同色K就進</option>
+          <option value="2">布林觸軌轉強(不看趨勢、停損固定在回拉極值)</option>
         </select>
       </div>
       <div class="settings-field">
@@ -872,6 +873,14 @@
           <option value="">預設(不設，持有到時間)</option>
           <option value="0">不設，持有到時間</option>
           <option value="1">停損在回拉低點(空單：反彈高點)</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>出場方式</label>
+        <select id="backtestPrExitMode">
+          <option value="">預設(持有固定根數)</option>
+          <option value="0">持有固定根數</option>
+          <option value="1">回到布林中軌(最長12根)</option>
         </select>
       </div>
       <div class="settings-field">
@@ -1354,6 +1363,7 @@ const els = {
   backtestPrMinAtr: document.getElementById('backtestPrMinAtr'),
   backtestPrSlMode: document.getElementById('backtestPrSlMode'),
   backtestPrHoldBars: document.getElementById('backtestPrHoldBars'),
+  backtestPrExitMode: document.getElementById('backtestPrExitMode'),
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
@@ -2788,9 +2798,9 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     const m = s._strategy_type === 'mean_reversion' ? s._mr_cfg : null;
     const pr = s._strategy_type === 'pullback_resume' ? s._mr_cfg : null;
     if(pr){
-      strategyHtml += `<div class="cfg-row"><span class="cfg-label">回拉轉強</span><span class="cfg-value on">${Number(pr.mode) === 1 ? '基準組(趨勢裡任何同色K)' : '回拉轉強型態'}／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(pr.sides)]}</span></div>`
-        + `<div class="cfg-row"><span class="cfg-label">條件</span><span class="cfg-value">趨勢${{0:'EMA20', 1:'布林中軌', 2:'不看'}[Number(pr.trend)]}／回拉≥${pr.min_pullback_bars}根${Number(pr.min_pullback_atr) > 0 ? '、≥' + pr.min_pullback_atr + '×ATR' : ''}</span></div>`
-        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">持有${pr.hold_bars}根後收盤出場／${Number(pr.sl_mode) === 1 ? '停損在回拉低點' : '不設停損'}</span></div>`
+      strategyHtml += `<div class="cfg-row"><span class="cfg-label">回拉轉強</span><span class="cfg-value on">${{0:'回拉轉強型態', 1:'基準組(趨勢裡任何同色K)', 2:'布林觸軌轉強'}[Number(pr.mode)]}／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(pr.sides)]}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">條件</span><span class="cfg-value">${Number(pr.mode) === 2 ? '不看趨勢、回拉段碰布林軌' : '趨勢' + {0:'EMA20', 1:'布林中軌', 2:'不看'}[Number(pr.trend)]}／回拉≥${pr.min_pullback_bars}根${Number(pr.min_pullback_atr) > 0 ? '、≥' + pr.min_pullback_atr + '×ATR' : ''}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">${Number(pr.exit_mode) === 1 ? '回到布林中軌(最長12根)' : '持有' + pr.hold_bars + '根後收盤出場'}／${Number(pr.sl_mode) === 1 || Number(pr.mode) === 2 ? '停損在回拉低點' : '不設停損'}</span></div>`
         + `<div class="cfg-row"><span class="cfg-label">注意</span><span class="cfg-value">下面的停損點數/ATR倍數這個策略不用</span></div>`;
     }
     if(m){
@@ -3419,6 +3429,7 @@ function buildBacktestParamOverrides(){
     addIfPresent('pr_min_pullback_atr', els.backtestPrMinAtr);
     addIfPresent('pr_sl_mode', els.backtestPrSlMode);
     addIfPresent('pr_hold_bars', els.backtestPrHoldBars);
+    addIfPresent('pr_exit_mode', els.backtestPrExitMode);
   }
   return params.toString();
 }
@@ -3563,8 +3574,13 @@ function btParamLabel(p){
   if(p.strategy_type === 'smc_structure') parts.push('SMC');
   else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');
   else if(p.strategy_type === 'mean_reversion') parts.push('均值回歸' + ({1:'A', 2:'B'}[Number(p.mr_setups)] || ''));
-  else if(p.strategy_type === 'pullback_resume') parts.push('回拉轉強' + (Number(p.pr_mode) === 1 ? '基準組' : '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '') + ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || '')
-    + (Number(p.pr_sl_mode) === 1 ? '・回拉低點停損' : '・無停損') + (Number(p.pr_hold_bars) > 1 ? `・持有${Number(p.pr_hold_bars)}根` : ''));
+  else if(p.strategy_type === 'pullback_resume'){
+    const band = Number(p.pr_mode) === 2;   // r101：布林觸軌轉強不看趨勢、停損固定
+    parts.push('回拉轉強' + ({1:'基準組', 2:'・布林觸軌'}[Number(p.pr_mode)] || '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '')
+      + (band ? '' : ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || ''))
+      + (band || Number(p.pr_sl_mode) === 1 ? '・回拉低點停損' : '・無停損')
+      + (Number(p.pr_exit_mode) === 1 ? '・回中軌出場' : (Number(p.pr_hold_bars) > 1 ? `・持有${Number(p.pr_hold_bars)}根` : '')));
+  }
   const dm = Number(p.daily_smc_filter_mode || 0);
   parts.push(dm === 3 ? `日線:逆勢×${p.daily_smc_against_weight ?? 0.5}` : ({0:'日線:不濾', 1:'日線:擋逆勢', 2:'日線:嚴格'}[dm] || `日線:模式${dm}`));
   if(p.trend_filter_mode == null) parts.push('趨勢:沿用設定');
@@ -3585,6 +3601,7 @@ function btLabelParamsOf(job){
     if(first.result.mr_cfg && first.result.strategy_type === 'pullback_resume'){
       p.pr_mode = first.result.mr_cfg.mode; p.pr_sides = first.result.mr_cfg.sides; p.pr_trend = first.result.mr_cfg.trend;
       p.pr_sl_mode = first.result.mr_cfg.sl_mode; p.pr_hold_bars = first.result.mr_cfg.hold_bars;
+      p.pr_exit_mode = first.result.mr_cfg.exit_mode;
     }
   }
   return p;

@@ -285,3 +285,111 @@ class R100Labels(unittest.TestCase):
         self.assertIn("'・回拉低點停損' : '・無停損'", h)
         self.assertIn("p.pr_sl_mode = first.result.mr_cfg.sl_mode", h)
         self.assertIn("ag.no_data_windows", h)
+
+
+CALM = [4000.0 + (i % 2) * 2 for i in range(39)]          # 0..38 陰陽交錯，最後收 4000
+BAND_PATH = CALM + [3995.0, 3990.0, 3984.0, 3991.0, 3996.0, 4000.0, 4005.0, 4006.0, 4007.0, 4008.0]  # 48 小時
+
+
+class R101BandTouch(unittest.TestCase):
+    """r101：布林觸軌轉強(mode=2)與回中軌出場(exit_mode=1)。"""
+
+    def test_bollinger_is_population_std(self):
+        closes = [float(x) for x in range(1, 21)]
+        mid, up, lo = P._bollinger(closes)
+        m = sum(closes) / 20
+        sd = (sum((x - m) ** 2 for x in closes) / 20) ** 0.5
+        self.assertAlmostEqual(mid[19], m)
+        self.assertAlmostEqual(up[19], m + 2 * sd)
+        self.assertAlmostEqual(lo[19], m - 2 * sd)
+        self.assertIsNone(mid[18])
+
+    def _pre(self, closes=None):
+        return P.precompute(_bars(closes or BAND_PATH[:43]))
+
+    def test_long_after_touching_lower_band(self):
+        pre = self._pre()
+        self.assertLessEqual(pre["candles"][41]["low"], pre["bb_lo"][41], "前提：第 41 根碰到下軌")
+        r = P.evaluate_at(pre, 42, cfg(mode=2))
+        self.assertEqual((r["direction"], r["mr"]["setup"]), ("bullish", "觸軌多"))
+        self.assertIn("碰布林下軌", r["chan"]["reason"])
+
+    def test_no_touch_no_signal(self):
+        wide = [4000.0 + (i % 2) * 10 for i in range(39)]      # 波動大、通道寬
+        closes = wide + [3999.0, 3998.5, 3998.0, 4001.0]       # 一樣回拉三根再收回，但沒碰到下軌
+        pre = P.precompute(_bars(closes))
+        self.assertTrue(all(pre["candles"][j]["low"] > pre["bb_lo"][j] for j in (39, 40, 41)), "前提")
+        r = P.evaluate_at(pre, 42, cfg(mode=2))
+        self.assertEqual(r["stage"], "中性")
+        self.assertIn("沒有碰到", r["chan"]["reason"])
+
+    def test_wick_touch_on_first_pullback_bar_counts(self):
+        wide = [4000.0 + (i % 2) * 10 for i in range(39)]
+        bars = _bars(wide + [3999.0, 3998.5, 3998.0, 4001.0])
+        pre = P.precompute(bars)
+        bars[39]["low"] = pre["bb_lo"][39] - 0.5               # 只有第一根回拉K的下影線碰到，收盤沒碰到
+        self.assertGreater(bars[39]["close"], pre["bb_lo"][39], "前提：收盤在下軌之上")
+        r = P.evaluate_at(pre, 42, cfg(mode=2))
+        self.assertEqual(r["direction"], "bullish")
+
+    def test_trend_is_ignored_and_stop_is_forced(self):
+        pre = self._pre()
+        pre["ema"][42] = 9999.0                               # 一般模式下趨勢不成立
+        self.assertEqual(P.evaluate_at(pre, 42, cfg(mode=0, sides=1))["stage"], "中性", "前提")
+        r = P.evaluate_at(pre, 42, cfg(mode=2, sl_mode=0), current_price=3991.0)
+        self.assertEqual(r["direction"], "bullish")
+        lowest = min(pre["candles"][j]["low"] for j in (39, 40, 41))
+        self.assertAlmostEqual(r["mr"]["sl_points"], 3991.0 - lowest, msg="停損固定在回拉極值，不管 sl_mode")
+
+    def test_short_mirror_touching_upper_band(self):
+        closes = CALM[:-1] + [4002.0, 4007.0, 4012.0, 4018.0, 4011.0]   # 陽線三根衝上軌後轉弱
+        closes = [c for c in closes]
+        pre = P.precompute(_bars(closes))
+        i = len(closes) - 1
+        self.assertGreaterEqual(pre["candles"][i - 1]["high"], pre["bb_up"][i - 1], "前提")
+        r = P.evaluate_at(pre, i, cfg(mode=2))
+        self.assertEqual((r["direction"], r["mr"]["setup"]), ("bearish", "觸軌空"))
+
+    def test_mid_band_exit_target(self):
+        pre = self._pre()
+        r = P.evaluate_at(pre, 42, cfg(mode=2, exit_mode=1), current_price=3991.0)
+        self.assertAlmostEqual(r["mr"]["tp_price"], pre["bb_mid"][42])
+        self.assertGreater(r["mr"]["tp_price"], 3991.0)
+        r2 = P.evaluate_at(pre, 42, cfg(mode=2, exit_mode=1), current_price=pre["bb_mid"][42] + 1)
+        self.assertIsNone(r2["mr"]["tp_price"], "中軌不在獲利方向：沒有停利價")
+        self.assertIsNone(P.evaluate_at(pre, 42, cfg(mode=2))["mr"]["tp_price"], "exit_mode=0 沒有停利價")
+
+    def test_max_hold_follows_exit_mode(self):
+        self.assertEqual(cfg(exit_mode=1)["max_hold_hours"], P.MID_MAX_HOLD)
+        self.assertEqual(cfg(exit_mode=0, hold_bars=3)["max_hold_hours"], 3)
+        self.assertIsNone(P.build_cfg({"mode": 3})[0])
+        self.assertIsNone(P.build_cfg({"exit_mode": 2})[0])
+
+    def test_backtest_hits_mid_band(self):
+        res = _run(path=BAND_PATH, pr_mode=2, pr_exit_mode=1, pr_sides=1)
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有進場")
+        t = trades[0]
+        self.assertEqual(t["mr_setup"], "觸軌多")
+        self.assertAlmostEqual(t["entry_price"], 3991.0, places=6)
+        self.assertEqual(t["exit_reason"], "觸及停利")
+        self.assertAlmostEqual(t["exit_price"], t["tp_price"])
+        self.assertEqual(res["mr_cfg"]["max_hold_hours"], P.MID_MAX_HOLD)
+
+    def test_backtest_hold_one_bar(self):
+        res = _run(path=BAND_PATH, pr_mode=2, pr_sides=1)
+        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        self.assertEqual(t["exit_reason"], "持有時間到")
+        self.assertAlmostEqual(t["exit_price"], 3996.0, places=6)
+
+    def test_labels_and_dashboard(self):
+        from app import backtest_jobs as J
+        self.assertIn("pr_exit_mode", J.LABEL_PARAM_KEYS)
+        self.assertEqual(J._MR_CFG_LABEL["pullback_resume"]["exit_mode"], "pr_exit_mode")
+        from app import main
+        self.assertIn("pr_exit_mode", main._backtest_job_params())
+        with open(os.path.join(ROOT, "app/static/dashboard.html"), encoding="utf-8") as f:
+            h = f.read()
+        self.assertIn('<option value="2">布林觸軌轉強', h)
+        self.assertIn("addIfPresent('pr_exit_mode'", h)
+        self.assertIn("'・回中軌出場'", h)
