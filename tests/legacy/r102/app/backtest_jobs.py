@@ -48,11 +48,12 @@ def _iso(ms):
 LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
                     "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
                     # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
-                    "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars")
+                    "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode")
 # 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
 _MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
                  "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",
-                                     "sl_mode": "pr_sl_mode", "hold_bars": "pr_hold_bars"}}
+                                     "sl_mode": "pr_sl_mode", "hold_bars": "pr_hold_bars",
+                                     "exit_mode": "pr_exit_mode"}}
 
 
 def _label_params(job):

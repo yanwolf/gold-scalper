@@ -2551,8 +2551,12 @@ function renderTradeList(el, trades, settingsChangedAt){
     const isWin = pnlKnown && t.pnl_points > 0;
     const pnlClass = isWin ? 'win' : 'loss';
     // 真實下單過的交易：優先顯示依真實成交價算的USDT，沒有就用點數×張數估算
+    // r103：扣掉實際手續費後的淨額(成交明細 commission)；手續費還不知道時標出來
+    const feePart = t.real_pnl_usd == null ? '' : (t.real_net_usd != null
+      ? `，扣手續費 ${t.real_net_usd >= 0 ? '+' : ''}${t.real_net_usd.toFixed(2)}`
+      : '，手續費未知');
     const usdPart = t.real_pnl_usd != null
-      ? ` <span style="font-size:0.85em; opacity:.85;">(${t.real_pnl_usd >= 0 ? '+' : ''}${t.real_pnl_usd.toFixed(2)} U 實)</span>`
+      ? ` <span style="font-size:0.85em; opacity:.85;">(${t.real_pnl_usd >= 0 ? '+' : ''}${t.real_pnl_usd.toFixed(2)} U 實${feePart})</span>`
       : (t.real_open_executed
           // 成交價查不到：用推估值(點數×張數)，標「估」(使用者決定2026-09-22)
           ? (t.real_pnl_usd_est != null
@@ -2914,8 +2918,13 @@ function renderPaperTrading(data, t){
   t.paperWinRate.textContent = data.total_trades ? `${data.win_rate}%` : '--';
   // 總損益的USDT只用真實成交價算的(第8條r28)；以前是「全部模擬點數×張數」，連沒真的下單的也算進去
   const ru = data.real_usd;
+  // r103：手續費另外列；淨額只在每一筆手續費都知道時才顯示
+  const feeTag = (ru && ru.fee_known)
+    ? `，手續費 −${ru.fee_total.toFixed(2)} U${ru.fee_unknown ? `(另 ${ru.fee_unknown} 筆不知道)` : ''}${ru.net_total != null ? `，淨 ${ru.net_total >= 0 ? '+' : ''}${ru.net_total.toFixed(2)} U` : ''}` : '';
   const realUsdTag = (ru && (ru.known || ru.unknown))
-    ? ` <span style="font-size:0.85em; opacity:.85;">(${ru.total >= 0 ? '+' : ''}${ru.total.toFixed(2)} U${ru.estimated ? `，其中 ${ru.estimated} 筆估算` : ''}${ru.unknown ? `，另有 ${ru.unknown} 筆未知` : ''})</span>` : '';
+    ? ` <span style="font-size:0.85em; opacity:.85;">(${ru.total >= 0 ? '+' : ''}${ru.total.toFixed(2)} U${ru.estimated ? `，其中 ${ru.estimated} 筆估算` : ''}${ru.unknown ? `，另有 ${ru.unknown} 筆未知` : ''}${feeTag})</span>`
+      + (ru.fee_per_unit_round_trip != null ? `<div style="font-size:11px; color:var(--muted); margin-top:2px;">實際手續費平均每張一進一出 ${ru.fee_per_unit_round_trip.toFixed(2)} U(≈ ${ru.fee_per_unit_round_trip.toFixed(2)} 點)，回測「假設價差」可以設這個數</div>` : '')
+    : '';
   const unknownNote = data.unknown_pnl_trades ? ` <span style="font-size:0.8em; color:var(--muted);">(另有 ${data.unknown_pnl_trades} 筆損益未知)</span>` : '';
   t.paperTotalPnl.innerHTML = data.total_trades != null ? `${data.total_pnl_points.toFixed(2)}${realUsdTag}${unknownNote}` : '--';
   t.paperProfitFactor.textContent = data.profit_factor != null ? data.profit_factor.toFixed(2) : (data.total_trades ? '∞' : '--');

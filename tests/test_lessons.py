@@ -35,6 +35,10 @@ _REAL_BACKFILL_START = getattr(pt, "_start_backfill_thread", None)
 _BACKFILL_DEFAULT = []
 if _REAL_BACKFILL_START is not None:
     pt._start_backfill_thread = _BACKFILL_DEFAULT.append
+# r103：手續費背景補查一樣預設收下來(不在背景打網路)
+_FEE_DEFAULT = []
+if getattr(pt, "_start_fee_thread", None) is not None:
+    pt._start_fee_thread = _FEE_DEFAULT.append
 
 ONE_WAY_ROWS = [{"symbol": "XAUUSDT", "positionSide": "BOTH", "positionAmt": "0.1"}]
 
@@ -1998,7 +2002,9 @@ def _sqlite_pool():
             # r76：背景補登還沒完成的記號(進場／出場各一欄)
             "open_backfill TEXT", "exit_backfill TEXT",
             # r89：開倉時的日線SMC結構標記(舊版程式不讀這欄，多一欄不影響舊版重跑)
-            "daily_smc TEXT"]
+            "daily_smc TEXT",
+            # r103：實際手續費(舊版程式不讀這兩欄)
+            "entry_fee_usd REAL", "exit_fee_usd REAL"]
     conn.execute(f"CREATE TABLE paper_trades ({', '.join(cols)})")
     conn.execute("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)")   # r85：緊急停止狀態
     conn.create_function("now", 0, lambda: "2026-09-26T00:00:00+00:00")
@@ -2797,7 +2803,9 @@ class Lesson54(ExecHarness):
              mock.patch.object(binance_streamer, "get_recent_trades", return_value=[{"price": 4401.0}]), \
              mock.patch.object(pt, "_latest_price", return_value=4401.0), \
              mock.patch.object(ex, "close_position", return_value=(True, {"executedQty": "0.100", "avgPrice": "4401"})) as cp, \
-             mock.patch.object(self.eng, "_cancel_backstop", return_value=False):
+             mock.patch.object(self.eng, "_cancel_backstop", return_value=False), \
+             mock.patch.object(self.eng, "_close_fees", return_value=None, create=True):
+            # r103：平倉結帳後查手續費也會查成交明細——這組測試的前提「送單前查了成交明細」不能被它湊滿，先換掉
             if via == "exit":
                 self.assertTrue(self.eng._try_claim_close(pos), "前提：出場判斷認領了部位")
                 self.eng._close_position(pos, 4401.0, "訊號反轉")

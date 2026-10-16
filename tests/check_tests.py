@@ -187,6 +187,9 @@ NOT_SELECTED_COLUMNS = {
     "exit_backfill": "出場補登記號：重啟時由 load_pending_backfills 另外讀",
     "entry_expected_price": "執行品質，只給網頁看", "entry_slippage_points": "執行品質，只給網頁看",
     "entry_spread_points": "執行品質，只給網頁看", "entry_book_stale": "執行品質，只給網頁看",
+    # r103：持倉中的進場手續費走 partial_state(RUNTIME_STATE_KEYS 的 entry_fee_usd)還原；欄位本身只給平倉紀錄統計用
+    "entry_fee_usd": "持倉中由 partial_state 的 entry_fee_usd 還原；欄位給已平倉統計",
+    "exit_fee_usd": "平倉後",
 }
 
 

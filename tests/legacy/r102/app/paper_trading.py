@@ -41,6 +41,31 @@ logger = logging.getLogger("paper_trading")
 
 PAPER_POLL_SECONDS = int(os.getenv("PAPER_POLL_SECONDS", "15"))
 
+# r102 布林觸軌轉強前瞻測試(band_touch_3600)
+BAND_MAX_HOLD_SECONDS = 12 * 3600          # 回中軌出場最長 12 根1小時K(跟回測的最長持有一樣)
+BAND_ENTRY_WINDOW_SECONDS = 300            # 訊號K收盤後 5 分鐘內才進場：重啟/晚到不追進一根早就收完的K
+
+
+def _held_seconds(position):
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(position["entry_time"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def band_entry_allowed(result, last_bar_ms, now_ms=None):
+    """布林觸軌的進場時機：(可以?, 理由)。同一根K只進一次；訊號K收盤超過 BAND_ENTRY_WINDOW_SECONDS 就不追。"""
+    bar = (result.get("band") or {}).get("bar_close_ms")
+    if bar is None:
+        return False, "布林觸軌：沒有訊號K的收盤時間"
+    if bar == last_bar_ms:
+        return False, "布林觸軌：這根1小時K已經進場過"
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) if now_ms is None else now_ms
+    late = (now_ms - bar) / 1000
+    if late > BAND_ENTRY_WINDOW_SECONDS:
+        return False, f"布林觸軌：訊號K已收盤 {late:.0f} 秒，超過 {BAND_ENTRY_WINDOW_SECONDS} 秒不追"
+    return True, ""
+
 DEFAULT_BUCKET_SIZE = 1.0
 DEFAULT_TRADE_LIMIT = 3000
 
@@ -138,8 +163,11 @@ def _latest_price():
 class PaperTradingEngine:
     def __init__(self, interval_seconds=60, label=None, strategy_type="chan_profile",
                  resonance_min_conditions=4, execution_index=None, engine_id=None,
-                 execution_account="gold", execution_symbol=None):
+                 execution_account="gold", execution_symbol=None, notify_sim=False):
         self.interval_seconds = interval_seconds
+        # r102：純模擬也發 Telegram(前瞻測試要即時知道)。其他引擎維持「只有真實下單才通知」
+        self.notify_sim = notify_sim
+        self._band_last_bar = None   # r102 布林觸軌：上一次進場用的是哪一根1小時K(收盤時間 ms)，同一根只進一次
         self.label = label or f"{interval_seconds}秒K線"
         self.strategy_type = strategy_type
         self.resonance_min_conditions = resonance_min_conditions
@@ -1316,6 +1344,12 @@ class PaperTradingEngine:
             trail_trigger_points = s["paper_trail_trigger_points"]
             trail_distance_points = s["paper_trail_distance_points"]
 
+        band = self.strategy_type == "band_touch"
+        if band:
+            # r102：規則寫死、跟 r101 回測一樣——停損在回拉段極值、不移動停損、不看反向訊號(只靠停損/中軌/時間出場)
+            sl_points = (result.get("band") or {}).get("sl_points") or sl_points
+            trail_trigger_points = trail_distance_points = 1e12
+
         # SMC結構策略：初始停損優先用「OB/FVG區域外緣」算出來的結構停損距離
         # (smc_structure.py的suggested_sl_points)，比固定點數/ATR更貼近這套方法的本意；
         # 算不出來(沒碰到區域)時退回上面的設定值。移動停損仍照設定跑。
@@ -1333,8 +1367,13 @@ class PaperTradingEngine:
             if tp and ((position["direction"] == "bearish" and current_price <= tp)
                        or (position["direction"] == "bullish" and current_price >= tp)):
                 if self._try_claim_close(position):
-                    self._close_position(position, current_price, "觸及結構停利", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
+                    self._close_position(position, current_price, "觸及中軌停利" if band else "觸及結構停利", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
                 position = None
+        if position and band and _held_seconds(position) >= BAND_MAX_HOLD_SECONDS:
+            # r102：最長持有 12 根1小時K(跟回測的 MID_MAX_HOLD 一樣)
+            if self._try_claim_close(position):
+                self._close_position(position, current_price, "持有時間到", bid=result.get("bid"), ask=result.get("ask"), book_stale=result.get("book_stale"))
+            position = None
         if position:
             changed = trading_core.update_trailing_stop(
                 position, current_price, trail_trigger_points, trail_distance_points
@@ -1351,7 +1390,7 @@ class PaperTradingEngine:
 
             exit_reason = trading_core.check_exit(
                 position, current_price, result["stage"], result["direction"],
-                reversal_confirm_count=s["paper_reversal_confirm_count"],
+                reversal_confirm_count=10 ** 6 if band else s["paper_reversal_confirm_count"],
             )
             if exit_reason:
                 # 這裡才第一次呼叫claim：如果快速停損監控已經在這之前搶先關掉這筆倉位，
@@ -1366,7 +1405,8 @@ class PaperTradingEngine:
             # 不擋單(寧可正常運作，不要因為資料不足就整個卡住)。
             choppiness_index = result.get("choppiness_index")
             is_choppy = (
-                s["paper_use_chop_filter"]
+                not band   # r102：布林觸軌跟回測一樣不套震盪濾網
+                and s["paper_use_chop_filter"]
                 and choppiness_index is not None
                 and choppiness_index >= s["paper_chop_threshold"]
             )
@@ -1382,10 +1422,34 @@ class PaperTradingEngine:
             # 趨勢濾網：大週期雙SuperTrend方向跟訊號方向比對(見analysis.trend_filter_allows)
             trend_dir = (result.get("trend_filter") or {}).get("direction")
             trend_ok, trend_note = trend_filter_allows(trend_mode, trend_dir, result["direction"])
+            if band:
+                trend_ok = True   # r102：規則寫死不看趨勢濾網(回測就是趨勢:關)
             if not trend_ok:
                 logger.info(f"{self.label}: {trend_note}")
-            if not is_choppy and not market_closed and not atr_too_low and trend_ok:
+            band_ok = True
+            if band:
+                if self._band_last_bar is None:
+                    self._band_last_bar = self._band_last_bar_from_db()
+                band_ok, band_note = band_entry_allowed(result, self._band_last_bar)
+                if not band_ok:
+                    logger.info(f"{self.label}: {band_note}")
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok and band_ok:
                 self._open_position(result, current_price, sl_points)
+
+    def _band_last_bar_from_db(self):
+        """
+        r102：重啟後記憶體裡沒有「上一次用哪根K進場」。用最近一筆已平倉交易的進場時間推回那根訊號K
+        (進場一定在訊號K收盤後 5 分鐘內，往下取整到整點就是訊號K的收盤時間)，避免重啟後同一根K又進一次。
+        讀不到時回 0(不是 None：這輪不再重查；0 不會等於任何一根K的收盤時間)。
+        """
+        try:
+            ok, rows = db.load_closed_paper_trades(limit=1, engine_id=self.engine_id)
+            if ok and rows:
+                t = datetime.fromisoformat(rows[0]["entry_time"]).timestamp() * 1000
+                return int(t // 3_600_000) * 3_600_000
+        except Exception as e:
+            logger.warning(f"{self.label}: 讀最近一筆交易失敗(只影響重啟後同一根K防重複進場): {e}")
+        return 0
 
     def _load_state(self):
         """從資料庫載入持倉紀錄。讀取失敗就拋出去(由_run_step照節奏推播)，不能當成「沒有持倉」(第8條r37)。"""
@@ -1444,6 +1508,10 @@ class PaperTradingEngine:
         # r89：開倉當下的日線SMC結構(只讀快取、不打網路、不拋例外)。純參考：不影響這次要不要開、怎麼開，
         # 只存進交易紀錄，之後分組統計「順／逆日線結構」的績效
         position["daily_smc"] = daily_smc.tag_for_trade()
+        if self.strategy_type == "band_touch":
+            tp = (signal_result.get("band") or {}).get("tp_price")
+            if tp is not None:
+                position["tp_price"] = float(tp)
         if self.strategy_type == "smc_structure":
             smc = signal_result.get("smc") or {}
             s_ = settings_module.get_settings(engine_id=self.engine_id)
@@ -1454,6 +1522,8 @@ class PaperTradingEngine:
 
         with self._lock:
             self._position = position
+        if self.strategy_type == "band_touch":
+            self._band_last_bar = (signal_result.get("band") or {}).get("bar_close_ms")
 
         logger.info(
             f"模擬單開倉({self.label}): {position['direction']} @ {current_price:.2f} "
@@ -1688,7 +1758,7 @@ class PaperTradingEngine:
         # 純模擬的引擎完全不通知——原本是每個引擎開倉/平倉都會發，四個引擎
         # 全部訊息量太大、變成垃圾訊息，使用者只在意「真的下單了沒有」，
         # 純模擬的部分繼續在dashboard上看就好，不需要即時推播(修正記錄見README)。
-        if is_execution_engine:
+        if is_execution_engine or self.notify_sim:
             try:
                 # 持倉模式/槓桿自動調整的warning一併附在通知裡，讓使用者知道實際用了什麼設定
                 open_note = slippage_note
@@ -2034,7 +2104,7 @@ class PaperTradingEngine:
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}"
             ))
 
-        if is_execution_engine or skip_close_reason:
+        if is_execution_engine or skip_close_reason or self.notify_sim:
             try:
                 # 真實下單引擎的出場通知附上USDT：優先用真實成交價(進出場都有actual_price時)，
                 # 否則用模擬點數×張數估算。XAUUSDT永續1張=1盎司，1點=1 USDT/張。
@@ -2210,12 +2280,20 @@ paper_trading_1h_smc = PaperTradingEngine(
     interval_seconds=3600, label="1小時K SMC結構", strategy_type="smc_structure", execution_index=5,
 )
 
+# r102：布林觸軌轉強的前瞻測試(只在 lab；live 的 LIVE_ENGINE_IDS 沒有它)。純模擬、不綁真實下單，
+# 但開平倉都發 Telegram(notify_sim)。規則跟 r101 回測通過的那組一樣、寫死在 signal_engine.band_touch_cfg()
+paper_trading_1h_band = PaperTradingEngine(
+    interval_seconds=3600, label="1小時K布林觸軌(前瞻)", strategy_type="band_touch", execution_index=6,
+    notify_sim=True,
+)
+
 ALL_PAPER_TRADING_ENGINES = {
     paper_trading_1m.engine_id: paper_trading_1m,
     paper_trading_5m.engine_id: paper_trading_5m,
     paper_trading_15m.engine_id: paper_trading_15m,
     paper_trading_1m_resonance.engine_id: paper_trading_1m_resonance,
     paper_trading_1h_smc.engine_id: paper_trading_1h_smc,
+    paper_trading_1h_band.engine_id: paper_trading_1h_band,
 }
 
 # 依服務角色決定實際載入的引擎(修正記錄見README)：lab全開；live只開LIVE_ENGINE_IDS，

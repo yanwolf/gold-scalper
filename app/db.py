@@ -251,6 +251,15 @@ def init_schema():
                     ALTER TABLE paper_trades
                     ADD COLUMN IF NOT EXISTS daily_smc TEXT;
                 """)
+                # r103：真實下單的實際手續費(USDT，依成交明細的 commission)。NULL＝不知道(查不到、BNB 抵扣、純模擬)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS entry_fee_usd DOUBLE PRECISION;
+                """)
+                cur.execute("""
+                    ALTER TABLE paper_trades
+                    ADD COLUMN IF NOT EXISTS exit_fee_usd DOUBLE PRECISION;
+                """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_settings (
                         key TEXT PRIMARY KEY,
@@ -544,6 +553,25 @@ def update_paper_trade_fills(trade_id, order_id, boundary_id):
             _pool.putconn(conn)
     except Exception as e:
         _db_write_error("記錄成交明細界線", e)
+
+
+def update_paper_trade_fees(trade_id, entry_fee=None, exit_fee=None):
+    """r103：寫進場/出場手續費(USDT)。傳 None 的那一邊不動(COALESCE)；trade_id 是 None 時跳過。"""
+    if not _enabled or trade_id is None or (entry_fee is None and exit_fee is None):
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE paper_trades SET entry_fee_usd = COALESCE(%s, entry_fee_usd), "
+                            "exit_fee_usd = COALESCE(%s, exit_fee_usd) WHERE id = %s;",
+                            (entry_fee, exit_fee, trade_id))
+            conn.commit()
+            _db_write_ok("記錄手續費")
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        _db_write_error("記錄手續費", e)
 
 
 def update_paper_trade_partial_state(trade_id, state):
@@ -851,7 +879,8 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                            entry_book_stale, exit_book_stale,
                            real_open_executed, real_open_quantity,
                            entry_actual_price, exit_actual_price,
-                           sl_price, peak_price, trailing_active, pnl_estimated, daily_smc
+                           sl_price, peak_price, trailing_active, pnl_estimated, daily_smc,
+                           entry_fee_usd, exit_fee_usd
                     FROM paper_trades
                     WHERE status = 'closed' AND engine_id = %s
                     ORDER BY exit_time DESC
@@ -863,7 +892,7 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
         finally:
             _pool.putconn(conn)
 
-        return True, [
+        return True, [_with_fees(
             {
                 "direction": r[0], "entry_price": r[1],
                 "entry_time": r[2].isoformat() if r[2] else None,
@@ -892,13 +921,26 @@ def load_closed_paper_trades(limit=500, engine_id="chan_profile_60"):
                     round(r[6] * r[16], 2)
                     if r[15] and r[16] and isinstance(r[6], (int, float)) and not (r[17] and r[18]) else None
                 ),
-            }
+                "entry_fee_usd": r[24], "exit_fee_usd": r[25],
+            })
             for r in rows
         ]
     except Exception as e:
         # 讀取失敗≠沒有交易(第8條r47)：以前回[]，風控就當成「今天沒虧、沒連虧」，斷路器永遠不會觸發
         logger.error(f"讀取模擬單歷史失敗: {e}")
         return False, f"{type(e).__name__}: {e}"
+
+
+def _with_fees(t):
+    """
+    r103：手續費合計與扣手續費後的真實損益。進出場手續費都知道才算 fee_usd；
+    real_net_usd 只在「真實成交價算的 USDT」和 fee_usd 都有時才算(估算的 USDT 不跟真實手續費混在一起)。
+    """
+    a, b = t.get("entry_fee_usd"), t.get("exit_fee_usd")
+    t["fee_usd"] = round(a + b, 4) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None
+    t["real_net_usd"] = (round(t["real_pnl_usd"] - t["fee_usd"], 2)
+                         if isinstance(t.get("real_pnl_usd"), (int, float)) and t["fee_usd"] is not None else None)
+    return t
 
 
 def get_closed_paper_trades(limit=500, engine_id="chan_profile_60"):

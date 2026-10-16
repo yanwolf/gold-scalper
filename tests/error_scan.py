@@ -38,7 +38,7 @@ def main():
     bf = []
     current = {"test": "(金絲雀)"}   # r76：記下是哪一支測試開的，報出來才找得到
     def spy(t):
-        if t.name == "fill-backfill" and not getattr(getattr(t, "_target", None), "_backfill_selftest", False):
+        if t.name in ("fill-backfill", "fee-backfill") and not getattr(getattr(t, "_target", None), "_backfill_selftest", False):
             bf.append(current["test"])
         return real_start(t)
     class _Result(unittest.TextTestResult):
