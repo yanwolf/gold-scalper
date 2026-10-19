@@ -366,7 +366,7 @@ class R101BandTouch(unittest.TestCase):
         self.assertEqual(cfg(exit_mode=1)["max_hold_hours"], P.MID_MAX_HOLD)
         self.assertEqual(cfg(exit_mode=0, hold_bars=3)["max_hold_hours"], 3)
         self.assertIsNone(P.build_cfg({"mode": 3})[0])
-        self.assertIsNone(P.build_cfg({"exit_mode": 2})[0])
+        self.assertIsNone(P.build_cfg({"exit_mode": 4})[0])   # r104 起 2、3 是合法值
 
     def test_backtest_hits_mid_band(self):
         res = _run(path=BAND_PATH, pr_mode=2, pr_exit_mode=1, pr_sides=1)
@@ -396,3 +396,80 @@ class R101BandTouch(unittest.TestCase):
         self.assertIn('<option value="2">布林觸軌轉強', h)
         self.assertIn("addIfPresent('pr_exit_mode'", h)
         self.assertIn("'・回中軌出場'", h)
+
+
+class R104Exits(unittest.TestCase):
+    """r104：布林觸軌的兩種新出場(對面布林軌、移動停損)、分段卡片的扣成本數字、網頁顯示。"""
+
+    def test_cfg(self):
+        c2, c3, c1 = cfg(mode=2, exit_mode=2), cfg(mode=2, exit_mode=3), cfg(mode=2, exit_mode=1)
+        self.assertEqual((c2["max_hold_hours"], c2["trail_atr"]), (P.MID_MAX_HOLD, 0.0))
+        self.assertEqual((c3["max_hold_hours"], c3["trail_atr"]), (P.MID_MAX_HOLD, P.TRAIL_ATR))
+        self.assertEqual(c1["trail_atr"], 0.0)
+        self.assertIsNone(P.build_cfg({"exit_mode": 4})[0])
+
+    def test_opposite_band_target(self):
+        pre = P.precompute(_bars(BAND_PATH[:43]))
+        r = P.evaluate_at(pre, 42, cfg(mode=2, exit_mode=2), current_price=3991.0)
+        self.assertAlmostEqual(r["mr"]["tp_price"], pre["bb_up"][42])
+        self.assertIn("上軌", r["profile"]["reason"])
+        closes = CALM[:-1] + [4002.0, 4007.0, 4012.0, 4018.0, 4011.0]
+        pre_s = P.precompute(_bars(closes))
+        i = len(closes) - 1
+        rs = P.evaluate_at(pre_s, i, cfg(mode=2, exit_mode=2), current_price=4011.0)
+        self.assertEqual(rs["direction"], "bearish", "前提")
+        self.assertAlmostEqual(rs["mr"]["tp_price"], pre_s["bb_lo"][i], msg="空單停利在下軌")
+
+    def test_trail_mode_has_no_target(self):
+        r = P.evaluate_at(P.precompute(_bars(BAND_PATH[:43])), 42, cfg(mode=2, exit_mode=3), current_price=3991.0)
+        self.assertIsNone(r["mr"]["tp_price"])
+        self.assertIn("移動停損", r["profile"]["reason"])
+
+    def test_backtest_trailing_locks_profit(self):
+        path = CALM + [3995.0, 3990.0, 3984.0, 3991.0, 4004.0, 4012.0, 3995.0, 3970.0, 3970.0, 3970.0, 3970.0, 3970.0]
+        res = _run(path=path, pr_mode=2, pr_exit_mode=3, pr_sides=1)
+        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        self.assertAlmostEqual(t["entry_price"], 3991.0, places=6, msg="前提：同一個進場")
+        self.assertEqual(t["exit_reason"], "觸及移動停損")
+        self.assertGreater(t["exit_price"], 3991.0, "漲上去之後回吐：移動停損鎖住獲利，不會回到原始停損")
+        same = _run(path=path, pr_mode=2, pr_exit_mode=1, pr_sides=1)
+        t1 = sorted(same["recent_trades"], key=lambda t: t["entry_time"])[0]
+        self.assertNotEqual(t1["exit_reason"], "觸及移動停損", "對照：回中軌出場不會有移動停損")
+
+    def test_backtest_opposite_band_hit(self):
+        path = CALM + [3995.0, 3990.0, 3984.0, 3991.0, 4000.0, 4010.0, 4020.0, 4021.0, 4022.0, 4023.0, 4024.0, 4025.0]
+        res = _run(path=path, pr_mode=2, pr_exit_mode=2, pr_sides=1)
+        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        self.assertEqual(t["exit_reason"], "觸及停利")
+        self.assertAlmostEqual(t["exit_price"], t["tp_price"])
+        self.assertGreater(t["tp_price"], P.precompute(_bars(path[:43]))["bb_mid"][42], "目標比中軌遠")
+
+    def test_job_rows_carry_cost_adjusted_numbers(self):
+        from app import backtest_jobs as J
+        res = {"total_trades": 2, "assumed_spread_points": 3.4,
+               "stats_spread_adjusted": {"total_pnl_points": -1.8, "profit_factor": 0.8}, "recent_trades": []}
+        row = J._window_row(0, res, 0, 1)
+        self.assertEqual((row["assumed_spread_points"], row["net_pnl_points"], row["net_profit_factor"]), (3.4, -1.8, 0.8))
+        trades = [{"entry_time": "2026-01-01T00:00:00+00:00", "exit_time": "2026-01-01T01:00:00+00:00",
+                   "pnl_points": 5.0, "direction": "bullish"},
+                  {"entry_time": "2026-01-01T02:00:00+00:00", "exit_time": "2026-01-01T03:00:00+00:00",
+                   "pnl_points": -1.0, "direction": "bullish"}]
+        ag = J._aggregate([{"recent_trades": trades, "assumed_spread_points": 3.4}])
+        self.assertAlmostEqual(ag["net_pnl_points"], 4.0 - 6.8)
+        self.assertEqual(ag["assumed_spread_points"], 3.4)
+        self.assertIsNone(J._aggregate([{"recent_trades": trades, "assumed_spread_points": 0}])["net_pnl_points"])
+
+    def test_dashboard(self):
+        with open(os.path.join(ROOT, "app/static/dashboard.html"), encoding="utf-8") as f:
+            h = f.read()
+        self.assertIn('<option value="2">對面的布林軌', h)
+        self.assertIn('<option value="3">移動停損', h)
+        self.assertIn("if(data.strategy_type === 'band_touch'){", h)
+        self.assertIn("bandTouchConfigHtml(data.label", h)
+        self.assertIn("openPositionReasonsHtml(p, data.strategy_type)", h)
+        self.assertIn("data.strategy_type === 'band_touch');", h, "前瞻引擎的成交紀錄顯示進場/出場設定")
+        self.assertIn("扣成本(每筆", h)
+
+    def test_forward_engine_unchanged(self):
+        from app import signal_engine as SE
+        self.assertEqual(SE.band_touch_cfg()["exit_mode"], 1, "前瞻引擎維持回中軌(規則不中途改)")

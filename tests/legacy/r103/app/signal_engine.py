@@ -22,6 +22,7 @@ STRATEGY_TYPE切換(修正記錄見README)：新增"resonance_fvg"實驗性策�
 """
 
 import os
+import time
 
 from app.binance_client import binance_streamer
 from app.analysis import (
@@ -38,7 +39,58 @@ CHAN_MAX_CANDLES = 600  # 即時路徑從1分鐘K棒快取取樣時，最多餵�
                               # 也沒用，實際能用的資料量是兩者取較小值)
 
 DEFAULT_STRATEGY_TYPE = os.getenv("STRATEGY_TYPE", "chan_profile")  # "chan_profile" / "resonance_fvg" / "smc_structure"
-STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure")
+STRATEGY_TYPES = ("chan_profile", "resonance_fvg", "smc_structure", "band_touch")
+
+# r102：布林觸軌轉強的前瞻測試引擎(band_touch_3600，只在 lab、純模擬)。規則跟 r101 回測通過的那組完全一樣，
+# 寫死、不吃 settings：回拉轉強 mode=2(布林觸軌轉強)、exit_mode=1(回中軌出場，最長12根)、多空都做
+BAND_TOUCH_CFG = None
+BAND_TOUCH_MAX_CANDLES = 200
+
+
+def band_touch_cfg():
+    global BAND_TOUCH_CFG
+    if BAND_TOUCH_CFG is None:
+        from app import pullback_resume
+        cfg, err = pullback_resume.build_cfg({"mode": 2, "exit_mode": 1, "sides": 3})
+        assert err is None, err
+        BAND_TOUCH_CFG = cfg
+    return BAND_TOUCH_CFG
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def signal_band_touch(hourly, current_price, now_ms=None):
+    """
+    布林觸軌轉強的即時判斷：只看「已收盤」的1小時K(進行中那根丟掉)，判斷最後一根已收盤K。
+    回傳跟其他策略一樣格式的結果；「訊號」時多帶 band：{bar_close_ms, sl_points, tp_price, setup}。
+    bar_close_ms 讓引擎判斷「這根K是不是剛收盤」「同一根K進過沒有」。
+    """
+    from app import pullback_resume
+    now_ms = _now_ms() if now_ms is None else now_ms
+    hour_ms = 3_600_000
+    closed = [c for c in (hourly or []) if c["bucket_start"] + hour_ms <= now_ms][-BAND_TOUCH_MAX_CANDLES:]
+    if current_price is None and closed:
+        current_price = closed[-1]["close"]
+    pre = pullback_resume.precompute(closed)
+    i = len(closed) - 1
+    result = pullback_resume.evaluate_at(pre, i, band_touch_cfg(), current_price=current_price) if i >= 0 \
+        else pullback_resume._neutral("沒有已收盤的1小時K")
+    bar_close_ms = closed[-1]["bucket_start"] + hour_ms if closed else None
+    mr = result.get("mr") or {}
+    result["band"] = ({"bar_close_ms": bar_close_ms, "sl_points": mr.get("sl_points"),
+                       "tp_price": mr.get("tp_price"), "setup": mr.get("setup")}
+                      if result.get("stage") == "訊號" else {"bar_close_ms": bar_close_ms})
+    result["current_price"] = current_price
+    result["strategy_type"] = "band_touch"
+    result["trend_filter"] = None
+    result["atr"] = compute_atr(closed)
+    result["choppiness_index"] = None
+    result["emas"] = result["rsi"] = result["macd"] = result["fvgs"] = None
+    result["chan_detail"] = {"interval_seconds": 3600, "source_candle_count": len(closed)}
+    result["profile_detail"] = {"bucket_size": 1.0, "trade_count": 0, "profile": [], "interpretation": None}
+    return result
 
 
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
@@ -68,6 +120,15 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     vs 品質」的取捨(修正記錄見README)。
     """
     strategy_type = strategy_type or DEFAULT_STRATEGY_TYPE
+
+    if strategy_type == "band_touch":
+        # 即時路徑：本地1小時K(含剛收盤那根)接上 REST 歷史補長度
+        if candles is None:
+            candles = build_candles(trades, interval_seconds=3600)
+        hourly = smc_structure.merge_hourly_candles(smc_structure.get_hourly_history(), candles)
+        if current_price is None and trades:
+            current_price = trades[-1]["price"]
+        return signal_band_touch(hourly, current_price)
 
     if strategy_type == "smc_structure":
         # SMC結構策略走獨立的輕量路徑：不算纏論/分價量表(它用不到，而且長天數回測每根
@@ -218,6 +279,8 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     if strategy_type == "smc_structure":
         # SMC結構策略固定用1小時K(不管引擎的interval_seconds怎麼設)，避免誤把它掛在小週期上
         interval_seconds = smc_structure.SMC_INTERVAL_SECONDS
+    elif strategy_type == "band_touch":
+        interval_seconds = 3600
     candles = binance_streamer.get_recent_candles(interval_seconds=interval_seconds, limit=CHAN_MAX_CANDLES)
     # 趨勢濾網用的大週期K棒：丟掉進行中的最後一根，只用已收盤的，方向才不會在同一根K棒內來回翻
     trend_candles = None

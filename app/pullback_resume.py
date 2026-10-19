@@ -16,6 +16,8 @@
 布林觸軌轉強(mode=2，r101)：不看趨勢；回拉段(連續反色K)裡至少一根的低點碰到布林下軌(BOLL 20,2；空單：高點碰上軌)，
 接著同樣的轉強K收回前一根開盤才進場。停損一律放在回拉段的極值(這個模式不管 sl_mode，規則事先定死)。
 出場可選 exit_mode：0=持有 hold_bars 根；1=回到布林中軌(訊號那根的中軌，停利價固定)，最長持有 MID_MAX_HOLD 根。
+r104 加兩種(都是最長 MID_MAX_HOLD 根)：2=對面的布林軌(做多停利在訊號那根的上軌，空單在下軌)；
+3=移動停損(浮盈到 TRAIL_ATR 倍 ATR 啟動，最差保本，之後回吐 TRAIL_ATR 倍 ATR 出場，沒有停利價)。
 中軌不在進場價的獲利方向時，沒有停利價，只靠時間出場。
 
 基準組(mode=1)：同樣的趨勢條件，「任何一根陽線收盤就買、持有一樣久」(空單：任何陰線就賣)。
@@ -28,7 +30,8 @@ from app.mean_reversion import _ema_series, _atr_series
 
 TREND_PERIOD = 20
 BB_PERIOD, BB_K = 20, 2.0
-MID_MAX_HOLD = 12     # exit_mode=1(回中軌)時最長持有幾根
+MID_MAX_HOLD = 12     # exit_mode=1/2/3 時最長持有幾根
+TRAIL_ATR = 1.0       # exit_mode=3：浮盈幾倍 ATR 啟動移動停損、回吐幾倍 ATR 出場
 SLOPE_BARS = 3
 PRE_BARS = 5           # 回拉幅度：從回拉開始前幾根的最高點量起
 MAX_PULLBACK_BARS = 12  # 往回數陰線最多數幾根
@@ -38,7 +41,7 @@ DEFAULT_CFG = {
     "sides": 3,               # 1=只做多 2=只做空 3=多空都做
     "trend": 0,               # 0=EMA20 1=布林中軌(SMA20) 2=不看趨勢
     "mode": 0,                # 0=回拉轉強型態 1=基準組(趨勢裡任何一根同色K) 2=布林觸軌轉強(r101)
-    "exit_mode": 0,           # 0=持有 hold_bars 根 1=回到布林中軌(最長 MID_MAX_HOLD 根)
+    "exit_mode": 0,           # 0=持有 hold_bars 根 1=回到布林中軌 2=對面布林軌 3=移動停損(1~3 最長 MID_MAX_HOLD 根)
     "min_pullback_bars": 1,
     "min_pullback_atr": 0.0,  # 0=不限回拉幅度
     "sl_mode": 0,             # 0=不設停損(持有到時間) 1=停損在回拉段低點(空單：反彈段高點)
@@ -51,7 +54,7 @@ CFG_LIMITS = {
     "sides": (1, 3, int),
     "trend": (0, 2, int),
     "mode": (0, 2, int),
-    "exit_mode": (0, 1, int),
+    "exit_mode": (0, 3, int),
     "min_pullback_bars": (1, 6, int),
     "min_pullback_atr": (0.0, 5.0, float),
     "sl_mode": (0, 1, int),
@@ -80,7 +83,8 @@ def build_cfg(overrides=None):
             return None, f"回拉轉強參數 {k} 要在 {lo}～{hi} 之間，收到 {v}"
         cfg[k] = val
     # 回測迴圈用這個欄位做時間出場
-    cfg["max_hold_hours"] = MID_MAX_HOLD if int(cfg["exit_mode"]) == 1 else int(cfg["hold_bars"])
+    cfg["max_hold_hours"] = MID_MAX_HOLD if int(cfg["exit_mode"]) in (1, 2, 3) else int(cfg["hold_bars"])
+    cfg["trail_atr"] = TRAIL_ATR if int(cfg["exit_mode"]) == 3 else 0.0   # 回測迴圈用這個欄位做移動停損
     return cfg, None
 
 
@@ -223,6 +227,14 @@ def evaluate_at(pre, i, cfg, current_price=None):
             tp_price, exit_note = mid, f"回到布林中軌 {mid:.2f} 停利，最長 {MID_MAX_HOLD} 根"
         else:
             exit_note = f"中軌不在獲利方向，沒有停利價，最長 {MID_MAX_HOLD} 根"
+    elif int(cfg["exit_mode"]) == 2:
+        far = (pre["bb_up"] if sign > 0 else pre["bb_lo"])[i]
+        if far is not None and sign * (far - entry) > 0:
+            tp_price, exit_note = far, f"碰到對面布林{'上' if sign > 0 else '下'}軌 {far:.2f} 停利，最長 {MID_MAX_HOLD} 根"
+        else:
+            exit_note = f"對面布林軌不在獲利方向，沒有停利價，最長 {MID_MAX_HOLD} 根"
+    elif int(cfg["exit_mode"]) == 3:
+        exit_note = f"浮盈 {TRAIL_ATR:g} 倍ATR 後啟動移動停損(最差保本)、回吐 {TRAIL_ATR:g} 倍ATR 出場，最長 {MID_MAX_HOLD} 根"
     return {
         "stage": "訊號", "direction": "bullish" if sign > 0 else "bearish",
         "chan": {"reason": why},

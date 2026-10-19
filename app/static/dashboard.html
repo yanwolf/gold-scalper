@@ -882,6 +882,8 @@
           <option value="">預設(持有固定根數)</option>
           <option value="0">持有固定根數</option>
           <option value="1">回到布林中軌(最長12根)</option>
+          <option value="2">對面的布林軌(最長12根)</option>
+          <option value="3">移動停損：浮盈1倍ATR啟動、最差保本(最長12根)</option>
         </select>
       </div>
       <div class="settings-field">
@@ -2536,7 +2538,48 @@ function renderReadinessBanner(el, readiness){
   `;
 }
 
-function renderTradeList(el, trades, settingsChangedAt){
+// r104：進場理由、進場當下決定的出場設定(例如「中軌不在獲利方向，沒有停利價」)
+function tradeReasonsHtml(t){
+  const parts = [];
+  if(t.chan_reason) parts.push(`進場：${t.chan_reason}`);
+  if(t.profile_reason) parts.push(`出場設定：${t.profile_reason}`);
+  return parts.length ? `<div style="font-size:10px; color:var(--muted); margin-top:2px;">${parts.join('<br/>')}</div>` : '';
+}
+
+function openPositionReasonsHtml(p, strategyType){
+  const lines = [];
+  if(p.chan_reason) lines.push(`<b>進場理由：</b>${p.chan_reason}`);
+  if(p.tp_price != null){
+    lines.push(`<b>停利價：</b><span class="mono">${Number(p.tp_price).toFixed(2)}</span>`);
+  }else if(strategyType === 'band_touch'){
+    lines.push(`<b>停利價：</b>沒有(${(p.profile_reason || '').includes('不在獲利方向') ? '中軌不在獲利方向' : '這筆不設停利'})，只靠停損或時間出場`);
+  }
+  if(p.profile_reason) lines.push(`<b>出場設定：</b>${p.profile_reason}`);
+  if(strategyType === 'band_touch' && p.entry_time){
+    const until = new Date(new Date(p.entry_time).getTime() + 12 * 3600 * 1000);
+    lines.push(`<b>最長持有到：</b>${until.toLocaleString('zh-TW')}(進場後 12 小時，時間到就出場)`);
+  }
+  return lines.length ? `<div style="font-size:11px; color:var(--muted); line-height:1.7; margin:6px 2px 0;">${lines.join('<br/>')}</div>` : '';
+}
+
+function bandTouchConfigHtml(label, s){
+  const row = (k, v, cls) => `<div class="cfg-row"><span class="cfg-label">${k}</span><span class="cfg-value ${cls || ''}">${v}</span></div>`;
+  return `
+    <div class="active-config-card">
+      <div class="cfg-title">目前策略設定（${label}）— 規則寫死，跟 r101 回測通過的那組一樣，不吃全域設定</div>
+      ${row('策略', '布林觸軌轉強(1小時K，多空都做)', 'on')}
+      ${row('進場', '回拉段碰布林軌(20,2)後，轉強K收回前一根開盤；訊號K收盤 5 分鐘內才進')}
+      ${row('停損', '回拉段的極值，不移動停損')}
+      ${row('停利', '訊號那根的布林中軌(不在獲利方向時沒有停利價)')}
+      ${row('最長持有', '12 小時')}
+      ${row('不看', '趨勢濾網、震盪濾網、反向訊號、ATR停損設定', 'off')}
+      ${row('休市不開新倉', s.paper_block_market_closed ? '開啟(照設定)' : '關閉(照設定)', s.paper_block_market_closed ? 'on' : '')}
+      ${row('最小ATR門檻', Number(s.paper_min_atr_points) > 0 ? s.paper_min_atr_points + 'pt(照設定)' : '不限制(照設定)')}
+      ${row('真實下單', '不下單(純模擬，開平倉發 Telegram)')}
+    </div>`;
+}
+
+function renderTradeList(el, trades, settingsChangedAt, showReasons){
   if(!trades || trades.length === 0){
     el.innerHTML = '<div class="empty">尚無已平倉紀錄</div>';
     return;
@@ -2589,7 +2632,7 @@ function renderTradeList(el, trades, settingsChangedAt){
       ${dividerHtml}
       <div class="paper-trade-row ${isOld ? 'is-old-settings' : ''}">
         <span class="dir ${t.direction}">${dirLabel}</span>
-        <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）${stopInfo}</span>
+        <span class="meta">${t.entry_price.toFixed(2)} → ${t.exit_price.toFixed(2)}（${t.exit_reason}，${exitTime}）${stopInfo}${showReasons ? tradeReasonsHtml(t) : ''}</span>
         <span class="pnl ${pnlClass}">${pnlText}</span>
       </div>
     `;
@@ -2806,7 +2849,7 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     if(pr){
       strategyHtml += `<div class="cfg-row"><span class="cfg-label">回拉轉強</span><span class="cfg-value on">${{0:'回拉轉強型態', 1:'基準組(趨勢裡任何同色K)', 2:'布林觸軌轉強'}[Number(pr.mode)]}／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(pr.sides)]}</span></div>`
         + `<div class="cfg-row"><span class="cfg-label">條件</span><span class="cfg-value">${Number(pr.mode) === 2 ? '不看趨勢、回拉段碰布林軌' : '趨勢' + {0:'EMA20', 1:'布林中軌', 2:'不看'}[Number(pr.trend)]}／回拉≥${pr.min_pullback_bars}根${Number(pr.min_pullback_atr) > 0 ? '、≥' + pr.min_pullback_atr + '×ATR' : ''}</span></div>`
-        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">${Number(pr.exit_mode) === 1 ? '回到布林中軌(最長12根)' : '持有' + pr.hold_bars + '根後收盤出場'}／${Number(pr.sl_mode) === 1 || Number(pr.mode) === 2 ? '停損在回拉低點' : '不設停損'}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">${({1:'回到布林中軌(最長12根)', 2:'對面的布林軌(最長12根)', 3:'移動停損：浮盈1倍ATR啟動、回吐1倍ATR出場(最長12根)'})[Number(pr.exit_mode)] || ('持有' + pr.hold_bars + '根後收盤出場')}／${Number(pr.sl_mode) === 1 || Number(pr.mode) === 2 ? '停損在回拉低點' : '不設停損'}</span></div>`
         + `<div class="cfg-row"><span class="cfg-label">注意</span><span class="cfg-value">下面的停損點數/ATR倍數這個策略不用</span></div>`;
     }
     if(m){
@@ -2867,6 +2910,11 @@ function renderPaperTrading(data, t){
     }
   }
   renderActiveConfig(document.getElementById(t.activeConfigId), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
+  if(data.strategy_type === 'band_touch'){
+    // r104：布林觸軌前瞻引擎的規則寫死、不吃設定——不顯示全域的停損/濾網設定，改列它實際用的規則
+    const cfgEl = document.getElementById(t.activeConfigId);
+    if(cfgEl) cfgEl.innerHTML = bandTouchConfigHtml(data.label, data.active_settings || {});
+  }
   const ovCount = Object.keys(data.engine_overrides || {}).length;
   if(ovCount){
     const title = document.querySelector('#' + t.activeConfigId + ' .cfg-title');
@@ -2897,6 +2945,8 @@ function renderPaperTrading(data, t){
       `;
     }
 
+    // r104：進場理由、出場設定(停利價／沒有停利價)、最長持有到幾點。以前要查資料庫才看得到
+    const reasonHtml = openPositionReasonsHtml(p, data.strategy_type);
     t.paperOpenPosition.innerHTML = `
       <div class="paper-position-card ${p.direction}">
         <span>
@@ -2906,6 +2956,7 @@ function renderPaperTrading(data, t){
         </span>
         <span class="mono">停損 ${p.sl_price.toFixed(2)} / 峰值 ${p.peak_price.toFixed(2)}</span>
       </div>
+      ${reasonHtml}
       ${livePriceHtml}
     `;
   }else{
@@ -2942,7 +2993,7 @@ function renderPaperTrading(data, t){
     ddEl.innerHTML += reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場（純參考，不影響下單）');
   }
 
-  renderTradeList(t.paperTradeList, data.recent_trades, data.settings_changed_at);
+  renderTradeList(t.paperTradeList, data.recent_trades, data.settings_changed_at, data.strategy_type === 'band_touch');
 }
 
 function renderSlippageImpact(el, si, data){
@@ -3541,7 +3592,7 @@ function renderBacktestResult(data, el){
 
     renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
     setupBacktestApply(data);
-    renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades);
+    renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades, null, data.strategy_type === 'pullback_resume');
     // 回測筆數動輒上百筆，預設收合避免把績效數字擠到看不到，要看細節再展開
     // (修正記錄見README)
     document.getElementById('backtestTradesToggle').addEventListener('click', () => {
@@ -3590,7 +3641,7 @@ function btParamLabel(p){
     parts.push('回拉轉強' + ({1:'基準組', 2:'・布林觸軌'}[Number(p.pr_mode)] || '') + ({1:'多', 2:'空'}[Number(p.pr_sides)] || '')
       + (band ? '' : ({1:'・布林', 2:'・不看趨勢'}[Number(p.pr_trend)] || ''))
       + (band || Number(p.pr_sl_mode) === 1 ? '・回拉低點停損' : '・無停損')
-      + (Number(p.pr_exit_mode) === 1 ? '・回中軌出場' : (Number(p.pr_hold_bars) > 1 ? `・持有${Number(p.pr_hold_bars)}根` : '')));
+      + (({1:'・回中軌出場', 2:'・對面軌出場', 3:'・移動停損出場'})[Number(p.pr_exit_mode)] || (Number(p.pr_hold_bars) > 1 ? `・持有${Number(p.pr_hold_bars)}根` : '')));
   }
   const dm = Number(p.daily_smc_filter_mode || 0);
   parts.push(dm === 3 ? `日線:逆勢×${p.daily_smc_against_weight ?? 0.5}` : ({0:'日線:不濾', 1:'日線:擋逆勢', 2:'日線:嚴格'}[dm] || `日線:模式${dm}`));
@@ -3628,6 +3679,7 @@ function btWinCard(title, bias, r, extraClass, idx){
       <div><div class="lbl">PF</div><div class="num mono">${btPf(r)}</div></div>
       <div><div class="lbl">回撤</div><div class="num mono">${r.total_trades ? Number(r.max_drawdown_points).toFixed(1) : '--'}</div></div>
     </div>
+    ${Number(r.assumed_spread_points) > 0 && r.total_trades ? `<div class="bt-win-split">扣成本(每筆 ${Number(r.assumed_spread_points)} 點)：損益 <span class="${r.net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.net_pnl_points)}</span>，PF ${r.net_profit_factor != null ? Number(r.net_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
   </div>`;
 }
