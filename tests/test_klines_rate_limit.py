@@ -371,3 +371,76 @@ class Preflight(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpotKlines(Base):
+    """r106：現貨K線(PAXGUSDT@spot，長歷史回測用)。"""
+
+    def test_split_symbol(self):
+        self.assertEqual(B.split_symbol("PAXGUSDT@spot"), ("PAXGUSDT", "spot"))
+        self.assertEqual(B.split_symbol("PAXGUSDT"), ("PAXGUSDT", "futures"))
+        self.assertEqual(B.split_symbol("XAUUSDT"), ("XAUUSDT", "futures"))
+
+    def test_fetch_spot_uses_spot_symbol_limit_and_market(self):
+        calls = []
+        end = 1_780_000_000_000 - 1
+        st = end - 86_400_000 + 1
+        page = [[st + i * 60_000, "1", "1", "1", "1", "1", st + i * 60_000 + 59_999] for i in range(1000)]
+
+        def fake(params, mode="batch", market="futures", source=None):
+            calls.append((dict(params), mode, market))
+            return page if len(calls) == 1 else page[:440]
+        with mock.patch.object(W, "get_klines", side_effect=fake):
+            out = B.fetch_historical_klines(symbol="PAXGUSDT@spot", days=1, end_time_ms=end)
+        self.assertEqual([c[2] for c in calls], ["spot", "spot"])
+        self.assertEqual(calls[0][0]["symbol"], "PAXGUSDT", "送出去的商品代號不帶 @spot")
+        self.assertEqual(calls[0][0]["limit"], 1000, "現貨一頁最多 1000 根")
+        self.assertEqual(len(calls), 2, "第二頁不滿 1000 根就停")
+        self.assertEqual(len(out), 1440)
+
+    def test_futures_still_uses_futures(self):
+        with mock.patch.object(W, "get_klines", return_value=[]) as g:
+            B.fetch_historical_klines(symbol="PAXGUSDT", days=1, end_time_ms=1_780_000_000_000 - 1)
+        self.assertEqual(g.call_args.kwargs["market"], "futures")
+        self.assertEqual(g.call_args.args[0]["limit"], B.MAX_KLINES_PER_REQUEST)
+
+    def test_spot_url_and_separate_weight(self):
+        urls = []
+
+        def get(url, params=None, timeout=None, **kw):
+            urls.append(url)
+            return R(200, {"X-MBX-USED-WEIGHT-1M": "2500"})
+        with mock.patch.object(W.requests, "get", side_effect=get):
+            W.get_klines({"x": 1}, mode="batch", market="spot")
+            W.get_klines({"x": 1}, mode="batch", market="spot")
+        self.assertEqual(urls, [W.SPOT_KLINES_URL] * 2)
+        self.assertEqual(self.sleeps, [], "現貨上限 6000，用到 2500 不用等")
+        self.assertEqual(W.used_this_minute("spot"), 2500)
+        self.assertEqual(W.used_this_minute(), 0, "現貨的權重不算進期貨(期貨即時路徑不受影響)")
+
+    def test_spot_pauses_at_its_own_threshold(self):
+        self.respond(R(200, {"X-MBX-USED-WEIGHT-1M": str(W.SPOT_PAUSE_AT)}), R(200))
+        W.get_klines({"x": 1}, market="spot")
+        W.get_klines({"x": 1}, market="spot")
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_spot_429_blocks_everything(self):
+        self.respond(R(429, {"Retry-After": "30"}), R(200))
+        W.get_klines({"x": 1}, market="spot")
+        self.assertEqual(self.sleeps, [30.0])
+        self.respond(R(429, {"Retry-After": "30"}))
+        with self.assertRaises(W.BinanceRateLimited):
+            W.get_klines({"x": 1}, mode="live")
+        self.assertEqual(len(self.calls), 2, "現貨被 429 之後的冷卻，期貨即時路徑一樣不送")
+
+    def test_spot_is_batch_only(self):
+        with self.assertRaises(ValueError):
+            W.get_klines({"x": 1}, mode="live", market="spot")
+
+    def test_dashboard_and_label(self):
+        with open(os.path.join(ROOT, "app/static/dashboard.html"), encoding="utf-8") as f:
+            h = f.read()
+        self.assertIn('<option value="PAXGUSDT@spot">', h)
+        self.assertIn('<option value="PAXGUSDT">', h)
+        self.assertIn("p.symbol.replace('@spot', '現貨')".replace("p.symbol", "String(p.symbol)"), h)
+        self.assertIn("symbol", J.LABEL_PARAM_KEYS)

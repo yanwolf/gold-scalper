@@ -45,7 +45,7 @@ def _iso(ms):
 
 
 # r91：清單上要分得出哪個任務是哪組設定——summary 帶這幾個關鍵參數
-LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
+LABEL_PARAM_KEYS = ("symbol", "interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
                     "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
                     # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
                     "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode",

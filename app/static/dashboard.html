@@ -689,6 +689,8 @@
     <select id="backtestSymbol">
       <option value="XAUUSDT" selected>黃金 XAUUSDT</option>
       <option value="BTCUSDT">比特幣 BTCUSDT</option>
+      <option value="PAXGUSDT">黃金代幣 PAXGUSDT 期貨(2025/3 起)</option>
+      <option value="PAXGUSDT@spot">黃金代幣 PAXGUSDT 現貨(長歷史，只能回測)</option>
     </select>
     <select id="backtestBucketSize">
       <option value="1">箱寬 1(適合黃金)</option>
@@ -3701,6 +3703,8 @@ function btSplitText(bd){
 function btParamLabel(p){
   if(!p) return '參數不明';
   const parts = [];
+  // r106：不是 XAUUSDT 的回測，標籤最前面標出商品
+  if(p.symbol && p.symbol !== 'XAUUSDT') parts.push(String(p.symbol).replace('@spot', '現貨'));
   if(p.interval_seconds) parts.push(p.interval_seconds >= 3600 ? `${p.interval_seconds/3600}小時K` : `${p.interval_seconds/60}分K`);
   if(p.strategy_type === 'smc_structure') parts.push('SMC');
   else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');

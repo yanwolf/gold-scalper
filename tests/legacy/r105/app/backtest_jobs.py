@@ -48,12 +48,15 @@ def _iso(ms):
 LABEL_PARAM_KEYS = ("interval_seconds", "strategy_type", "daily_smc_filter_mode", "daily_smc_against_weight",
                     "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
                     # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
-                    "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode")
+                    "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode",
+                    "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides")
 # 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
 _MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
                  "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",
                                      "sl_mode": "pr_sl_mode", "hold_bars": "pr_hold_bars",
-                                     "exit_mode": "pr_exit_mode"}}
+                                     "exit_mode": "pr_exit_mode"},
+                 "breakout_trend": {"channel": "bo_channel", "big_bar_atr": "bo_big_bar_atr", "trend": "bo_trend",
+                                    "sides": "bo_sides"}}
 
 
 def _label_params(job):
@@ -115,6 +118,11 @@ def _window_row(idx, res, start_ms, end_ms):
               "daily_bias_days", "daily_smc_breakdown", "skipped_daily_smc", "skipped_trend", "daily_smc_error",
               "skipped_cooldown", "data_gap_note"):
         row[k] = res.get(k)
+    # r104：扣成本(假設價差＋手續費，每筆 assumed_spread_points 點)後的損益與 PF，分段卡片直接看得到
+    adj = res.get("stats_spread_adjusted") or {}
+    row["assumed_spread_points"] = res.get("assumed_spread_points")
+    row["net_pnl_points"] = adj.get("total_pnl_points")
+    row["net_profit_factor"] = adj.get("profit_factor")
     return row
 
 
@@ -124,7 +132,14 @@ def _aggregate(results):
         if isinstance(r, dict) and not r.get("error"):
             trades.extend(r.get("recent_trades") or [])
     st = trading_stats.compute_stats(trades)
+    # r104：扣成本的合計(各段用同一個假設成本；取第一個有結果的段)
+    cost = next((float(r.get("assumed_spread_points") or 0) for r in results
+                 if isinstance(r, dict) and not r.get("error")), 0.0)
+    net = trading_stats.compute_stats(trades, spread_cost_points=cost) if cost > 0 else None
     return {"total_trades": st["total_trades"], "win_rate": st["win_rate"], "total_pnl_points": st["total_pnl_points"],
+            "assumed_spread_points": cost,
+            "net_pnl_points": net["total_pnl_points"] if net else None,
+            "net_profit_factor": net["profit_factor"] if net else None,
             "profit_factor": st["profit_factor"],
             "profit_factor_infinite": st["profit_factor"] is None and st["total_trades"] > 0,
             "max_drawdown_points": st["max_drawdown_points"],
