@@ -82,7 +82,7 @@ class TelegramNotifier:
     def notify_trade_event(self, action, label, direction, price, exit_reason=None, pnl_points=None,
                             executed=None, execution_error=None, skip_reason=None, account="gold",
                             slippage_note=None, quantity=None, real_pnl_usd=None, stop_note=None,
-                            real_pnl_estimated=False, exchange_note=None):
+                            real_pnl_estimated=False, exchange_note=None, fee_usd=None, fee_pending=False):
         """
         模擬單引擎實際開倉/平倉時呼叫這個方法發送通知。
 
@@ -170,6 +170,11 @@ class TelegramNotifier:
                 + (f"（{quantity:g} 張 ≈ {'+' if real_pnl_usd >= 0 else ''}"
                    f"{real_pnl_usd:.2f} USDT"
                    f"{'，含估算' if real_pnl_estimated else '，依真實成交價'}）" if quantity and real_pnl_usd is not None else "")
+                # r103：實際手續費(成交明細的 commission)。真正進帳戶的是扣掉它之後的淨額
+                + (f"\n手續費：−{fee_usd:.2f} USDT，扣除後淨 {'+' if real_pnl_usd - fee_usd >= 0 else ''}{real_pnl_usd - fee_usd:.2f} USDT"
+                   if quantity and real_pnl_usd is not None and fee_usd is not None else "")
+                + (f"\n手續費：−{fee_usd:.2f} USDT" if quantity and real_pnl_usd is None and fee_usd is not None else "")
+                + ("\n手續費：成交明細還沒出來，背景補查中(網頁稍後更新淨損益)" if quantity and fee_usd is None and fee_pending else "")
                 + "\n\n"
                 f"{execution_note}"
             )

@@ -122,6 +122,8 @@ FILL_MAX_PAGES = 10        # 界線之後超過這麼多頁就當成沒拿完、
 # 成交價背景補登(第15條r71)：送單當下訂單回應、查訂單、成交明細都拿不到均價時，隔這些秒數各再查一次(累計約2分多)。
 # 實盤2026-09-25：回應FILLED卻沒有avgPrice，1秒內的兩次補救都落空，其實幾秒後成交明細就查得到了
 FILL_BACKFILL_DELAYS = (3, 10, 30, 90)
+# r103：手續費(成交明細的 commission)平倉當下查不到時，背景隔這些秒數各再查一次，查到只寫資料庫、不另外通知
+FEE_BACKFILL_DELAYS = (3, 10, 30)
 
 
 # 部分出場狀態(第15條r74)：這幾個欄位一變就整份寫進資料庫，重啟後還原
@@ -135,6 +137,7 @@ RUNTIME_STATE_KEYS = PARTIAL_STATE_KEYS + (
     "tp_price",                                         # SMC 結構停利(以前註明「純記憶體」，r85 起存)
     "pending_reversal_direction", "pending_reversal_count",   # 反轉出場的連續確認計數
     "backstop_price", "backstop_hedge",                 # 交易所停損的觸發價與下單時的持倉模式(撤舊單要用)
+    "entry_fee_usd",                                    # r103：進場手續費(USDT)，平倉時跟出場手續費一起寫進紀錄
 )
 # 刻意不存的(寫明理由；靜態檢查要求每個執行時長出來的鍵不是在上面、就是在這裡)
 NOT_RESTORED_KEYS = {
@@ -144,6 +147,11 @@ NOT_RESTORED_KEYS = {
     "real_open_pending_until": "開倉回應不明的確認期限：r33 起缺期限就當成已逾時、立刻逐幣確認",
     "real_qty_for_pnl": "平倉當下才設、同一次結帳就用完",
 }
+
+
+def _start_fee_thread(fn):
+    """r103：手續費背景補查的執行緒(跟成交價補登分開，測試框架預設一律收下來、不真的開)。"""
+    threading.Thread(target=fn, daemon=True, name="fee-backfill").start()
 
 
 def _start_backfill_thread(fn):
@@ -629,6 +637,14 @@ class PaperTradingEngine:
                 q = sum(float(t["qty"]) for t in own_rows)
                 if q > 0 and q >= (position.get("real_open_quantity") or 0) - 1e-9:
                     position["entry_actual_price"] = round(sum(float(t["price"]) * float(t["qty"]) for t in own_rows) / q, 6)
+            if own_rows and position.get("entry_fee_usd") is None:
+                # r103：進場手續費。成交明細湊滿這張單的數量才算(只出現一部分就等平倉時再查)
+                q = sum(float(t["qty"]) for t in own_rows)
+                if q >= (position.get("real_open_quantity") or 0) - 1e-9:
+                    fee = execution_module.commission_usdt(own_rows)
+                    if fee is not None:
+                        position["entry_fee_usd"] = fee
+                        db.update_paper_trade_fees(position.get("id"), entry_fee=fee)
             boundary = max(own) if own else (max(ids) if ids else None)
             if boundary is None:
                 return
@@ -658,6 +674,43 @@ class PaperTradingEngine:
         except Exception as e:
             logger.error(f"用成交明細算均價失敗({self.label}): {e}")
             return None
+
+    def _order_fee(self, order_id, want_qty):
+        """
+        r103：這張單的實際手續費(USDT)，依成交明細的 commission。成交明細沒湊滿這張單的數量(還沒寫完)、
+        不是用 USDT 付(BNB 抵扣)、查不到：回 None(不知道，不估算)。不丟例外。
+        """
+        try:
+            if order_id is None:
+                return None
+            ok, trades = execution_module.get_user_trades(symbol=self.execution_symbol, account=self.execution_account)
+            rows = [t for t in trades if str(t.get("orderId")) == str(order_id)] if ok and isinstance(trades, list) else []
+            q = sum(float(t["qty"]) for t in rows)
+            if not rows or (want_qty and q < float(want_qty) - 1e-9):
+                return None
+            return execution_module.commission_usdt(rows)
+        except Exception as e:
+            logger.error(f"查手續費失敗({self.label}): {e}")
+            return None
+
+    def _run_fee_backfill(self, ctx):
+        """背景補查手續費(r103)：查到就寫資料庫，網頁的淨損益自動更新；全部查不到維持未知。不丟例外。"""
+        try:
+            for delay in FEE_BACKFILL_DELAYS:
+                time.sleep(delay)
+                if ctx["entry_fee"] is None:
+                    ctx["entry_fee"] = self._order_fee(ctx["open_oid"], ctx["open_qty"])
+                    if ctx["entry_fee"] is not None:
+                        db.update_paper_trade_fees(ctx["trade_id"], entry_fee=ctx["entry_fee"])
+                if ctx["exit_fee"] is None and ctx["close_oid"] is not None:
+                    ctx["exit_fee"] = self._order_fee(ctx["close_oid"], ctx["close_qty"])
+                    if ctx["exit_fee"] is not None:
+                        db.update_paper_trade_fees(ctx["trade_id"], exit_fee=ctx["exit_fee"])
+                if ctx["entry_fee"] is not None and (ctx["exit_fee"] is not None or ctx["close_oid"] is None):
+                    return
+            logger.warning(f"手續費補查放棄({self.label})：紀錄{ctx['trade_id']}，網頁顯示未知")
+        except Exception as e:
+            logger.error(f"手續費補查出錯({self.label}): {e}")
 
     def _order_fill_price(self, order_id, want_qty):
         """補登用：這張單的實際成交均價。先查訂單(avgPrice、cumQuote)，再查成交明細(數量要湊滿)；都沒有回None。"""
@@ -1890,6 +1943,7 @@ class PaperTradingEngine:
         close_filled_qty = None
         backfill_order = None   # 平倉單成交了但當下拿不到均價：結帳、通知之後排背景補登(第15條r71)
         backfill_fills = None   # 要用「界線之後的平倉成交」補登時要湊滿的數量(r72)
+        close_order = None      # r103：成交的平倉單(查出場手續費用)。交易所端平掉/分段平倉時沒有(手續費記未知)
         if is_execution_engine and real_open is False:
             is_execution_engine = False
             skip_close_reason = "開倉當時未送出真實下單(被風控擋下或失敗)，此筆帳面部位出場不送真實平倉單"
@@ -1918,6 +1972,7 @@ class PaperTradingEngine:
                 executed = success
                 filled = bool(success)
                 if success:
+                    close_order = result
                     logger.info(f"同步平倉成功({self.label}): {result}")
                     actual_fill_price = execution_module.extract_fill_price(result) or self._fill_vwap_by_order(result)
                     exit_actual_price = actual_fill_price
@@ -2002,6 +2057,7 @@ class PaperTradingEngine:
                     ok_r, res_r = False, str(e)
                 if ok_r:
                     executed, execution_error = True, None
+                    close_order = res_r
                     exit_actual_price = execution_module.extract_fill_price(res_r) or self._fill_vwap_by_order(res_r)
                     if not exit_actual_price:
                         backfill_order = res_r
@@ -2096,6 +2152,8 @@ class PaperTradingEngine:
                 logger.error(f"查詢backstop成交價失敗({self.label}): {e}")
 
         self._safe("出錯次數收尾", self._end_position_step_errors)
+        fees = self._safe("手續費", lambda: self._close_fees(position, executed, close_order, close_filled_qty),
+                          default=None) or {"entry": None, "exit": None, "total": None, "pending": False, "real": False}
         pnl_txt = f"{closed_record['pnl_points']:+.2f}" if closed_record.get("pnl_points") is not None else "未知"
         logger.info(f"模擬單平倉({self.label}): {position.get('direction')} @ {exit_price} ({exit_reason}, 損益:{pnl_txt})")
         if failed_closes:
@@ -2140,6 +2198,7 @@ class PaperTradingEngine:
                     account=self.execution_account, slippage_note=slippage_note,
                     quantity=qty, real_pnl_usd=real_pnl_usd, stop_note=stop_note,
                     real_pnl_estimated=bool(position.get("usd_estimated")) and real_pnl_usd is not None,
+                    fee_usd=fees["total"], fee_pending=fees["pending"],
                 )
             except Exception as e:
                 logger.error(f"平倉通知發送失敗({self.label}): {e}")
@@ -2151,6 +2210,41 @@ class PaperTradingEngine:
                 self._clear_backfill_mark(backfill_ctx, "found_elsewhere")
             else:
                 self._safe("排成交價補登", lambda: self._start_fill_backfill(backfill_ctx))
+
+    def _close_fees(self, position, executed, close_order, close_filled_qty):
+        """
+        r103：這筆真實單的進出場手續費(USDT，依成交明細)。寫進資料庫；查不到的排背景補查。
+        回傳 {entry, exit, total, pending, real}：total 只在兩邊都知道時才有；pending＝背景還在查。
+        分段平倉(partial_close_filled)只有最後一張單的單號，出場手續費不完整 → 記未知(不補查)。
+        交易所端平掉(停損單觸發、App 平倉)沒有我們的平倉單號 → 出場手續費未知。
+        """
+        out = {"entry": None, "exit": None, "total": None, "pending": False, "real": False}
+        if not position.get("real_open_executed"):
+            return out
+        out["real"] = True
+        entry = position.get("entry_fee_usd")
+        open_oid = position.get("real_open_order_id")
+        open_qty = position.get("close_orig_qty") or position.get("real_open_quantity")
+        if entry is None and open_oid is not None:
+            entry = self._order_fee(open_oid, open_qty)
+        close_oid = None
+        if executed and isinstance(close_order, dict) and not position.get("partial_close_filled"):
+            close_oid = close_order.get("orderId")
+        close_qty = close_filled_qty or position.get("real_open_quantity")
+        exit_fee = self._order_fee(close_oid, close_qty) if close_oid is not None else None
+        if entry is not None or exit_fee is not None:
+            db.update_paper_trade_fees(position.get("id"), entry_fee=entry, exit_fee=exit_fee)
+        out.update(entry=entry, exit=exit_fee)
+        if entry is not None and exit_fee is not None:
+            out["total"] = round(entry + exit_fee, 6)
+        missing_entry = entry is None and open_oid is not None
+        missing_exit = exit_fee is None and close_oid is not None
+        if (missing_entry or missing_exit) and position.get("id") is not None:
+            ctx = {"trade_id": position.get("id"), "open_oid": open_oid, "open_qty": open_qty,
+                   "close_oid": close_oid, "close_qty": close_qty, "entry_fee": entry, "exit_fee": exit_fee}
+            _start_fee_thread(lambda: self._run_fee_backfill(ctx))
+            out["pending"] = True
+        return out
 
     def get_summary(self, limit=50):
         """

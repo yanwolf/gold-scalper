@@ -229,7 +229,7 @@ class Isolation(unittest.TestCase):
         self.assertIn('<option value="mean_reversion">', h)
         for k in ("mr_setups", "mr_rsi_level", "mr_sl_atr", "mr_max_hold_hours"):
             self.assertIn(f"addIfPresent('{k}'", h)
-        self.assertIn("data.strategy_type === 'mean_reversion' || data.strategy_type === 'pullback_resume') ?", h, "沒有引擎：不顯示套用按鈕")
+        self.assertIn("(data.strategy_type === 'mean_reversion' || data.strategy_type === 'pullback_resume'", h, "沒有引擎：不顯示套用按鈕")
 
 
 if __name__ == "__main__":

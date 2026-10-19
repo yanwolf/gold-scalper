@@ -25,8 +25,19 @@ def real_usd_summary(trades):
     known = [t["real_pnl_usd"] for t in real if num(t.get("real_pnl_usd"))]
     est = [t["real_pnl_usd_est"] for t in real if not num(t.get("real_pnl_usd")) and num(t.get("real_pnl_usd_est"))]
     unknown = len(real) - len(known) - len(est)
-    return {"total": round(sum(known) + sum(est), 2), "known": len(known), "estimated": len(est),
-            "estimated_total": round(sum(est), 2), "unknown": unknown}
+    # r103：實際手續費(成交明細 commission)。只加總知道的；不知道的筆數另外列，淨額只在全部都知道時才算
+    fee_rows = [t for t in real if num(t.get("fee_usd"))]
+    fee_total = round(sum(t["fee_usd"] for t in fee_rows), 2)
+    fee_unknown = len(real) - len(fee_rows)
+    qty = sum(float(t.get("real_open_quantity") or 0) for t in fee_rows)
+    total = round(sum(known) + sum(est), 2)
+    return {"total": total, "known": len(known), "estimated": len(est),
+            "estimated_total": round(sum(est), 2), "unknown": unknown,
+            "fee_total": fee_total, "fee_known": len(fee_rows), "fee_unknown": fee_unknown,
+            # 扣手續費後的淨額：手續費有任何一筆不知道就不算(不然會把「少扣」當成「賺比較多」)
+            "net_total": round(total - fee_total, 2) if real and fee_unknown == 0 else None,
+            # 每張每筆(一進一出)平均手續費＝等於幾點成本：給回測「假設價差」當參考
+            "fee_per_unit_round_trip": round(fee_total / qty, 3) if qty > 0 else None}
 
 
 def compute_stats(trades, spread_cost_points=0.0):

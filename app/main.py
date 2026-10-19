@@ -1065,6 +1065,14 @@ async def backtest_run(
     pr_sl_mode: Optional[int] = None,
     pr_hold_bars: Optional[int] = None,
     pr_exit_mode: Optional[int] = None,
+    bo_channel: Optional[int] = None,
+    bo_big_bar_atr: Optional[float] = None,
+    bo_trend: Optional[int] = None,
+    bo_sides: Optional[int] = None,
+    bo_sl_atr: Optional[float] = None,
+    bo_trail_trigger_atr: Optional[float] = None,
+    bo_trail_atr: Optional[float] = None,
+    bo_max_hold_days: Optional[int] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -1143,6 +1151,9 @@ async def backtest_run(
         pr_sides=pr_sides, pr_trend=pr_trend, pr_mode=pr_mode, pr_min_pullback_bars=pr_min_pullback_bars,
         pr_min_pullback_atr=pr_min_pullback_atr, pr_sl_mode=pr_sl_mode, pr_hold_bars=pr_hold_bars,
         pr_exit_mode=pr_exit_mode,
+        bo_channel=bo_channel, bo_big_bar_atr=bo_big_bar_atr, bo_trend=bo_trend, bo_sides=bo_sides,
+        bo_sl_atr=bo_sl_atr, bo_trail_trigger_atr=bo_trail_trigger_atr, bo_trail_atr=bo_trail_atr,
+        bo_max_hold_days=bo_max_hold_days,
     )
 
 
@@ -1195,6 +1206,14 @@ def _backtest_job_params(
     pr_sl_mode: Optional[int] = None,
     pr_hold_bars: Optional[int] = None,
     pr_exit_mode: Optional[int] = None,
+    bo_channel: Optional[int] = None,
+    bo_big_bar_atr: Optional[float] = None,
+    bo_trend: Optional[int] = None,
+    bo_sides: Optional[int] = None,
+    bo_sl_atr: Optional[float] = None,
+    bo_trail_trigger_atr: Optional[float] = None,
+    bo_trail_atr: Optional[float] = None,
+    bo_max_hold_days: Optional[int] = None,
 ):
     """背景回測任務的參數：跟 /backtest/run 同一組(天數、結束日期、段數另外給)。"""
     return dict(locals())

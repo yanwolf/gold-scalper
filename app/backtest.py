@@ -28,6 +28,7 @@ from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
 from app import smc_structure
 from app import mean_reversion
 from app import pullback_resume
+from app import breakout_trend
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -76,9 +77,10 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 
 
 SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
-HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume", "breakout_trend")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
 # r99：只存在回測、介面相同的1小時K策略(build_cfg / precompute / evaluate_at，結果放在 "mr")
-HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume}
+HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume,
+              "breakout_trend": breakout_trend}   # r105：4小時K突破(用1小時K組4小時K)
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
 
 
@@ -219,6 +221,14 @@ def run_backtest(
     pr_sl_mode=None,
     pr_hold_bars=None,
     pr_exit_mode=None,
+    bo_channel=None,
+    bo_big_bar_atr=None,
+    bo_trend=None,
+    bo_sides=None,
+    bo_sl_atr=None,
+    bo_trail_trigger_atr=None,
+    bo_trail_atr=None,
+    bo_max_hold_days=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -324,6 +334,16 @@ def run_backtest(
             return {"error": mr_err}
         interval_seconds = 3600
         reversal_confirm_count = 10 ** 6   # 「賺賠都走」：只用持有時間出場，反向訊號不提前出場
+    # r105：大週期突破(breakout_trend.py，只存在回測)。訊號只在4小時K收盤那一小時給；出場只靠停損/移動停損/持有天數
+    if strategy_type == "breakout_trend":
+        mr_cfg, mr_err = breakout_trend.build_cfg({
+            "channel": bo_channel, "big_bar_atr": bo_big_bar_atr, "trend": bo_trend, "sides": bo_sides,
+            "sl_atr": bo_sl_atr, "trail_trigger_atr": bo_trail_trigger_atr, "trail_atr": bo_trail_atr,
+            "max_hold_days": bo_max_hold_days})
+        if mr_err:
+            return {"error": mr_err}
+        interval_seconds = 3600
+        reversal_confirm_count = 10 ** 6
 
     # klines可由呼叫端預先抓好傳進來(參數掃描用：十幾組回測共用同一份資料，
     # 對照組和每一組實驗才是在完全相同的K線上比較，也省掉重複抓資料的時間)
@@ -670,11 +690,12 @@ def run_backtest(
 
         # r96：均值回歸的停損/移動停損一律用1小時K的ATR倍數(不吃正式設定的點數)
         if strategy_type in HR_MODULES:
-            _atr_h = (result.get("mr") or {}).get("atr") or atr
+            # r105：大週期突破用4小時ATR(hr_atr)算移動停損；其他策略沒有這個欄位，照舊
+            _atr_h = result.get("hr_atr") or (result.get("mr") or {}).get("atr") or atr
             if result.get("mr"):
                 step_sl_points = result["mr"]["sl_points"]
             if _atr_h and float(mr_cfg["trail_atr"]) > 0:
-                step_trail_trigger_points = float(mr_cfg["trail_atr"]) * _atr_h
+                step_trail_trigger_points = float(mr_cfg.get("trail_trigger_atr", mr_cfg["trail_atr"])) * _atr_h
                 step_trail_distance_points = float(mr_cfg["trail_atr"]) * _atr_h
             else:
                 step_trail_trigger_points = step_trail_distance_points = 1e12   # 不移動停損

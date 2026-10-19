@@ -718,6 +718,24 @@ def get_user_trades(symbol=None, account=DEFAULT_ACCOUNT, limit=100, from_id=Non
     return _signed_request("GET", "/fapi/v1/userTrades", params, account=account)
 
 
+def commission_usdt(rows):
+    """
+    r103：成交明細(userTrades)的手續費加總(USDT)。任何一筆不是用 USDT 付(例如開了 BNB 抵扣)、或欄位缺漏、
+    或清單是空的：回 None——不能把一部分當成全部(第8條r28：未知就是未知)。
+    """
+    if not rows:
+        return None
+    total = 0.0
+    for t in rows:
+        if not isinstance(t, dict) or t.get("commissionAsset") != "USDT":
+            return None
+        try:
+            total += abs(float(t.get("commission")))
+        except (TypeError, ValueError):
+            return None
+    return round(total, 6)
+
+
 def get_order_status(symbol, order_id, account=DEFAULT_ACCOUNT):
     """查詢指定訂單的目前狀態，用來在avgPrice還沒被填入時重新確認實際成交價。"""
     return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, account=account)
