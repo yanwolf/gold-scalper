@@ -2842,6 +2842,11 @@ r105 的 4 小時K突破在 XAUUSDT(2025/12 才上市，約 10 個月)上沒過�
 - `BINANCE_LESSONS.md` 覆蓋成 r101、補上 gold-scalper 的對照結果；`preflight.py` 的 VERSION 改成 `2026-10-20r101`。
   程式行為沒有改，只動測試與檢查器。`tests/legacy/` 改留 r107、r108。
 
+## 清單同步到 r102（r110）
+
+`BINANCE_LESSONS.md` 覆蓋成 r102，`preflight.py` 的 VERSION 改成 `2026-10-20r102`。r102 只新增另外兩個專案的對照紀錄，
+沒有新的檢查項目要 gold-scalper 對照；程式與測試都沒有改(`tests/legacy/` 維持 r107、r108)。
+
 ## 舊版程式要留著（BINANCE_LESSONS.md 用法第 5 點 r37）
 
 每次照清單修改、部署前，在 git 打標籤，之後才能拿新的測試跑舊版、確認框架在舊版上不會崩：
