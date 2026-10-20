@@ -227,6 +227,25 @@ async def control_halt(payload: dict = Body(...)):
     return {"success": True, "manual_halt": state}
 
 
+@app.post("/control/abandon")
+async def control_abandon(payload: dict = Body(...)):
+    """
+    r107(BINANCE_LESSONS 第16條 r99)「停止追蹤此部位」：payload {"password", "engine_id"}。
+    只有平倉被交易所一直明確拒絕、已標成卡住的部位才允許。帳上移除(損益記未知、不計入績效與斷路器)，
+    交易所上的部位與掛單不動；這個帳戶的這個商品在交易所清空前不再真實進場，清空後自動解除。
+    """
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    engine = PAPER_TRADING_ENGINES.get(payload.get("engine_id") or "")
+    if engine is None:
+        return {"success": False, "error": f"沒有這個引擎：{payload.get('engine_id')}"}
+    done, message = engine.abandon_position(by="網頁")
+    if done:
+        db.insert_settings_audit("abandon_position", engine_id=engine.engine_id, detail={"message": message})
+    return {"success": bool(done), "message": message, "error": None if done else message}
+
+
 @app.post("/control/resume")
 async def control_resume(payload: dict = Body(...)):
     ok, error = settings_module.verify_password(payload.get("password", ""))

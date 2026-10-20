@@ -2592,6 +2592,39 @@ function renderReadinessBanner(el, readiness){
   `;
 }
 
+// r107(第16條r99)：待平倉狀態——重試次數、交易所明確拒絕的連續次數、卡住後的下次重試時間與「停止追蹤」按鈕
+function pendingCloseHtml(p, engineId, apiBase){
+  if(!p.pending_close) return '';
+  const lines = [`<b>待平倉：</b>${p.pending_close.reason || ''}，已重試 ${p.close_fail_count || 0} 次`];
+  if(p.close_reject_count) lines.push(`交易所明確拒絕(-2022)連續 ${p.close_reject_count} 次`);
+  let btn = '';
+  if(p.close_stuck){
+    const next = p.close_next_try ? new Date(Number(p.close_next_try) * 1000).toLocaleTimeString('zh-TW', {hour12:false}) : '--';
+    lines.push(`🟡 已標成卡住(${new Date(p.close_stuck).toLocaleString('zh-TW',{hour12:false})} 起)：程式再送也不會好，改成每 10 分鐘重試一次，下次 ${next}`);
+    btn = `<button class="btn-secondary abandon-btn" data-engine="${engineId}" data-base="${apiBase}" style="margin-top:6px;">停止追蹤此部位</button>
+      <div style="font-size:10.5px; color:var(--muted); margin-top:3px;">帳上移除(損益記未知、不計入績效與斷路器)，交易所上的部位與掛單不動；交易所清空前這個帳戶的這個商品不再真實進場。</div>`;
+  }
+  return `<div style="font-size:11px; color:var(--gold); line-height:1.7; margin:6px 2px 0;">${lines.join('<br/>')}${btn}</div>`;
+}
+
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('.abandon-btn') : null;
+  if(!btn) return;
+  if(!confirm('確定停止追蹤這筆部位？\n帳上會移除(損益記未知)，交易所上的部位與掛單不會動，請自己到幣安處理。\n交易所清空前，這個帳戶的這個商品不再真實進場。')) return;
+  const pwd = getOrPromptPassword(); if(!pwd) return;
+  btn.disabled = true;
+  try{
+    const res = await fetch(`${btn.dataset.base || ''}/control/abandon`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ password: pwd, engine_id: btn.dataset.engine }),
+    });
+    const d = await res.json();
+    alert(d.success ? d.message : `失敗：${d.error || d.message}`);
+    if(btn.dataset.base) refreshLivePaper(); else fetchPaperTrading();
+  }catch(err){ alert(`失敗：${err.message}`); }
+  btn.disabled = false;
+});
+
 // r104：進場理由、進場當下決定的出場設定(例如「中軌不在獲利方向，沒有停利價」)
 function tradeReasonsHtml(t){
   const parts = [];
@@ -2940,7 +2973,7 @@ const PAPER_TARGETS = null; // 用els(主畫面)；正式端分頁傳自己的�
 function liveTargets(){
   const g = id => document.getElementById(id);
   return {
-    activeConfigId: 'livePaperActiveConfig', drawdownPeriodId: 'livePaperDrawdownPeriod',
+    activeConfigId: 'livePaperActiveConfig', drawdownPeriodId: 'livePaperDrawdownPeriod', apiBase: '/live-proxy',
     paperOpenPosition: g('livePaperOpenPosition'), paperReadiness: g('livePaperReadiness'),
     paperTotal: g('livePaperTotal'), paperWinRate: g('livePaperWinRate'), paperTotalPnl: g('livePaperTotalPnl'),
     paperProfitFactor: g('livePaperProfitFactor'), paperMaxDrawdown: g('livePaperMaxDrawdown'),
@@ -3006,7 +3039,7 @@ function renderPaperTrading(data, t){
     }
 
     // r104：進場理由、出場設定(停利價／沒有停利價)、最長持有到幾點。以前要查資料庫才看得到
-    const reasonHtml = openPositionReasonsHtml(p, data.strategy_type);
+    const reasonHtml = openPositionReasonsHtml(p, data.strategy_type) + pendingCloseHtml(p, data.engine_id, t.apiBase || '');
     t.paperOpenPosition.innerHTML = `
       <div class="paper-position-card ${p.direction}">
         <span>
@@ -3021,6 +3054,13 @@ function renderPaperTrading(data, t){
     `;
   }else{
     t.paperOpenPosition.innerHTML = '<div class="paper-position-empty">目前空手，等待下一個訊號</div>';
+  }
+  if(data.abandoned_position){
+    // r107：已放棄追蹤的部位(交易所上還留著、程式不管了)，清空前不再真實進場
+    const a = data.abandoned_position;
+    t.paperOpenPosition.innerHTML += a.unknown
+      ? `<div style="font-size:11.5px; color:var(--gold); margin-top:6px;">🟡 讀不到「已放棄追蹤」清單，真實開倉保守暫停</div>`
+      : `<div style="font-size:11.5px; color:var(--gold); margin-top:6px; line-height:1.6;">🟡 已放棄追蹤：${a.symbol} ${a.direction === 'bullish' ? '多單' : '空單'} ${a.quantity ?? ''}（${a.at ? new Date(a.at).toLocaleString('zh-TW',{hour12:false}) : ''}）<br/>交易所上的部位與掛單沒有動，清空前這個帳戶的 ${a.symbol} 不再真實進場；清空後會自動解除並通知。</div>`;
   }
 
   renderReadinessBanner(t.paperReadiness, data.readiness);

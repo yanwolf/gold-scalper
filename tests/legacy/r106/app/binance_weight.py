@@ -20,6 +20,10 @@ import time
 import requests
 
 KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+# r106：現貨K線(只給回測用，例如 PAXGUSDT 現貨 2020 年起的長歷史)。現貨的 IP 權重是另一套計數(上限 6000/分)，
+# 已用權重分開記；429/418 跟期貨共用同一個冷卻/封鎖狀態(保守：被擋就全部讓開)
+SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
+SPOT_PAUSE_AT = 3000
 WEIGHT_LIMIT_1M = 2400
 PAUSE_AT = 1200               # batch：這一分鐘已用到這裡就讓路到下一分鐘
 MAX_RETRIES = 3               # batch：429／冷卻最多等幾次
@@ -38,7 +42,7 @@ class BinanceRateLimited(RuntimeError):
 
 
 def _fresh_state():
-    return {"used": 0, "used_minute": None, "used_source": None,
+    return {"used": 0, "used_minute": None, "used_source": None, "spot_used": 0, "spot_minute": None,
             "count_429": 0, "count_418": 0, "cooldown_until": 0.0, "banned_until": 0.0,
             "last_limit_source": None, "waits": 0, "wait_seconds": 0.0, "skipped_live": 0}
 
@@ -60,7 +64,7 @@ def _retry_after(headers, default):
         return default
 
 
-def record(resp, source=""):
+def record(resp, source="", market="futures"):
     """記下任何一個幣安回應的權重標頭與 429／418。回傳狀態碼。resp 是 None 或格式不對時什麼都不做。"""
     if resp is None:
         return None
@@ -74,9 +78,13 @@ def record(resp, source=""):
             used = None
         if used is not None:
             try:
-                _state["used"] = int(used)
-                _state["used_minute"] = int(now // 60)
-                _state["used_source"] = source
+                if market == "spot":
+                    _state["spot_used"] = int(used)
+                    _state["spot_minute"] = int(now // 60)
+                else:
+                    _state["used"] = int(used)
+                    _state["used_minute"] = int(now // 60)
+                    _state["used_source"] = source
             except (TypeError, ValueError):
                 pass
         if status == 429:
@@ -90,9 +98,11 @@ def record(resp, source=""):
     return status
 
 
-def used_this_minute():
+def used_this_minute(market="futures"):
     """這一分鐘(依最後一次看到的標頭)已用的權重；上一分鐘的數字已經歸零，回 0。"""
     with _state_lock:
+        if market == "spot":
+            return _state["spot_used"] if _state["spot_minute"] == int(_now() // 60) else 0
         if _state["used_minute"] == int(_now() // 60):
             return _state["used"]
         return 0
@@ -130,9 +140,14 @@ def _banned_error(left):
                               "封鎖期間不送任何K線請求；同 IP 的正式端也可能受影響，請檢查正式端")
 
 
-def get_klines(params, mode="batch", source=None):
-    """抓一頁K線(回傳 JSON list)。mode="batch" 排隊且會等待；mode="live" 不排隊、不等待、被擋就直接拋。"""
+def get_klines(params, mode="batch", source=None, market="futures"):
+    """抓一頁K線(回傳 JSON list)。mode="batch" 排隊且會等待；mode="live" 不排隊、不等待、被擋就直接拋。
+    market="spot"(r106)：抓現貨K線，只允許 batch(即時路徑不用現貨)。"""
     source = source or f"klines-{mode}"
+    if market == "spot" and mode != "batch":
+        raise ValueError("現貨K線只給回測(batch)用")
+    url = SPOT_KLINES_URL if market == "spot" else KLINES_URL
+    pause_at = SPOT_PAUSE_AT if market == "spot" else PAUSE_AT
     if mode == "live":
         kind, left = blocked()
         if kind:
@@ -164,12 +179,12 @@ def get_klines(params, mode="batch", source=None):
                 wait = float(min(max(math.ceil(left), 1), MAX_WAIT))
                 _note_wait(wait)
                 _sleep(wait)
-            elif used_this_minute() >= PAUSE_AT:
+            elif used_this_minute(market) >= pause_at:
                 wait = float(61 - int(_now()) % 60)   # 權重以分鐘重算，等到下一分鐘
                 _note_wait(wait)
                 _sleep(wait)
-            resp = requests.get(KLINES_URL, params=params, timeout=15)
-            status = record(resp, source)
+            resp = requests.get(url, params=params, timeout=15)
+            status = record(resp, source, market)
             if status == 418:
                 raise _banned_error(blocked()[1])
             if status == 429:

@@ -364,7 +364,7 @@ class Preflight(Base):
              mock.patch.object(P.execution_module, "_get_credentials", return_value=(None, None)):
             items = [x["item"] for x in P.check()]
         self.assertIn("IP 權重（K 線）", items)
-        self.assertTrue(P.VERSION.endswith("r98"))
+        self.assertRegex(P.VERSION, r"r(9[8-9]|\d{3,})$", "r98 起(之後的版本也行)；跟清單一致由下一行檢查")
         with open(os.path.join(ROOT, "BINANCE_LESSONS.md"), encoding="utf-8") as f:
             self.assertIn(f"版本 {P.VERSION}", f.read(300))
 
