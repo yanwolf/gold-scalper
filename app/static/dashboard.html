@@ -963,6 +963,10 @@
         </select>
       </div>
       <div class="settings-field">
+        <label>MT5 券商每筆成本(points，點差＋佣金；結果另外列一行 MT5 重算，含隔夜庫存費)</label>
+        <input type="number" id="backtestMt5Cost" placeholder="留空=0.4" step="0.05" min="0" max="5" />
+      </div>
+      <div class="settings-field">
         <label>最小ATR門檻(points，0=不限制)</label>
         <input type="number" id="backtestMinAtr" placeholder="留空=沿用正式設定" step="0.1" min="0" />
       </div>
@@ -1424,6 +1428,7 @@ const els = {
   backtestBoMaxHold: document.getElementById('backtestBoMaxHold'),
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
+  backtestMt5Cost: document.getElementById('backtestMt5Cost'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
@@ -3133,12 +3138,27 @@ function renderSlippageImpact(el, si, data){
     </div>`;
 }
 
+function mt5ViewHtml(v){
+  // r111：同一批交易用 MT5 券商成本(點差＋佣金＋隔夜庫存費)重算
+  if(!v || !v.total_trades) return '';
+  const pf = v.profit_factor != null ? Number(v.profit_factor).toFixed(2) : '∞';
+  return `
+    <div class="spread-adjusted-card">
+      <div class="spread-adjusted-title">改用 ${v.label}：每筆 ${v.cost_points} points，隔夜庫存費合計 ${v.swap_total >= 0 ? '+' : ''}${Number(v.swap_total).toFixed(2)}(跨 ${v.nights} 晚)</div>
+      <div class="stat-row">
+        <div class="stat"><div class="lbl">勝率</div><div class="val mono">${v.win_rate}%</div></div>
+        <div class="stat"><div class="lbl">總損益(points)</div><div class="val mono ${v.total_pnl_points >= 0 ? 'positive' : 'negative'}">${Number(v.total_pnl_points).toFixed(2)}</div></div>
+        <div class="stat"><div class="lbl">獲利因子</div><div class="val mono">${pf}</div></div>
+      </div>
+    </div>`;
+}
+
 function renderSpreadAdjusted(el, data){
   if(!el) return;
   const spread = data.assumed_spread_points;
   const adj = data.stats_spread_adjusted;
   if(!spread || !adj || !data.total_trades){
-    el.innerHTML = '';
+    el.innerHTML = mt5ViewHtml(data.mt5_view);
     return;
   }
   const pfText = adj.profit_factor != null ? adj.profit_factor.toFixed(2) : (adj.total_trades ? '∞' : '--');
@@ -3152,7 +3172,7 @@ function renderSpreadAdjusted(el, data){
         <div class="stat"><div class="lbl">獲利因子</div><div class="val mono">${pfText}</div></div>
       </div>
     </div>
-  `;
+  ` + mt5ViewHtml(data.mt5_view);
 }
 
 function renderDrawdownPeriod(el, data){
@@ -3558,6 +3578,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('chop_threshold', els.backtestChopThreshold);
   addIfPresent('block_market_closed', els.backtestBlockMarketClosed);
   addIfPresent('min_atr_points', els.backtestMinAtr);
+  addIfPresent('mt5_cost_points', els.backtestMt5Cost);   // r111
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
@@ -3770,6 +3791,7 @@ function btParamLabel(p){
   else if(Number(p.trend_filter_mode) === 0) parts.push('趨勢:關');
   else parts.push(`趨勢:${Number(p.trend_filter_mode) === 2 ? '嚴格' : '擋逆勢'}${p.trend_interval_seconds ? ' ' + p.trend_interval_seconds/3600 + 'h' : ''}${p.trend_slow_multiplier ? ' ' + p.trend_slow_multiplier + 'x' : ''}`);
   if(Number(p.cooldown_hours) > 0) parts.push(`冷卻${Number(p.cooldown_hours)}h`);
+  if(p.mt5_cost_points != null && p.mt5_cost_points !== '') parts.push(`MT5成本${Number(p.mt5_cost_points)}`);
   return parts.join('・');
 }
 
@@ -3805,6 +3827,7 @@ function btWinCard(title, bias, r, extraClass, idx){
       <div><div class="lbl">回撤</div><div class="num mono">${r.total_trades ? Number(r.max_drawdown_points).toFixed(1) : '--'}</div></div>
     </div>
     ${Number(r.assumed_spread_points) > 0 && r.total_trades ? `<div class="bt-win-split">扣成本(每筆 ${Number(r.assumed_spread_points)} 點)：損益 <span class="${r.net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.net_pnl_points)}</span>，PF ${r.net_profit_factor != null ? Number(r.net_profit_factor).toFixed(2) : '∞'}</div>` : ''}
+    ${r.mt5_net_pnl_points != null && r.total_trades ? `<div class="bt-win-split">MT5(每筆 ${Number(r.mt5_cost_points)} 點＋庫存費 ${btNum(r.mt5_swap_total)})：損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
   </div>`;
 }

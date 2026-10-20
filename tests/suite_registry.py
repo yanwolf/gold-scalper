@@ -38,6 +38,7 @@ REGISTRY = {
     "test_mean_reversion.py": (set(), _BACKTEST),
     "test_pullback_resume.py": (set(), _BACKTEST),
     "test_breakout_trend.py": (set(), _BACKTEST),
+    "test_cost_profiles.py": (set(), "成本重算只是統計(回測結果、引擎績效)，不碰交易所下單路徑；r111 新功能，不重跑舊版"),
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
