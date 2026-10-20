@@ -190,3 +190,16 @@ def is_gold_market_closed(dt_utc):
     if wd in (0, 1, 2, 3) and hour == 17:
         return True, "每日維護休市(17:00~18:00 ET)"
     return False, None
+
+
+ABANDON_EXIT_PREFIX = "停止追蹤"
+
+
+def is_abandoned_record(trade):
+    """
+    r107(BINANCE_LESSONS 第16條 r99)：「停止追蹤此部位」記下的那一筆——不是策略出場，
+    不計入績效統計、不算進當日斷路器與連續虧損(損益本來就未知，部位還在交易所)。
+    """
+    if not isinstance(trade, dict):
+        return False
+    return bool(trade.get("abandoned")) or str(trade.get("exit_reason") or "").startswith(ABANDON_EXIT_PREFIX)

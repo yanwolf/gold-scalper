@@ -119,7 +119,9 @@ class Signals(unittest.TestCase):
     def test_setup_b_not_when_close_stays_above_slow(self):
         closes = [4100.0 - i * 1.0 for i in range(70)]
         slow = M.precompute(_bars(closes))["slow"][69]
-        r = M.evaluate_at(M.precompute(_bars(closes + [slow + 5.0])), 70, self.cfg)
+        pre = M.precompute(_bars(closes + [slow + 5.0]))
+        self.assertGreater(pre["candles"][70]["close"], pre["slow"][70], "前提：這根收在慢線之上")
+        r = M.evaluate_at(pre, 70, self.cfg)
         self.assertNotEqual(r.get("direction"), "bearish")
 
     def test_tp_falls_back_when_fast_line_too_close(self):
@@ -212,9 +214,11 @@ class Isolation(unittest.TestCase):
 
     def test_live_paths_do_not_use_it(self):
         for rel in ("app/paper_trading.py", "app/execution.py", "app/signal_engine.py", "app/notifier.py"):
+            self.assertIn("def ", self._src(rel), f"前提：讀到了 {rel}")
             self.assertNotIn("mean_reversion", self._src(rel), rel)
 
     def test_not_a_settings_field(self):
+        self.assertIn("def get_settings", self._src("app/settings.py"), "前提：讀到了設定檔")
         self.assertNotIn("mr_", self._src("app/settings.py"))
 
     def test_endpoints_accept_params(self):

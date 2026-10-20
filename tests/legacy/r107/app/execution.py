@@ -718,6 +718,22 @@ def get_user_trades(symbol=None, account=DEFAULT_ACCOUNT, limit=100, from_id=Non
     return _signed_request("GET", "/fapi/v1/userTrades", params, account=account)
 
 
+def is_reduce_only_rejected(error):
+    """
+    BINANCE_LESSONS 第 16 條 r99：交易所「明確拒絕」平倉單(-2022 ReduceOnly Order is rejected)——同一張單再送幾次都一樣，
+    跟網路錯誤、逾時這類暫時性失敗要分開處理(只有它會退讓)。error 可能是 dict(幣安回應)或字串。
+    """
+    if isinstance(error, dict):
+        try:
+            if int(error.get("code")) == -2022:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return "ReduceOnly Order is rejected" in str(error.get("msg") or "")
+    s = str(error or "")
+    return "-2022" in s or "ReduceOnly Order is rejected" in s
+
+
 def commission_usdt(rows):
     """
     r103：成交明細(userTrades)的手續費加總(USDT)。任何一筆不是用 USDT 付(例如開了 BNB 抵扣)、或欄位缺漏、

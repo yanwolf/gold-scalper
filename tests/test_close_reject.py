@@ -110,6 +110,7 @@ class RejectVsTransient(Base):
     def test_other_errors_never_back_off(self):
         pos = self._pos()
         self.fail_close(pos, MARGIN, n=pt.CLOSE_REJECT_STUCK_AFTER + 5)
+        self.assertEqual(pos.get("close_fail_count"), pt.CLOSE_REJECT_STUCK_AFTER + 5, "前提：真的失敗了這麼多次")
         self.assertFalse(pos.get("close_stuck"), "別種錯誤不算明確拒絕，不退讓")
         self.assertEqual(manual_alerts(self.eng.alerts), [])
 
@@ -141,6 +142,7 @@ class RejectVsTransient(Base):
     def test_transient_after_stuck_resumes_every_round(self):
         pos = self._pos()
         self.fail_close(pos, REJECT, n=pt.CLOSE_REJECT_STUCK_AFTER)
+        self.assertTrue(pos.get("close_stuck"), "前提：先卡住了")
         self.fail_close(pos, TIMEOUT)
         self.assertFalse(pos.get("close_stuck"))
         self.assertNotIn("close_next_try", pos)
@@ -269,9 +271,11 @@ class WebAndPreflight(Base):
         with mock.patch.object(main.settings_module, "verify_password", return_value=(False, "密碼錯誤")):
             r = asyncio.run(main.control_abandon({"password": "x", "engine_id": self.eng.engine_id}))
         self.assertFalse(r["success"])
+        self.assertIn("密碼", r["error"])
         with mock.patch.object(main.settings_module, "verify_password", return_value=(True, None)):
             r = asyncio.run(main.control_abandon({"password": "x", "engine_id": "nope"}))
             self.assertFalse(r["success"])
+            self.assertIn("沒有這個引擎", r["error"])
             self.eng._position = None
             r = asyncio.run(main.control_abandon({"password": "x", "engine_id": self.eng.engine_id}))
         self.assertFalse(r["success"], "沒有卡住的部位就不能停止追蹤")
@@ -283,7 +287,7 @@ class WebAndPreflight(Base):
         r = preflight.abandoned_check()
         self.assertEqual((r["item"], r["status"]), ("已放棄追蹤的部位", "warn"))
         self.assertIn("XAUUSDT 空 1.0", r["msg"])
-        self.assertTrue(preflight.VERSION.endswith("r99"))
+        self.assertRegex(preflight.VERSION, r"r(99|\d{3,})$", "r99 起(之後的版本也行)；跟清單一致由下一行檢查")
         with open(os.path.join(ROOT, "BINANCE_LESSONS.md"), encoding="utf-8") as f:
             self.assertIn(f"版本 {preflight.VERSION}", f.read(300))
 

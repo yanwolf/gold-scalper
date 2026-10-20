@@ -28,6 +28,7 @@ class Commission(unittest.TestCase):
         self.assertAlmostEqual(ex.commission_usdt([row(1, 0.5, "0.8"), row(1, 0.5, "-0.87")]), 1.67)
 
     def test_unknown_cases(self):
+        self.assertEqual(ex.commission_usdt([row(1, 1, "0.5")]), 0.5, "對照：全用 USDT 付就算得出來")
         self.assertIsNone(ex.commission_usdt([]))
         self.assertIsNone(ex.commission_usdt([row(1, 1, "0.5", asset="BNB")]), "BNB 抵扣：不能當成 0")
         self.assertIsNone(ex.commission_usdt([row(1, 1, "0.5"), row(1, 1, "0.1", asset="BNB")]), "一部分不知道就是不知道")
@@ -121,6 +122,7 @@ class EngineFees(unittest.TestCase):
         trades = [row(100, 1.0, "1.67"), row(200, 0.4, "0.67", side="SELL")]
         with mock.patch.object(ex, "get_user_trades", return_value=(True, trades)):
             out = self.eng._close_fees(self._pos(), True, {"orderId": 200}, 1.0)
+        self.assertEqual(out["entry"], 1.67, "前提：進場那張湊滿了照算")
         self.assertIsNone(out["exit"], "只出現 0.4/1.0 張：不能當成完整的手續費")
 
     def test_partial_close_and_external_close_are_unknown_without_backfill(self):
@@ -134,7 +136,7 @@ class EngineFees(unittest.TestCase):
     def test_sim_only_does_nothing(self):
         with mock.patch.object(ex, "get_user_trades") as g:
             out = self.eng._close_fees(self._pos(real_open_executed=False), None, None, None)
-        self.assertFalse(out["real"])
+        self.assertIs(out["real"], False, "標成不是真實單")
         self.assertFalse(g.called)
         self.assertEqual(self.writes, [])
 

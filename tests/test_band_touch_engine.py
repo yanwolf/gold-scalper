@@ -127,6 +127,7 @@ class EngineTick(unittest.TestCase):
     def test_same_bar_and_late_bar_do_not_open(self):
         r = self._result()
         self.tick(r)
+        self.assertIsNotNone(self.eng._position, "前提：第一次有開倉")
         self.eng._position = None                            # 假裝馬上停損出場
         self.tick(r)
         self.assertIsNone(self.eng._position, "同一根K不再進")

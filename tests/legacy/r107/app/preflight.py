@@ -15,7 +15,7 @@ crypto-screener / gold-scalper / pump-dump-hunter 三個專案內容相同，
 import time
 from app import execution as execution_module, settings as settings_module
 
-VERSION = "2026-10-12r98"  # 三個專案共用；複製過去時連同這行一起帶
+VERSION = "2026-10-20r99"  # 三個專案共用；複製過去時連同這行一起帶
 
 
 def accounts_to_check():
@@ -102,6 +102,24 @@ def ip_weight_check(symbol="XAUUSDT"):
             "msg": f"這一分鐘已用 {used}/{W.WEIGHT_LIMIT_1M}(回測到 {W.PAUSE_AT} 就讓路)；{tail()}"[:200]}
 
 
+def abandoned_check():
+    """
+    r107(第16條 r99)：已放棄追蹤的部位另外列出——交易所上還留著、程式已經不管的部位，
+    清空前同帳戶同商品不再真實進場。不混進其他項目。
+    """
+    from app import abandoned
+    item = "已放棄追蹤的部位"
+    ok, entries = abandoned.list_all()
+    if not ok:
+        return {"item": item, "status": "warn", "msg": "讀不到清單(資料庫)，真實開倉保守暫停"}
+    if not entries:
+        return {"item": item, "status": "ok", "msg": "沒有"}
+    lines = [f"{e.get('symbol')} {'多' if e.get('direction') == 'bullish' else '空'} {e.get('quantity')}"
+             f"(帳戶 {e.get('account_key')}，{e.get('label') or e.get('engine_id')}，{str(e.get('at') or '')[:16]})" for e in entries]
+    return {"item": item, "status": "warn",
+            "msg": f"{len(entries)} 筆，交易所清空前不再真實進場：" + "；".join(lines)}
+
+
 def check(account=None, symbol=None):
     """
     對「一個帳戶」跑完整自檢，回傳[(項目, 狀態, 說明), ...]。
@@ -111,6 +129,10 @@ def check(account=None, symbol=None):
     account = account or execution_module.DEFAULT_ACCOUNT
     symbol = symbol or execution_module.DEFAULT_SYMBOL
     out = [notify_check()]
+    try:
+        out.append(abandoned_check())
+    except Exception as e:
+        out.append({"item": "已放棄追蹤的部位", "status": "warn", "msg": f"檢查失敗：{type(e).__name__}: {e}"})
     try:
         out.append(ip_weight_check(symbol))
     except Exception as e:

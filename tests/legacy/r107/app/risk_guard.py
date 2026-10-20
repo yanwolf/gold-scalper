@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 from app import db
 from app import settings as settings_module
+from app import trading_core
+from app import abandoned
 
 logger = logging.getLogger("risk_guard")
 
@@ -51,6 +53,8 @@ def get_daily_pnl_usd(engine, quantity):
 
     daily_pnl_points = 0.0
     for t in trades:
+        if trading_core.is_abandoned_record(t):
+            continue   # r107：停止追蹤不是策略出場，不算進斷路器
         exit_time_str = t.get("exit_time")
         if not exit_time_str:
             continue
@@ -82,6 +86,8 @@ def get_consecutive_losses(engine):
 
     count = 0
     for t in trades:
+        if trading_core.is_abandoned_record(t):
+            continue   # r107：停止追蹤不是策略出場，不算連續虧損
         pnl = t.get("pnl_points")
         if pnl is None:
             count += 1  # 損益未知：斷路器當成一次虧損(第8條r50)，只會更早停
@@ -99,7 +105,7 @@ def get_unknown_pnl_count(engine):
         trades = db.get_closed_paper_trades(limit=50, engine_id=engine.engine_id)
     else:
         trades = list(engine._closed_trades_memory)
-    return sum(1 for t in trades if t.get("pnl_points") is None)
+    return sum(1 for t in trades if t.get("pnl_points") is None and not trading_core.is_abandoned_record(t))
 
 
 def check_spread_edge(sl_points, spread_points, min_ratio):
@@ -299,6 +305,16 @@ def _check_inner(engine, quantity, sl_points=None, bid=None, ask=None):
             _history_read_failed(hist_err)
             return False, f"讀不到平倉紀錄(資料庫)，不知道今天虧多少、連虧幾筆，暫停真實下單：{hist_err}", "history_unreadable"
         _history_read_ok()
+    # r107(第16條r99)：這個帳戶的這個商品有「已放棄追蹤」的部位，交易所清空前不再真實進場(模擬單照常)
+    try:
+        from app import execution as _ex
+        ab = abandoned.blocked(_ex.physical_account_key(getattr(engine, "execution_account", "gold")),
+                               _ex._resolve_symbol(getattr(engine, "execution_symbol", None)))
+    except Exception as e:
+        ab = {"unknown": True, "error": str(e)}
+    if ab:
+        return False, ("讀不到「已放棄追蹤」清單，保守暫停真實開倉" if ab.get("unknown")
+                       else f"這個帳戶的 {ab.get('symbol')} 有已放棄追蹤的部位，交易所清空前不再真實進場"), "abandoned"
     halt = get_manual_halt()   # r85：重啟後從資料庫讀回；讀不到當成停止中
     if halt["active"]:
         return False, f"手動緊急停止中({halt['reason'] or '未填原因'})，暫停所有新的真實開倉", "manual_halt"

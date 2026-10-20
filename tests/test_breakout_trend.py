@@ -134,6 +134,7 @@ class Config(unittest.TestCase):
     def test_rejects(self):
         for bad in ({"channel": 2}, {"sides": 4}, {"trend": 0.5}, {"sl_atr": "x"}, {"nope": 1}):
             self.assertIsNone(BO.build_cfg(bad)[0], bad)
+            self.assertTrue(BO.build_cfg(bad)[1], f"要講原因：{bad}")
 
 
 def _price(m, path):
@@ -191,6 +192,8 @@ class Integration(unittest.TestCase):
     def test_trail_trigger_is_separate_from_distance(self):
         rally = [4030.0 + 6 * k for k in range(1, 25)]
         drop = [rally[-1] - 3 * k for k in range(1, 25)]
+        base = _run(UP + rally + drop)
+        self.assertTrue(any(t["exit_reason"] == "觸及移動停損" for t in base["recent_trades"]), "前提：預設那組會被移動停損出場")
         res = _run(UP + rally + drop, bo_trail_trigger_atr=20)
         self.assertFalse(any(t["exit_reason"] == "觸及移動停損" for t in res["recent_trades"]),
                          "浮盈沒到 20 倍ATR：移動停損不啟動(預設那組同一段行情會被移動停損出場)")
@@ -231,6 +234,7 @@ class Wiring(unittest.TestCase):
 
     def test_not_in_live_paths(self):
         for rel in ("app/paper_trading.py", "app/execution.py", "app/signal_engine.py", "app/notifier.py"):
+            self.assertIn("def ", self._src(rel), f"前提：讀到了 {rel}")
             self.assertNotIn("breakout_trend", self._src(rel), rel)
 
     def test_endpoints_jobs_dashboard(self):

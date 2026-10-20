@@ -46,8 +46,20 @@ MAX_KLINES_PER_REQUEST = 1500
 BinanceRateLimited = binance_weight.BinanceRateLimited
 
 
-def _get_klines_page(params, mode="batch"):
-    return binance_weight.get_klines(params, mode=mode)
+SPOT_SUFFIX = "@spot"            # r106：symbol 寫成 "PAXGUSDT@spot" 就抓現貨K線(只給回測)
+SPOT_MAX_KLINES_PER_REQUEST = 1000
+
+
+def split_symbol(symbol):
+    """'PAXGUSDT@spot' → ('PAXGUSDT', 'spot')；其他 → (symbol, 'futures')。"""
+    s = str(symbol or "")
+    if s.endswith(SPOT_SUFFIX):
+        return s[:-len(SPOT_SUFFIX)], "spot"
+    return s, "futures"
+
+
+def _get_klines_page(params, mode="batch", market="futures"):
+    return binance_weight.get_klines(params, mode=mode, market=market)
 
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_BUCKET_SIZE = 1.0
@@ -112,6 +124,8 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
     # r90：end_time_ms 可以指定(回測過去某一段)，沒指定就是現在
     end_time = end_time_ms if end_time_ms is not None else resolve_end_time_ms()
     start_time = end_time - days * 24 * 60 * 60 * 1000 + 1
+    symbol, market = split_symbol(symbol)
+    page_limit = SPOT_MAX_KLINES_PER_REQUEST if market == "spot" else MAX_KLINES_PER_REQUEST
 
     all_klines = []
     cursor = start_time
@@ -122,9 +136,9 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
             "interval": interval,
             "startTime": cursor,
             "endTime": end_time,
-            "limit": MAX_KLINES_PER_REQUEST,
+            "limit": page_limit,
         }
-        batch = _get_klines_page(params, mode=mode)   # 任何一頁失敗(含限流)整個拋出：不回傳抓一半的資料
+        batch = _get_klines_page(params, mode=mode, market=market)   # 任何一頁失敗(含限流)整個拋出：不回傳抓一半的資料
 
         if not batch:
             break
@@ -136,7 +150,7 @@ def fetch_historical_klines(symbol="XAUUSDT", interval="1m", days=2, max_days=No
             break  # 保險：避免因為API回傳異常造成無窮迴圈
         cursor = last_open_time + 1
 
-        if len(batch) < MAX_KLINES_PER_REQUEST:
+        if len(batch) < page_limit:
             break  # 這批資料不滿，代表已經抓到最新的了
 
     return all_klines

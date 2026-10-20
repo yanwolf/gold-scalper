@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from app.signal_engine import compute_full_signal
 from app import db
 from app import trading_core
+from app import abandoned
 from app import settings as settings_module
 from app import notifier as notifier_module
 from app import alert_cadence
@@ -125,6 +126,13 @@ FILL_BACKFILL_DELAYS = (3, 10, 30, 90)
 # r103：手續費(成交明細的 commission)平倉當下查不到時，背景隔這些秒數各再查一次，查到只寫資料庫、不另外通知
 FEE_BACKFILL_DELAYS = (3, 10, 30)
 
+# r107(BINANCE_LESSONS 第16條 r99)：交易所「明確拒絕」平倉(-2022)連續這麼多次(每輪 15 秒，約 10 分鐘)就標成卡住、
+# 推一則要人工處理的通知，之後每 CLOSE_STUCK_RETRY_SECONDS 才重試一次。暫時性錯誤不算、照舊每輪重試
+CLOSE_REJECT_STUCK_AFTER = 40
+CLOSE_STUCK_RETRY_SECONDS = 600
+ABANDON_EXIT_REASON = "停止追蹤(交易所一直拒絕平倉，部位與掛單留在交易所)"
+ABANDONED_RECONCILE_EVERY_TICKS = 20   # 約 5 分鐘對一次帳：交易所那一側清空了就自動解除
+
 
 # 部分出場狀態(第15條r74)：這幾個欄位一變就整份寫進資料庫，重啟後還原
 PARTIAL_STATE_KEYS = ("partial_realized_usd", "usd_estimated", "partial_pnl_unknown",
@@ -138,6 +146,7 @@ RUNTIME_STATE_KEYS = PARTIAL_STATE_KEYS + (
     "pending_reversal_direction", "pending_reversal_count",   # 反轉出場的連續確認計數
     "backstop_price", "backstop_hedge",                 # 交易所停損的觸發價與下單時的持倉模式(撤舊單要用)
     "entry_fee_usd",                                    # r103：進場手續費(USDT)，平倉時跟出場手續費一起寫進紀錄
+    "close_reject_count", "close_stuck", "close_next_try",   # r107(第16條r99)：交易所明確拒絕平倉的連續次數、卡住時間、下次重試
 )
 # 刻意不存的(寫明理由；靜態檢查要求每個執行時長出來的鍵不是在上面、就是在這裡)
 NOT_RESTORED_KEYS = {
@@ -566,6 +575,9 @@ class PaperTradingEngine:
             # 缺期限當成已經逾時：逐幣確認，有就認領、沒有就判定未成交
             self._run_step("開倉確認", self._resolve_open_pending, pos)
         if pos.get("pending_close"):
+            # r107(第16條r99)：交易所一直明確拒絕、已標卡住：退讓到下次重試時間才再試(停損對齊也一樣被拒，一起等)
+            if pos.get("close_stuck") and time.time() < float(pos.get("close_next_try") or 0):
+                return
             # 平倉單沒確認成交：每輪直接重試(第8條r13)，不等下一根K棒再觸發出場。
             # 等待期間交易所停損照常保留並對齊。
             self._run_step("停損對齊", self._sync_backstop, pos)
@@ -1143,6 +1155,20 @@ class PaperTradingEngine:
         position["close_fail_count"] = n
         position["pending_close"] = {"reason": exit_reason, "price": exit_price}
         position.pop("_closing", None)
+        # r107(第16條r99)：只有交易所明確拒絕(-2022)才計數；換成別種錯誤就歸零、回到每輪重試
+        rejected = execution_module.is_reduce_only_rejected(error)
+        newly_stuck = False
+        if rejected:
+            r = position.get("close_reject_count", 0) + 1
+            position["close_reject_count"] = r
+            if r >= CLOSE_REJECT_STUCK_AFTER:
+                if not position.get("close_stuck"):
+                    position["close_stuck"] = datetime.now(timezone.utc).isoformat()
+                    newly_stuck = True
+                position["close_next_try"] = time.time() + CLOSE_STUCK_RETRY_SECONDS
+        else:
+            for k in ("close_reject_count", "close_stuck", "close_next_try"):
+                position.pop(k, None)
         # r85：待平倉當場就存(不等這一輪結束)——這時候當掉，重啟後才知道還要平
         try:
             self._save_partial_state(position)
@@ -1150,7 +1176,20 @@ class PaperTradingEngine:
             logger.error(f"待平倉狀態寫不進資料庫({self.label}): {e}")
         with self._lock:
             self._position = position
-        if alert_cadence.should_alert(n):
+        if newly_stuck:
+            self._backstop_alert(
+                f"🟡 {self.label} 平倉一直被交易所拒絕，需要人工處理\n"
+                f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
+                f"交易所連續 {position['close_reject_count']} 次明確拒絕平倉(-2022 ReduceOnly Order is rejected)，"
+                f"程式再送也不會好\n"
+                f"錯誤：{error}\n"
+                f"之後改成每 {CLOSE_STUCK_RETRY_SECONDS // 60} 分鐘重試一次(不再每輪重送、不再重複通知)。\n"
+                f"請到幣安網頁確認；確定平不掉時，可在網頁持倉卡片按「停止追蹤此部位」"
+                f"(帳上移除、交易所的部位與掛單不動)"
+            )
+        elif position.get("close_stuck"):
+            pass   # 已經通知過「卡住」：之後被拒不再推播(洗版)
+        elif alert_cadence.should_alert(n):
             self._backstop_alert(
                 f"⚠️ {self.label} 平倉單沒有成交(第 {n} 次)\n"
                 f"幣別：{execution_module._resolve_symbol(self.execution_symbol)}\n"
@@ -1358,6 +1397,8 @@ class PaperTradingEngine:
         if self._orphan_cancels:
             self._run_step("殘留單重試", self._retry_orphan_cancels)
         pos = self._position
+        if not pos:
+            self._maybe_reconcile_abandoned()   # r107：已放棄追蹤的部位，交易所清空了就自動解除
         if pos:
             self._run_step("每輪維護", self._housekeeping, pos)
             if pos.get("pending_close"):
@@ -1488,6 +1529,18 @@ class PaperTradingEngine:
                     logger.info(f"{self.label}: {band_note}")
             if not is_choppy and not market_closed and not atr_too_low and trend_ok and band_ok:
                 self._open_position(result, current_price, sl_points)
+
+    def _maybe_reconcile_abandoned(self):
+        """每 ABANDONED_RECONCILE_EVERY_TICKS 輪(約 5 分鐘)，真實下單引擎空手時對一次已放棄追蹤的部位。"""
+        self._abandoned_tick = (getattr(self, "_abandoned_tick", 0) + 1) % ABANDONED_RECONCILE_EVERY_TICKS
+        if self._abandoned_tick != 0 or self._position is not None:
+            return
+        try:
+            if not self._is_execution_engine(settings_module.get_settings(engine_id=self.engine_id)):
+                return
+            self._reconcile_abandoned()
+        except Exception as e:
+            logger.error(f"已放棄追蹤部位對帳失敗({self.label}): {e}")
 
     def _band_last_bar_from_db(self):
         """
@@ -1827,6 +1880,80 @@ class PaperTradingEngine:
                 logger.error(f"開倉通知發送失敗({self.label}): {e}")
 
     @_engine_op(web=True)
+    def abandon_position(self, by="網頁"):
+        """
+        r107(BINANCE_LESSONS 第16條 r99)「停止追蹤此部位」：只在平倉被交易所明確拒絕到「卡住」後才允許。
+          - 帳上移除，記一筆**排除的損益未知**(出場原因 ABANDON_EXIT_REASON)：不計入績效、不算進當日斷路器——不是策略出場；
+          - **交易所上的部位與掛單不動**(撤單也平不掉的情況下，留著停損多一層保護)；
+          - 這個實體帳戶的這個商品記進「已放棄追蹤」清單(存資料庫)：清空前不再送真實開倉單；
+            之後定期對帳，交易所那一側清空了就自動解除並通知。
+        回傳 (ok, message)。
+        """
+        position = self._position
+        if not position:
+            return False, "目前沒有部位"
+        if not position.get("close_stuck"):
+            return False, "只有平倉被交易所一直拒絕、已標成「卡住」的部位才能停止追蹤"
+        symbol = execution_module._resolve_symbol(self.execution_symbol)
+        account_key = execution_module.physical_account_key(self.execution_account)
+        qty = position.get("real_open_quantity")
+        abandoned.add(account_key, symbol, engine_id=self.engine_id, label=self.label,
+                      direction=position.get("direction"), quantity=qty, trade_id=position.get("id"),
+                      entry_price=position.get("entry_actual_price") or position.get("entry_price"), by=by)
+        exit_time = datetime.now(timezone.utc).isoformat()
+        price = _latest_price() or (position.get("pending_close") or {}).get("price") or position.get("entry_price")
+        record = self._safe_closed_record(position, price, ABANDON_EXIT_REASON, exit_time)
+        record["pnl_points"] = None   # 損益未知：部位還在交易所，這裡沒有出場
+        record["abandoned"] = True
+        self._safe("寫停止追蹤紀錄", lambda: db.close_paper_trade(
+            position.get("id"), price, exit_time, ABANDON_EXIT_REASON, None))
+        self._closed_trades_memory.append(record)
+        with self._lock:
+            if self._position is position:
+                self._position = None
+        self._abandoned_tick = 0
+        msg = (f"🟡 {self.label} 已停止追蹤此部位({by})\n"
+               f"幣別：{symbol}　方向：{'多單' if position.get('direction') == 'bullish' else '空單'}　數量：{qty}\n"
+               f"帳上已移除(損益記未知、不計入績效與斷路器)；交易所上的部位與掛單沒有動，請到幣安網頁處理。\n"
+               f"這個帳戶的 {symbol} 在交易所清空前不再真實進場，清空後會自動解除並通知")
+        self._backstop_alert(msg)
+        logger.warning(f"停止追蹤部位({self.label}): {symbol} {position.get('direction')} {qty}")
+        return True, "已停止追蹤：帳上移除，交易所的部位與掛單沒有動；交易所清空後自動解除"
+
+    def _reconcile_abandoned(self):
+        """
+        r107：這個引擎的帳戶＋商品在「已放棄追蹤」清單裡時，定期查交易所：那一側清空了就自動解除並通知。
+        查不到(錯誤)就等下次，不解除(查不到≠沒有，第2條)。回傳 "none"／"still"／"cleared"／"unknown"。
+        """
+        symbol = execution_module._resolve_symbol(self.execution_symbol)
+        account_key = execution_module.physical_account_key(self.execution_account)
+        entry = abandoned.blocked(account_key, symbol)
+        if not entry or entry.get("unknown"):
+            return "none" if not entry else "unknown"
+        ok, rows = execution_module.get_position_info(symbol=self.execution_symbol, account=self.execution_account)
+        if not ok or not isinstance(rows, list):
+            return "unknown"
+        want = entry.get("direction")
+        remaining = 0.0
+        for r in rows:
+            try:
+                amt = float(r.get("positionAmt") or 0)
+            except (TypeError, ValueError):
+                return "unknown"
+            side = r.get("positionSide") or "BOTH"
+            if side == "LONG" or (side == "BOTH" and amt > 0):
+                if want == "bullish":
+                    remaining += abs(amt)
+            elif side == "SHORT" or (side == "BOTH" and amt < 0):
+                if want == "bearish":
+                    remaining += abs(amt)
+        if remaining > 1e-9:
+            return "still"
+        abandoned.remove(account_key, symbol)
+        self._backstop_alert(f"✅ {self.label} 已放棄追蹤的 {symbol} 部位，交易所那一側已經清空，自動解除——恢復真實進場")
+        return "cleared"
+
+    @_engine_op(web=True)
     def force_close(self, reason="手動緊急平倉"):
         """
         正式端控制面板用：不等訊號、不等停損，立刻以最新成交價把這個引擎的部位平掉
@@ -2108,6 +2235,8 @@ class PaperTradingEngine:
         position["_close_confirmed"] = True  # 外層包裝據此判斷：之後出錯不能把部位放回帳上
         failed_closes = position.pop("close_fail_count", 0)
         position.pop("pending_close", None)
+        for k in ("close_reject_count", "close_stuck", "close_next_try"):
+            position.pop(k, None)
         position.pop("_closing", None)
         exit_time = datetime.now(timezone.utc).isoformat()
         closed_record = self._safe_closed_record(position, exit_price, exit_reason, exit_time)
@@ -2278,6 +2407,8 @@ class PaperTradingEngine:
             stats_trades = [t for t in trades if t.get("entry_time") and t["entry_time"] >= settings_changed_at]
         else:
             stats_trades = trades
+        # r107：「停止追蹤」那筆不是策略出場，不計入績效(成交紀錄清單照樣列出)
+        stats_trades = [t for t in stats_trades if not trading_core.is_abandoned_record(t)]
 
         s = settings_module.get_settings(engine_id=self.engine_id)
 
@@ -2318,6 +2449,10 @@ class PaperTradingEngine:
             "strategy_type": self.strategy_type,
             "label": self.label,
             "open_position": position,
+            # r107：這個帳戶＋商品有已放棄追蹤的部位時，網頁列出來(交易所清空前不再真實進場)
+            "abandoned_position": self._safe("讀已放棄追蹤清單", lambda: abandoned.blocked(
+                execution_module.physical_account_key(self.execution_account),
+                execution_module._resolve_symbol(self.execution_symbol)), default=None),
             "recent_trades": trades[:limit],
             "stats_excluded_old_trades": len(trades) - len(stats_trades),  # 給dashboard顯示排除了幾筆舊紀錄
             "active_settings": s,

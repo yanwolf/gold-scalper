@@ -25,15 +25,62 @@ def _is_empty_literal(node):
         getattr(node, "elts", None) or getattr(node, "keys", None))
 
 
-def classify(call):
+def _nonempty_literal(node, consts=frozenset()):
+    """
+    r100(BINANCE_LESSONS 第25種的修正)：一定非空的迭代來源——寫死的非空 list／tuple／set(不含 *展開)、非空字串、
+    檔案最上層寫死的非空清單名稱(consts)。其他(執行時算出來的、寫死但空的)都不算。
+    """
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return bool(node.elts) and not any(isinstance(e, ast.Starred) for e in node.elts)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return len(node.value) > 0
+    return isinstance(node, ast.Name) and node.id in consts
+
+
+def _all_never_empty(arg, consts=frozenset()):
+    """
+    all(...) 的參數一定非空(不會因為空跑而成立)：寫死的非空清單本身(all([a, b]))，或產生式的每一層都迭代一定非空的來源、
+    而且**沒有 if 篩選**(篩完可能是空的)。
+    """
+    if isinstance(arg, (ast.List, ast.Tuple, ast.Set)):
+        return _nonempty_literal(arg, consts)
+    if isinstance(arg, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+        return all(not g.ifs and _nonempty_literal(g.iter, consts) for g in arg.generators)
+    return False
+
+
+def module_consts(tree):
+    """檔案最上層、只被指定一次、值是寫死非空清單／字串的名稱(例如 FIELDS = ("a", "b"))。指定兩次以上的不算(保守)。"""
+    seen, out = {}, set()
+    for node in tree.body:
+        targets, value = [], None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Name):
+                seen[t.id] = seen.get(t.id, 0) + 1
+                if value is not None and len(targets) == 1 and _nonempty_literal(value):
+                    out.add(t.id)
+    return frozenset(n for n in out if seen.get(n) == 1)
+
+
+def classify(call, consts=frozenset()):
     name = call.func.attr
     if name in NEG_FUNCS:
         return "neg"
     if name in ("assertEqual", "assertIs") and len(call.args) >= 2 and _is_empty_literal(call.args[1]):
         return "neg"
-    # 第25種(r44)：assertTrue(all(...)) 對空清單成立——程式什麼都沒做、清單是空的也會通過，算否定句
+    # 第25種(r44)：assertTrue(all(...)) 對空清單成立——程式什麼都沒做、清單是空的也會通過，算否定句。
+    # r100：迭代一定非空的寫死清單(而且沒有 if 篩選)不可能空跑，不算(以前一律報，會誤報)
     if name == "assertTrue" and call.args and isinstance(call.args[0], ast.Call) and \
             isinstance(call.args[0].func, ast.Name) and call.args[0].func.id == "all":
+        inner = call.args[0]
+        if len(inner.args) == 1 and _all_never_empty(inner.args[0], consts):
+            return "pos"
         return "neg"
     return "pos"
 
@@ -41,7 +88,9 @@ def classify(call):
 def scan(source):
     """回傳 {測試名: (正向數, 否定數)}"""
     out = {}
-    for cls in ast.parse(source).body:
+    tree = ast.parse(source)
+    consts = module_consts(tree)
+    for cls in tree.body:
         if not isinstance(cls, ast.ClassDef):
             continue
         for fn in cls.body:
@@ -49,7 +98,7 @@ def scan(source):
                 pos = neg = 0
                 for n in ast.walk(fn):
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr.startswith("assert"):
-                        if classify(n) == "pos":
+                        if classify(n, consts) == "pos":
                             pos += 1
                         else:
                             neg += 1
@@ -96,6 +145,29 @@ SELFTEST = [  # (測試主體, 預期是否被報出)
     ("with self.assertRaises(E):\n            f()", False),
     ("self.assertTrue(all(x > 0 for x in xs))", True),       # 第25種：空清單時也成立
     ("self.assertEqual(len(xs), 2)\n        self.assertTrue(all(x > 0 for x in xs))", False),
+    # r100：迭代寫死的非空清單不可能空跑——不報
+    ('self.assertTrue(all(k in h for k in ("a", "b")))', False),
+    ('self.assertTrue(all(k in h for k in ["a"]))', False),
+    ('self.assertTrue(all(k in h for k in {"a", "b"}))', False),
+    ('self.assertTrue(all(c.isalpha() for c in "abc"))', False),
+    ("self.assertTrue(all([a, b]))", False),
+    # 帶 if 篩選、寫死但空、*展開、其中一層是執行時算出來的——照報
+    ('self.assertTrue(all(k in h for k in ("a", "b") if k in want))', True),
+    ("self.assertTrue(all(x for x in ()))", True),
+    ('self.assertTrue(all(x for x in ""))', True),
+    ("self.assertTrue(all([]))", True),
+    ('self.assertTrue(all(x for x in ("a", *rest)))', True),
+    ('self.assertTrue(all(y for x in ("a", "b") for y in xs))', True),
+]
+
+# r100：檔案最上層寫死的清單名稱(整份原始碼，預期是否被報出)
+SELFTEST_MODULE = [
+    ('FIELDS = ("a", "b")\nclass C:\n    def test_x(self):\n        self.assertTrue(all(k in h for k in FIELDS))\n', False),
+    ('FIELDS = ("a", "b")\nclass C:\n    def test_x(self):\n        self.assertTrue(all(k in h for k in FIELDS if k))\n', True),
+    ("NONE = ()\nclass C:\n    def test_x(self):\n        self.assertTrue(all(k in h for k in NONE))\n", True),
+    ('FIELDS = ("a",)\nFIELDS = ()\nclass C:\n    def test_x(self):\n        self.assertTrue(all(k in h for k in FIELDS))\n', True),
+    ('FIELDS = ("a",)\nFIELDS += extra\nclass C:\n    def test_x(self):\n        self.assertTrue(all(k in h for k in FIELDS))\n', True),
+    ("class C:\n    FIELDS = ('a',)\n    def test_x(self):\n        self.assertTrue(all(k in h for k in FIELDS))\n", True),
 ]
 
 
@@ -314,6 +386,10 @@ class TestChecker(unittest.TestCase):
             src = f"class C:\n    def test_x(self):\n        {body}\n"
             self.assertEqual(bool(problems(src)), flagged, body)
 
+    def test_selftest_module_level_names(self):
+        for src, flagged in SELFTEST_MODULE:
+            self.assertEqual(bool(problems(src)), flagged, src)
+
     def test_harness_selftest(self):
         bad = "class ExecHarness: pass\nclass A(ExecHarness):\n    def test_x(self):\n        N.notify_trade_event(action=1)\n"
         ok = "class ExecHarness: pass\nclass B(unittest.TestCase):\n    def test_x(self):\n        N.notify_trade_event(action=1)\n"
@@ -328,6 +404,20 @@ class TestChecker(unittest.TestCase):
             src = f.read()
         self.assertGreater(src.count("(ExecHarness)"), 10, "前提：真的掃到了繼承 ExecHarness 的類別")
         self.assertEqual(harness_problems(src), [])
+
+    def test_every_test_file_has_positive_assertions(self):
+        # r100：以前只掃 test_lessons.py；r95 之後新增的測試檔(回測、手續費、限流、停止追蹤…)都沒掃到，
+        # 對照 r100 時一次找出 19 個只有否定句的測試(都已補前提)。之後新增的測試檔自動納入
+        import glob
+        files = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "test_*.py")))
+        self.assertGreater(len(files), 5, "前提：真的找到了測試檔")
+        bad = {}
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                probs = problems(f.read())
+            if probs:
+                bad[os.path.basename(path)] = probs
+        self.assertEqual(bad, {})
 
     def test_lessons_tests_all_have_a_positive_assertion(self):
         path = os.path.join(os.path.dirname(__file__), "test_lessons.py")

@@ -282,6 +282,7 @@ class Jobs(unittest.TestCase):
 
     def test_unknown_job(self):
         with mock.patch.object(db, "_enabled", False):
+            self.assertIs(db._enabled, False, "前提：不讀資料庫(只看記憶體)")
             self.assertIsNone(J.get_job("does-not-exist"))
 
 
@@ -347,6 +348,7 @@ class MobileLayout(unittest.TestCase):
         self.assertIn("select, input{ max-width: 100%; }", self.html)
 
     def test_no_undefined_border_variable(self):
+        self.assertIn("var(--", self.html, "前提：真的讀到了網頁的 CSS 變數")
         self.assertNotIn("var(--border)", self.html, "沒有這個 CSS 變數(r90 用了、邊框沒顯示)")
 
 
@@ -479,6 +481,8 @@ class Cooldown(unittest.TestCase):
         """冷卻只存在回測：正式設定裡沒有這個欄位，即時引擎也不讀它。"""
         import inspect
         from app import settings as S, paper_trading as pt
+        self.assertGreater(len(S.get_settings()), 10, "前提：讀到了正式設定")
+        self.assertIn("def _tick", inspect.getsource(pt), "前提：讀到了即時引擎的原始碼")
         self.assertFalse(any("cooldown" in k for k in S.get_settings().keys()))
         self.assertNotIn("cooldown_hours", inspect.getsource(pt))
 
@@ -526,4 +530,5 @@ class NoData(unittest.TestCase):
                                end_time_ms=start + 2 * DAY - 1, trend_filter_mode=0, use_chop_filter=False,
                                block_market_closed=False, min_atr_points=0, use_atr=False, sl_points=0.3,
                                trail_trigger_points=50, trail_distance_points=50, reversal_confirm_count=3)
+        self.assertIn("data_gap_note", r, "前提：結果有這個欄位(不是沒跑到)")
         self.assertIsNone(r["data_gap_note"])

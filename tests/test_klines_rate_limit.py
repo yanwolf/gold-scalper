@@ -121,6 +121,7 @@ class BatchPage(Base):
         self.respond(R(200, {"X-MBX-USED-WEIGHT-1M": "100"}), R(200))
         self.run_page()
         self.run_page()
+        self.assertEqual(len(self.calls), 2, "前提：兩次都送了")
         self.assertEqual(self.sleeps, [])
 
     def test_other_http_errors_raise_without_retry(self):
