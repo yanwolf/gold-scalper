@@ -133,8 +133,9 @@ class Config(unittest.TestCase):
 
     def test_rejects(self):
         for bad in ({"channel": 2}, {"sides": 4}, {"trend": 0.5}, {"sl_atr": "x"}, {"nope": 1}):
-            self.assertIsNone(BO.build_cfg(bad)[0], bad)
-            self.assertTrue(BO.build_cfg(bad)[1], f"要講原因：{bad}")
+            bad_cfg, _err = BO.build_cfg(bad)  # 固定長度
+            self.assertIsNone(bad_cfg, bad)
+            self.assertTrue(_err, f"要講原因：{bad}")
 
 
 def _price(m, path):
@@ -164,7 +165,7 @@ def _run(path, **kw):
 
 class Integration(unittest.TestCase):
     def test_trend_ride_exits_by_trailing_with_profit(self):
-        rally = [4030.0 + 6 * k for k in range(1, 25)]                # 突破後一路漲 24 小時
+        rally = [4030.0 + 6 * k for k in range(1, 25)]                # 固定長度(突破後一路漲 24 小時)
         drop = [rally[-1] - 3 * k for k in range(1, 25)]              # 再一路跌回來
         path = UP + rally + drop
         res = _run(path)
@@ -179,10 +180,12 @@ class Integration(unittest.TestCase):
         self.assertEqual(res["mr_cfg"]["trail_atr"], 3.0)
 
     def test_trailing_uses_four_hour_atr(self):
-        rally = [4030.0 + 6 * k for k in range(1, 25)]
+        rally = [4030.0 + 6 * k for k in range(1, 25)]  # 固定長度
         drop = [rally[-1] - 3 * k for k in range(1, 25)]
         res = _run(UP + rally + drop)
-        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         peak = max(rally)
         giveback = peak - t["exit_price"]
         pre = BO.precompute(hourly(UP + rally + drop))
@@ -190,7 +193,7 @@ class Integration(unittest.TestCase):
         self.assertGreater(giveback, 2.0 * atr4, "回吐距離是 3 倍『4小時』ATR(1小時ATR小得多)")
 
     def test_trail_trigger_is_separate_from_distance(self):
-        rally = [4030.0 + 6 * k for k in range(1, 25)]
+        rally = [4030.0 + 6 * k for k in range(1, 25)]  # 固定長度
         drop = [rally[-1] - 3 * k for k in range(1, 25)]
         base = _run(UP + rally + drop)
         self.assertTrue(any(t["exit_reason"] == "觸及移動停損" for t in base["recent_trades"]), "前提：預設那組會被移動停損出場")
@@ -207,15 +210,19 @@ class Integration(unittest.TestCase):
                 r = dict(r, stage="訊號", direction="bearish",
                          mr={"setup": "突破空", "sl_points": 5.0, "tp_price": None, "atr": 4.0})
             return r
-        path = UP + [4031.0, 4032.0, 4033.0, 4034.0] + [4034.0] * 8
+        # 最後一路跌：部位最後被停損出場(有一筆平倉紀錄可以看出場原因)
+        path = UP + [4031.0, 4032.0, 4033.0, 4034.0] + [4034.0] * 8 + [4010.0, 3980.0, 3950.0, 3920.0]
         with mock.patch.object(BO, "evaluate_at", side_effect=fake):
             res = _run(path, reversal_confirm_count=1)
         t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
-        self.assertTrue(not t or t[0]["exit_reason"] != "訊號反轉", "反向訊號不提前出場(只靠停損/移動停損)")
+        self.assertEqual(len(t), 1, f"前提：在第244小時進場、最後出場一次 {t}")
+        self.assertEqual(t[0]["exit_reason"], "觸及停損", "反向訊號不提前出場(只靠停損/移動停損)")
 
     def test_stop_loss_when_breakout_fails(self):
         path = UP + [4030.0 - 4 * k for k in range(1, 13)]
-        t = sorted(_run(path)["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(_run(path)["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         self.assertEqual(t["exit_reason"], "觸及停損")
         self.assertLess(t["pnl_points"], 0)
 

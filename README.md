@@ -2822,6 +2822,26 @@ r105 的 4 小時K突破在 XAUUSDT(2025/12 才上市，約 10 個月)上沒過�
   `preflight.py` 的 VERSION 改成 `2026-10-20r100`(r107 的版本測試改成「r99 以後」)。程式行為沒有改，只動測試與檢查器。
   `tests/legacy/` 改留 r106、r107。
 
+## 修正：逐檔檢查不再寫死只看 test_lessons.py（r109，BINANCE_LESSONS.md r101）
+
+清單 r101：除了否定句檢查，其他「逐檔掃」的檢查是不是也靠寫死的清單。**中，而且全部都是**：新介面(`check_newapi`)、
+索引(`check_indexing`)、突變(`mutation_check`)、舊版重跑(`rerun_old`)、錯誤掃描(`error_scan`)都只看 `test_lessons.py`；
+`scripts/verify.py` 的行為測試也是寫死模組清單。r95 之後新增的 7 個測試檔只在行為測試裡跑過。
+
+- **自動掃全部**：`verify.py` 第 2 步自動找 `tests/test_*.py` 與 `tests/check_*.py`；否定句(r108)、索引改成掃全部測試檔。
+  索引一掃找出 45 處(`sorted(...)[0]`、`build_cfg(...)[0]`、`self.notes[0]`…)，全部補前提或改成拆開取值。
+- **要登記**(`tests/suite_registry.py`)：突變、錯誤掃描、舊版重跑、新介面四種不是每個測試檔都適用，每個測試檔登記參加哪幾種、
+  寫明理由。`check_tests.test_every_test_file_is_registered`：沒登記、過期登記、沒寫理由、不認得的檢查名稱都報(含自我驗證)。
+  目前：`test_lessons` 四種都參加；`test_close_reject`、`test_fees`、`test_band_touch_engine` 參加突變與錯誤掃描(碰即時引擎的平倉/下單路徑)；
+  `test_klines_rate_limit` 參加錯誤掃描；回測／策略模組的測試(5 個)不碰下單路徑，都不參加。
+- **擴大後的結果**：突變檢查 165 → 220 項，`test_close_reject` 有 12 項在突變下通過——都是「平倉被拒之後」的計數／退讓／停止追蹤，
+  跟部位查詢的結果無關，逐項列成對照組豁免(引用 `Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers`，
+  它斷言被拒後查到部位還在，突變下失敗)。錯誤掃描 5 個檔 262 項，沒有被吞掉的程式錯誤。新介面、舊版重跑目前只登記 test_lessons。
+- 反向驗證(在副本裡)：新增沒登記的測試檔被報出(它的索引問題也被自動掃到)；把 `test_close_reject` 從突變登記拿掉，
+  它的 12 項豁免變成「過期」被報出。
+- `BINANCE_LESSONS.md` 覆蓋成 r101、補上 gold-scalper 的對照結果；`preflight.py` 的 VERSION 改成 `2026-10-20r101`。
+  程式行為沒有改，只動測試與檢查器。`tests/legacy/` 改留 r107、r108。
+
 ## 舊版程式要留著（BINANCE_LESSONS.md 用法第 5 點 r37）
 
 每次照清單修改、部署前，在 git 打標籤，之後才能拿新的測試跑舊版、確認框架在舊版上不會崩：

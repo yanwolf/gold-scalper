@@ -79,12 +79,20 @@ class TestIndexing(unittest.TestCase):
             src = f"class C:\n    def test_x(self):\n        {body}\n"
             self.assertEqual(bool(problems(src)), flagged, body)
 
-    def test_lessons_tests_check_before_indexing(self):
-        path = os.path.join(os.path.dirname(__file__), "test_lessons.py")
-        with open(path, encoding="utf-8") as f:
-            src = f.read()
-        self.assertGreater(src.count("def test_"), 50, "前提：真的掃到了測試")
-        self.assertEqual(problems(src), [])
+    def test_every_test_file_checks_before_indexing(self):
+        # r101：自動掃 tests/test_*.py 全部(以前寫死只看 test_lessons.py；r95 之後的 7 個測試檔一掃出 45 處，都已補前提)
+        import glob
+        files = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "test_*.py")))
+        self.assertGreater(len(files), 5, "前提：真的找到了測試檔")
+        with open(os.path.join(os.path.dirname(__file__), "test_lessons.py"), encoding="utf-8") as f:
+            self.assertGreater(f.read().count("def test_"), 50, "前提：test_lessons 真的有測試")
+        bad = {}
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                probs = problems(f.read())
+            if probs:
+                bad[os.path.basename(path)] = probs
+        self.assertEqual(bad, {})
 
 
 if __name__ == "__main__":

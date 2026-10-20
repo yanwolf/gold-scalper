@@ -68,7 +68,9 @@ class ClosedCandles(unittest.TestCase):
         self.assertEqual([c["close"] for c in got], [4000.0, 4010.0], "進行中的那根不能拿來判斷結構")
 
     def test_bad_rows_are_skipped(self):
-        got = D.klines_to_closed_candles([["x"], None, _raw([4000])[0]], now_ms=T0 + 5 * DAY)
+        good = _raw([4000])
+        self.assertEqual(len(good), 1, "前提：一根正常的K")
+        got = D.klines_to_closed_candles([["x"], None, good[0]], now_ms=T0 + 5 * DAY)
         self.assertEqual(len(got), 1)
 
 
@@ -121,6 +123,7 @@ class Structure(unittest.TestCase):
         candles = _candles(_path_up_then_down())
         full = D.bias_series(candles)
         s = D.summarize(candles)
+        self.assertTrue(full, "前提：有結果")
         self.assertEqual(full[-1]["bias"], s["bias"])
         self.assertEqual(full[-1]["confirmed"], s["confirmed"])
 
@@ -374,7 +377,9 @@ class Backtest(unittest.TestCase):
             ms = int(__import__("datetime").datetime.fromisoformat(t["entry_time"]).timestamp() * 1000)
             # 日K的 close_time 是當天最後一毫秒(xx:59:59.999)：1分K在同一毫秒收盤時，這根日K也已經收盤
             closed = [c for c in _candles(closes) if c["close_time"] <= ms]
-            self.assertEqual(t["daily_smc"]["bias"], D.bias_series(closed)[-1]["bias"], t["entry_time"])
+            series = D.bias_series(closed)
+            self.assertTrue(series, f"前提：進場前有已收盤的日K {t['entry_time']}")
+            self.assertEqual(t["daily_smc"]["bias"], series[-1]["bias"], t["entry_time"])
 
 
 class Endpoint(unittest.TestCase):

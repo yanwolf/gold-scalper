@@ -405,6 +405,21 @@ class TestChecker(unittest.TestCase):
         self.assertGreater(src.count("(ExecHarness)"), 10, "前提：真的掃到了繼承 ExecHarness 的類別")
         self.assertEqual(harness_problems(src), [])
 
+    def test_every_test_file_is_registered(self):
+        # r101：突變、錯誤掃描、舊版重跑、新介面四種「逐檔」檢查參加哪些測試檔，由 tests/suite_registry.py 登記；
+        # 沒登記的測試檔直接報(以前寫死只看 test_lessons，r95 之後新增的測試檔全部沒進去，也沒有東西會提醒)
+        from tests import suite_registry as R
+        files = R.test_files()
+        self.assertIn("test_lessons.py", files, "前提：真的找到了測試檔")
+        self.assertEqual(R.registration_problems(), [])
+        # 自我驗證：沒登記、過期、沒理由、不認得的檢查名稱都要報
+        fake = {"test_a.py": ({"mutation"}, "x"), "test_gone.py": (set(), "x"), "test_c.py": (set(), " "),
+                "test_d.py": ({"nope"}, "x")}
+        probs = R.registration_problems(["test_a.py", "test_b.py", "test_c.py", "test_d.py"], fake)
+        for want in ("沒登記：test_b.py", "過期登記：test_gone.py", "沒寫理由：test_c.py", "不認得的檢查：test_d.py"):
+            self.assertTrue(any(p.startswith(want) for p in probs), f"{want} 沒被報出：{probs}")
+        self.assertEqual(R.modules_for("mutation")[0], "tests.test_lessons", "test_lessons 排第一")
+
     def test_every_test_file_has_positive_assertions(self):
         # r100：以前只掃 test_lessons.py；r95 之後新增的測試檔(回測、手續費、限流、停止追蹤…)都沒掃到，
         # 對照 r100 時一次找出 19 個只有否定句的測試(都已補前提)。之後新增的測試檔自動納入

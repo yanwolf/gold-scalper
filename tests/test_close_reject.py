@@ -196,6 +196,7 @@ class Abandon(Base):
                                   ex._resolve_symbol(self.eng.execution_symbol))
         self.assertEqual((entry["direction"], entry["quantity"]), ("bullish", 0.1))
         self.assertTrue(any("已停止追蹤" in a for a in self.eng.alerts))
+        self.assertTrue(self.eng._closed_trades_memory, "前提：記憶體裡有那筆")
         self.assertIsNone(self.eng._closed_trades_memory[-1]["pnl_points"], "記憶體裡那筆也是損益未知")
 
     def test_record_excluded_from_stats_and_breaker(self):
@@ -219,7 +220,8 @@ class Abandon(Base):
     def test_blocks_real_entry_until_cleared(self):
         self._stuck()
         with mock.patch.object(pt, "_latest_price", return_value=4385.0, create=True):
-            self.assertTrue(self.eng.abandon_position()[0])
+            done, _ = self.eng.abandon_position()
+            self.assertTrue(done)
         allowed, reason, kind = risk_guard._check_inner(self.eng, 0.1)
         self.assertEqual((allowed, kind), (False, "abandoned"))
         self.assertIn("已放棄追蹤", reason)

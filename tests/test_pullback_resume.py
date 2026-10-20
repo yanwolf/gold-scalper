@@ -195,7 +195,9 @@ class Integration(unittest.TestCase):
             return r
         with mock.patch.object(P, "evaluate_at", side_effect=fake):
             res = _run(pr_hold_bars=2, reversal_confirm_count=1)
-        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         self.assertEqual((t["direction"], t["exit_reason"]), ("bullish", "持有時間到"))
         held = datetime.fromisoformat(t["exit_time"]) - datetime.fromisoformat(t["entry_time"])
         self.assertEqual(held.total_seconds(), 2 * 3600)
@@ -365,8 +367,10 @@ class R101BandTouch(unittest.TestCase):
     def test_max_hold_follows_exit_mode(self):
         self.assertEqual(cfg(exit_mode=1)["max_hold_hours"], P.MID_MAX_HOLD)
         self.assertEqual(cfg(exit_mode=0, hold_bars=3)["max_hold_hours"], 3)
-        self.assertIsNone(P.build_cfg({"mode": 3})[0])
-        self.assertIsNone(P.build_cfg({"exit_mode": 4})[0])   # r104 起 2、3 是合法值
+        bad_cfg, _err = P.build_cfg({"mode": 3})  # 固定長度
+        self.assertIsNone(bad_cfg)
+        bad_cfg, _err = P.build_cfg({"exit_mode": 4})  # 固定長度
+        self.assertIsNone(bad_cfg)   # r104 起 2、3 是合法值
 
     def test_backtest_hits_mid_band(self):
         res = _run(path=BAND_PATH, pr_mode=2, pr_exit_mode=1, pr_sides=1)
@@ -381,7 +385,9 @@ class R101BandTouch(unittest.TestCase):
 
     def test_backtest_hold_one_bar(self):
         res = _run(path=BAND_PATH, pr_mode=2, pr_sides=1)
-        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         self.assertEqual(t["exit_reason"], "持有時間到")
         self.assertAlmostEqual(t["exit_price"], 3996.0, places=6)
 
@@ -406,7 +412,8 @@ class R104Exits(unittest.TestCase):
         self.assertEqual((c2["max_hold_hours"], c2["trail_atr"]), (P.MID_MAX_HOLD, 0.0))
         self.assertEqual((c3["max_hold_hours"], c3["trail_atr"]), (P.MID_MAX_HOLD, P.TRAIL_ATR))
         self.assertEqual(c1["trail_atr"], 0.0)
-        self.assertIsNone(P.build_cfg({"exit_mode": 4})[0])
+        bad_cfg, _err = P.build_cfg({"exit_mode": 4})  # 固定長度
+        self.assertIsNone(bad_cfg)
 
     def test_opposite_band_target(self):
         pre = P.precompute(_bars(BAND_PATH[:43]))
@@ -428,18 +435,24 @@ class R104Exits(unittest.TestCase):
     def test_backtest_trailing_locks_profit(self):
         path = CALM + [3995.0, 3990.0, 3984.0, 3991.0, 4004.0, 4012.0, 3995.0, 3970.0, 3970.0, 3970.0, 3970.0, 3970.0]
         res = _run(path=path, pr_mode=2, pr_exit_mode=3, pr_sides=1)
-        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         self.assertAlmostEqual(t["entry_price"], 3991.0, places=6, msg="前提：同一個進場")
         self.assertEqual(t["exit_reason"], "觸及移動停損")
         self.assertGreater(t["exit_price"], 3991.0, "漲上去之後回吐：移動停損鎖住獲利，不會回到原始停損")
         same = _run(path=path, pr_mode=2, pr_exit_mode=1, pr_sides=1)
-        t1 = sorted(same["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(same["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t1 = trades[0]
         self.assertNotEqual(t1["exit_reason"], "觸及移動停損", "對照：回中軌出場不會有移動停損")
 
     def test_backtest_opposite_band_hit(self):
         path = CALM + [3995.0, 3990.0, 3984.0, 3991.0, 4000.0, 4010.0, 4020.0, 4021.0, 4022.0, 4023.0, 4024.0, 4025.0]
         res = _run(path=path, pr_mode=2, pr_exit_mode=2, pr_sides=1)
-        t = sorted(res["recent_trades"], key=lambda t: t["entry_time"])[0]
+        trades = sorted(res["recent_trades"], key=lambda t: t["entry_time"])
+        self.assertTrue(trades, "前提：有交易")
+        t = trades[0]
         self.assertEqual(t["exit_reason"], "觸及停利")
         self.assertAlmostEqual(t["exit_price"], t["tp_price"])
         self.assertGreater(t["tp_price"], P.precompute(_bars(path[:43]))["bb_mid"][42], "目標比中軌遠")

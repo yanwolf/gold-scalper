@@ -200,18 +200,21 @@ class RecordAll(Base):
 
     def test_signed_request_429_makes_klines_yield(self):
         self._signed(R(429, {"Retry-After": "20"}), testnet=False)
-        self.assertEqual(W.blocked()[0], "cooldown")
+        kind, _ = W.blocked()
+        self.assertEqual(kind, "cooldown")
         self.respond(R(200))
         self.run_page("batch")
         self.assertEqual(self.sleeps, [20.0], "下單/查部位被 429，研究端K線也要等")
 
     def test_signed_request_418_blocks_klines(self):
         self._signed(R(418), testnet=False)
-        self.assertEqual(W.blocked()[0], "banned")
+        kind, _ = W.blocked()
+        self.assertEqual(kind, "banned")
 
     def test_testnet_responses_are_not_counted(self):
         self._signed(R(418, {"X-MBX-USED-WEIGHT-1M": "2300"}), testnet=True)
-        self.assertEqual((W.blocked()[0], W.used_this_minute()), (None, 0))
+        kind, _ = W.blocked()
+        self.assertEqual((kind, W.used_this_minute()), (None, 0))
 
     def test_public_endpoints_are_recorded(self):
         with mock.patch.object(E.requests, "get",
@@ -221,7 +224,7 @@ class RecordAll(Base):
         self.assertEqual(W.used_this_minute(), 77)
 
     def test_used_weight_resets_next_minute(self):
-        t = [600.0]
+        t = [600.0]  # 固定長度
         with mock.patch.object(W, "_now", side_effect=lambda: t[0]):
             W.record(R(200, {"X-MBX-USED-WEIGHT-1M": "1500"}), "x")
             self.assertEqual(W.used_this_minute(), 1500)
@@ -352,6 +355,7 @@ class Preflight(Base):
         r = P.ip_weight_check()
         self.assertEqual(r["status"], "ok")
         self.assertIn("42/2400", r["msg"])
+        self.assertEqual(len(self.calls), 1, "前提：送了一次探測")
         self.assertEqual(self.calls[0]["limit"], 1, "只抓一根(權重 1)")
 
     def test_probe_hitting_429_is_warn(self):
@@ -402,6 +406,7 @@ class SpotKlines(Base):
     def test_futures_still_uses_futures(self):
         with mock.patch.object(W, "get_klines", return_value=[]) as g:
             B.fetch_historical_klines(symbol="PAXGUSDT", days=1, end_time_ms=1_780_000_000_000 - 1)
+        self.assertTrue(g.called, "前提：真的抓了")
         self.assertEqual(g.call_args.kwargs["market"], "futures")
         self.assertEqual(g.call_args.args[0]["limit"], B.MAX_KLINES_PER_REQUEST)
 

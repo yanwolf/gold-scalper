@@ -16,10 +16,13 @@ import tempfile
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 RUNNER = r'''
-import unittest, json
-import tests.test_lessons as T
+import unittest, json, importlib
+import tests.test_lessons as T   # 框架的模組層級設定先生效
+from tests import suite_registry
+# r101：參加舊版重跑的測試檔由 tests/suite_registry.py 登記(以前寫死只跑 test_lessons)
 res = unittest.TestResult()
-unittest.defaultTestLoader.loadTestsFromModule(T).run(res)
+for name in suite_registry.modules_for("rerun_old"):
+    unittest.defaultTestLoader.loadTestsFromModule(importlib.import_module(name)).run(res)
 out = {"run": res.testsRun, "assert": [t._testMethodName for t, _ in res.failures], "program": [], "framework": []}
 for t, tb in res.errors:
     last = [l for l in tb.splitlines() if 'File "' in l][-1]

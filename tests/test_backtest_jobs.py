@@ -169,6 +169,7 @@ class Jobs(unittest.TestCase):
             job = J.get_job(out["job_id"])
         self.assertEqual(len(rec), 3, "三段各跑一次")
         ends = [r["end"] for r in rec]
+        self.assertEqual(len(ends), 3, "前提：三段的結束時間都有")
         self.assertEqual(ends, sorted(ends), "最舊的一段先跑")
         self.assertEqual(ends[1] - ends[0], 30 * DAY)
         self.assertEqual(ends[2] - ends[1], 30 * DAY)
@@ -180,7 +181,9 @@ class Jobs(unittest.TestCase):
         self.assertEqual(job["aggregate"]["total_pnl_points"], 33.0)
         aligned = next(r for r in job["aggregate"]["daily_smc_breakdown"] if r["key"] == "aligned")
         self.assertEqual(aligned["total_trades"], 3, "合計的日線分組用全部段落的交易")
-        self.assertEqual(J.list_jobs()[0]["job_id"], out["job_id"])
+        jobs = J.list_jobs()
+        self.assertTrue(jobs, "前提：清單裡有任務")
+        self.assertEqual(jobs[0]["job_id"], out["job_id"])
 
     def test_one_window_failing_does_not_stop_others(self):
         rec = []
@@ -263,6 +266,7 @@ class Jobs(unittest.TestCase):
         with mock.patch.object(db, "list_backtest_jobs", return_value=(True, [json.dumps(summary)])), \
              mock.patch.object(db, "load_backtest_job", return_value=(True, json.dumps(full))):
             got = J.list_jobs()
+        self.assertEqual(len(got), 1, "前提：讀到那一筆")
         self.assertEqual(got[0]["label_params"]["daily_smc_filter_mode"], 1)
         self.assertEqual(got[0]["label_params"]["trend_filter_mode"], 2)
 
@@ -305,6 +309,7 @@ class Endpoints(unittest.TestCase):
             job = c.get(f"/backtest/jobs/{body['job_id']}").json()
             lst = c.get("/backtest/jobs").json()
         self.assertEqual(job["status"], "done")
+        self.assertEqual(len(rec), 2, "前提：兩段各跑一次")
         self.assertEqual(rec[0]["params"]["daily_smc_filter_mode"], 3)
         self.assertEqual(rec[0]["params"]["daily_smc_against_weight"], 0.3)
         self.assertEqual(rec[0]["params"]["interval_seconds"], 900)
@@ -474,6 +479,7 @@ class Cooldown(unittest.TestCase):
             body = TestClient(m.app).post("/backtest/jobs?days=30&windows=1&cooldown_hours=6").json()
             self.assertTrue(J.wait_idle(10))
             listed = {j["job_id"]: j for j in J.list_jobs()}
+        self.assertEqual(len(rec), 1, "前提：跑了一段")
         self.assertEqual(rec[0]["params"]["cooldown_hours"], 6.0)
         self.assertEqual(listed[body["job_id"]]["label_params"]["cooldown_hours"], 6.0)
 

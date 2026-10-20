@@ -34,11 +34,15 @@ else:
     step("pyflakes", "undefined_canary_name" in canary and "undefined name 'fastapi'" in out and not bad,
          f"金絲雀{'有' if 'undefined_canary_name' in canary else '沒有'}報出、掃到main.py已知誤報、問題 {len(bad)} 項 {bad[:3]}")
 
-# 2. 行為測試＋測試靜態檢查：要全部通過、數量達標
-r = run([PY, "-m", "unittest", "tests.test_lessons", "tests.check_tests", "tests.check_indexing", "tests.check_newapi",
-         "tests.test_daily_smc", "tests.test_backtest_jobs", "tests.test_mean_reversion", "tests.test_klines_rate_limit", "tests.test_pullback_resume", "tests.test_band_touch_engine", "tests.test_fees", "tests.test_breakout_trend", "tests.test_close_reject"])
+# 2. 行為測試＋測試靜態檢查：要全部通過、數量達標。
+#    r101：自動找 tests/test_*.py 與 tests/check_*.py 全部(以前寫死模組清單，新增測試檔要記得手動加)
+import glob  # noqa: E402
+mods = sorted("tests." + os.path.basename(p)[:-3] for pat in ("test_*.py", "check_*.py")
+              for p in glob.glob(os.path.join(ROOT, "tests", pat)))
+r = run([PY, "-m", "unittest", *mods])
 ran = next((int(l.split()[1]) for l in r.stderr.splitlines() if l.startswith("Ran ")), 0)
-step("行為測試＋靜態檢查", r.returncode == 0 and ran >= 60, f"執行 {ran} 項，{'全部通過' if r.returncode == 0 else r.stderr.strip().splitlines()[-1]}")
+step("行為測試＋靜態檢查", r.returncode == 0 and ran >= 60 and "tests.test_lessons" in mods,
+     f"測試檔 {len(mods)} 個、執行 {ran} 項，{'全部通過' if r.returncode == 0 else (r.stderr.strip().splitlines() or ['(沒有輸出)'])[-1]}")
 
 # 3. 改寫工具自我驗證
 sys.path.insert(0, os.path.join(ROOT, "scripts"))

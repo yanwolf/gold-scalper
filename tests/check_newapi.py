@@ -480,14 +480,23 @@ class TestNewApi(unittest.TestCase):
         self.assertEqual(r("pt.notifier_module.notifier"), "notifier")
         self.assertEqual(r("pt.settings_module"), "settings")
 
-    def test_lessons_tests_guard_new_interfaces(self):
+    def test_registered_tests_guard_new_interfaces(self):
+        # r101：掃的測試檔由 tests/suite_registry.py 登記(要在舊版上跑的那些；以前寫死只看 test_lessons)
+        from tests import suite_registry
         legacy = legacy_names(os.path.join(HERE, "legacy"))
         self.assertGreaterEqual(len(legacy), 1, "前提：tests/legacy/ 裡真的有舊版")
         self.assertTrue(all(len(m) > 5 and "paper_trading" in m for m, _ in legacy.values()), "前提：舊版真的解析到了模組")
-        with open(os.path.join(HERE, "test_lessons.py"), encoding="utf-8") as f:
-            src = f.read()
-        self.assertGreater(src.count("def test_"), 50, "前提：真的掃到了測試")
-        self.assertEqual(problems(src, legacy), [])
+        mods = suite_registry.modules_for("newapi")
+        self.assertIn("tests.test_lessons", mods, "前提：至少有 test_lessons")
+        bad = {}
+        for m in mods:
+            with open(os.path.join(HERE, m.split(".")[-1] + ".py"), encoding="utf-8") as f:
+                src = f.read()
+            self.assertGreater(src.count("def test_"), 0, f"前提：{m} 真的有測試")
+            p = problems(src, legacy)
+            if p:
+                bad[m] = p
+        self.assertEqual(bad, {})
 
 
 if __name__ == "__main__":

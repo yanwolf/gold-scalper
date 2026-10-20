@@ -13,14 +13,65 @@
 
 執行：python -m tests.mutation_check   (有任何問題時以非0結束)
 """
+import importlib
 import sys
 import unittest
 from unittest import mock
 
 import tests.test_lessons as T
+from tests import suite_registry
+
+# r101：參加突變檢查的測試檔由 tests/suite_registry.py 登記(以前寫死只看 test_lessons)。
+# test_lessons 的測試名稱照舊是「類別.方法」；其他檔案的加上檔名：「test_close_reject:類別.方法」
+MODULES = {m: importlib.import_module(m) for m in suite_registry.modules_for("mutation")}
+
+
+def _qual(module_name, cls, meth):
+    short = module_name.split(".")[-1]
+    return f"{cls}.{meth}" if short == "test_lessons" else f"{short}:{cls}.{meth}"
+
+
+def _split(name):
+    if ":" in name:
+        short, rest = name.split(":", 1)
+        mod = MODULES["tests." + short]
+    else:
+        mod, rest = T, name
+    cls, meth = rest.split(".")
+    return mod, cls, meth
 
 # 突變下仍通過、且確實經過被突變查詢的項目：{測試: (類別, 被引用的測試, 說明)}
+# r101 起 test_close_reject 也進突變檢查。它的情境都是「平倉被拒之後」：送單前的確認與被拒後的部位確認在突變下查不到→
+# 照樣送單、記待平倉(原本的設計)，被測的拒絕計數／退讓／停止追蹤跟部位查詢的結果無關。被拒後「真的去查了、查到還在 0.1」
+# 由被引用的那一項驗證(它斷言告警寫「目前交易所部位：0.1」，突變下變成查詢失敗、明確失敗)
+R107_WHY = ("平倉被拒後的部位確認在突變下查不到→一樣記待平倉(原本的設計)；這項測的是 -2022 計數／退讓／停止追蹤，"
+            "跟部位查詢的結果無關。被拒後真的查到部位還在，由被引用的那一項驗證(突變下失敗)")
+
 EXEMPT = {
+    "test_close_reject:Abandon.test_abandon_removes_from_books_but_leaves_exchange": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:Abandon.test_blocks_real_entry_until_cleared": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:Abandon.test_persisted_and_reloaded_after_restart": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:Abandon.test_reconcile_clears_when_exchange_flat": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:Abandon.test_refused_unless_stuck": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_backoff_skips_retry_until_next_try_then_retries": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_not_stuck_retries_every_round": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_other_errors_never_back_off": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_reject_counts_and_transient_does_not": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_stuck_after_threshold_with_single_manual_alert": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_success_after_stuck_settles_and_clears_flags": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
+    "test_close_reject:RejectVsTransient.test_transient_after_stuck_resumes_every_round": ("對照組", "Lesson8Close.test_t8a_pending_close_retried_every_round_then_recovers",
+        R107_WHY),
     "Lesson19.test_t8c_step_error_recovers_and_is_cleared_at_position_end": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
         "平倉送單前的確認(r54)在突變下查不到→照樣送單(原本的設計)；這項測的是送單之後的事。送單前的確認本身由被引用的那一項驗證(突變下失敗)"),
     "Lesson22.test_t8c_error_after_close_confirmed_is_not_restored": ("對照組", "Lesson54.test_r54_exit_does_not_close_other_position",
@@ -59,15 +110,15 @@ EXEMPT = {
 
 
 def _all_tests():
-    suite = unittest.defaultTestLoader.loadTestsFromModule(T)
     out = []
-    def walk(s):
-        for x in s:
-            if isinstance(x, unittest.TestSuite):
-                walk(x)
-            else:
-                out.append(f"{type(x).__name__}.{x._testMethodName}")
-    walk(suite)
+    for mname, mod in MODULES.items():
+        def walk(s):
+            for x in s:
+                if isinstance(x, unittest.TestSuite):
+                    walk(x)
+                elif type(x).__module__ == mname:   # 從別的測試檔匯入的類別(例如 ExecHarness)不重複算
+                    out.append(_qual(mname, type(x).__name__, x._testMethodName))
+        walk(unittest.defaultTestLoader.loadTestsFromModule(mod))
     return out
 
 
@@ -76,12 +127,12 @@ CRASHED = set()
 
 def _run(name):
     """跑一項；測試程式本身拋錯(不是斷言失敗、也不是被測程式拋的)另外記下(用法第5點r34)。"""
-    cls, meth = name.split(".")
+    mod, cls, meth = _split(name)
     res = unittest.TestResult()
-    unittest.TestSuite([getattr(T, cls)(meth)]).run(res)
+    unittest.TestSuite([getattr(mod, cls)(meth)]).run(res)
     for _, tb in res.errors:
         frames = [l for l in tb.splitlines() if 'File "' in l]
-        if frames and "tests/test_lessons.py" in frames[-1]:
+        if frames and "/tests/test_" in frames[-1]:
             CRASHED.add(name)
     return res.wasSuccessful()
 
@@ -161,7 +212,7 @@ def main():
     problems += [f"突變下測試本身崩掉：{n}(索引前先確認有東西)" for n in sorted(CRASHED)]
     failed = [n for n, (p, _) in mutated.items() if not p]
     print(f"全部 {len(mutated)} 項：突變下明確失敗 {len(failed)} 項、無關(未呼叫被突變查詢) {len(unrelated)} 項、"
-          f"經驗證的豁免 {len(EXEMPT)} 項")
+          f"經驗證的豁免 {len(EXEMPT)} 項(測試檔 {len(MODULES)} 個：{'、'.join(m.split('.')[-1] for m in MODULES)})")
     for n, (k, c, why) in EXEMPT.items():
         print(f"  豁免[{k}] {n}\n      ← {c}：{why}")
 

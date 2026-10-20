@@ -61,11 +61,15 @@ class LiveSignal(unittest.TestCase):
     def test_entry_timing(self):
         now = _now_ms()
         ok = {"band": {"bar_close_ms": now - 60_000}}
-        self.assertTrue(pt.band_entry_allowed(ok, None, now_ms=now)[0])
-        self.assertFalse(pt.band_entry_allowed(ok, now - 60_000, now_ms=now)[0], "同一根K只進一次")
+        allowed, _ = pt.band_entry_allowed(ok, None, now_ms=now)
+        self.assertTrue(allowed)
+        allowed, _ = pt.band_entry_allowed(ok, now - 60_000, now_ms=now)
+        self.assertFalse(allowed, "同一根K只進一次")
         late = {"band": {"bar_close_ms": now - (pt.BAND_ENTRY_WINDOW_SECONDS + 1) * 1000}}
-        self.assertFalse(pt.band_entry_allowed(late, None, now_ms=now)[0], "收盤太久不追")
-        self.assertFalse(pt.band_entry_allowed({"band": {}}, None, now_ms=now)[0])
+        allowed, _ = pt.band_entry_allowed(late, None, now_ms=now)
+        self.assertFalse(allowed, "收盤太久不追")
+        allowed, _ = pt.band_entry_allowed({"band": {}}, None, now_ms=now)
+        self.assertFalse(allowed)
 
     def test_backtest_rejects_live_strategy_name(self):
         res = B.run_backtest(days=1, strategy_type="band_touch", klines=[], daily_klines=[])
@@ -117,6 +121,7 @@ class EngineTick(unittest.TestCase):
         self.assertAlmostEqual(pos["sl_price"], 4000.0 - 7.3, msg="停損用回拉極值算出來的距離，不是設定的點數")
         self.assertEqual(pos["tp_price"], 4008.0)
         self.assertEqual([n["action"] for n in self.notes], ["open"], "純模擬也通知")
+        self.assertEqual(len(self.notes), 1, "前提：有開倉通知")
         self.assertIsNone(self.notes[0]["executed"], "通知標成純模擬")
 
     def test_trend_and_chop_filters_are_ignored(self):
@@ -139,6 +144,7 @@ class EngineTick(unittest.TestCase):
         self.tick(self._result(stage="中性", price=4008.5))
         self.assertIsNone(self.eng._position)
         close = [n for n in self.notes if n["action"] == "close"]
+        self.assertEqual(len(close), 1, "前提：有平倉通知")
         self.assertEqual(close[0]["exit_reason"], "觸及中軌停利")
 
     def test_max_hold_exit(self):
@@ -146,7 +152,9 @@ class EngineTick(unittest.TestCase):
         self.eng._position["entry_time"] = (datetime.now(timezone.utc) - timedelta(hours=12, seconds=1)).isoformat()
         self.tick(self._result(stage="中性", price=4001.0))
         self.assertIsNone(self.eng._position)
-        self.assertEqual([n for n in self.notes if n["action"] == "close"][0]["exit_reason"], "持有時間到")
+        close = [n for n in self.notes if n["action"] == "close"]
+        self.assertEqual(len(close), 1, "前提：有平倉通知")
+        self.assertEqual(close[0]["exit_reason"], "持有時間到")
 
     def test_no_trailing_and_no_reversal_exit(self):
         self.settings_over = {"paper_reversal_confirm_count": 1, "paper_use_atr_stops": 0,

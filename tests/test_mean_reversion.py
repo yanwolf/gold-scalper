@@ -137,7 +137,8 @@ class Signals(unittest.TestCase):
     def test_setup_a_needs_rsi_extreme(self):
         pre = M.precompute(_bars(_calm(80) + [3990.0]))
         self.assertGreater(pre["rsi"][80], 10, "前提：這根的RSI沒有低到10")
-        self.assertEqual(M.evaluate_at(pre, 80, M.build_cfg({"setups": 1})[0])["direction"], "bullish", "前提：預設門檻30會進場")
+        default_cfg, _ = M.build_cfg({"setups": 1})
+        self.assertEqual(M.evaluate_at(pre, 80, default_cfg)["direction"], "bullish", "前提：預設門檻30會進場")
         cfg, _ = M.build_cfg({"rsi_level": 10, "setups": 1})
         self.assertEqual(M.evaluate_at(pre, 80, cfg)["stage"], "中性", "離快線夠遠但RSI沒到門檻：不進場")
 

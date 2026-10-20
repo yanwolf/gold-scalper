@@ -6,10 +6,29 @@ import sys
 import unittest
 from unittest import mock
 
-import tests.test_lessons as T
+import importlib
+
+import tests.test_lessons as T   # noqa: F401  (框架的模組層級設定要先生效)
+from tests import suite_registry
+
+# r101：參加錯誤掃描的測試檔由 tests/suite_registry.py 登記(以前寫死只跑 test_lessons)
+MODULES = [importlib.import_module(m) for m in suite_registry.modules_for("error_scan")]
 
 PROGRAM_ERRORS = ("NameError", "AttributeError", "TypeError", "KeyError", "UnboundLocal", "IndexError", "ValueError")
 INJECTED = ("inj-", "boom", "Read timed out", "-2019", "-2022", "-1001", "NO_BASELINE", "沒有未平倉", "Internal", "ReduceOnly")
+
+
+def _own_tests(mod):
+    """這個測試檔自己定義的測試(從別的檔匯入的類別，例如 ExecHarness 的子類別，不重複跑)。"""
+    out = []
+    def walk(s):
+        for x in s:
+            if isinstance(x, unittest.TestSuite):
+                walk(x)
+            elif type(x).__module__ == mod.__name__:
+                out.append(x)
+    walk(unittest.defaultTestLoader.loadTestsFromModule(mod))
+    return out
 
 
 def main():
@@ -52,14 +71,18 @@ def main():
     with mock.patch.object(logging.Logger, "error", capture), mock.patch.object(sys, "stderr", stderr_buf), \
             mock.patch.object(threading.Thread, "start", spy):
         with open("/dev/null", "w") as devnull:
-            r = unittest.TextTestRunner(stream=devnull, resultclass=_Result).run(
-                unittest.defaultTestLoader.loadTestsFromModule(T))
+            suite = unittest.TestSuite()
+            for mod in MODULES:
+                for t in _own_tests(mod):
+                    suite.addTest(t)
+            r = unittest.TextTestRunner(stream=devnull, resultclass=_Result).run(suite)
     tracebacks = [l for l in stderr_buf.getvalue().splitlines() if l.startswith("Traceback") or "Exception in thread" in l]
     errs.extend(("stderr", l) for l in tracebacks)
     loggers = sorted({n for n, _ in errs})
     bad = [f"[{n}] {e}" for n, e in errs
            if (n == "stderr" or any(k in e for k in PROGRAM_ERRORS)) and not any(i in e for i in INJECTED)]
-    print(f"全部 {r.testsRun} 項，失敗 {len(r.failures) + len(r.errors)}；錯誤紀錄 {len(errs)} 筆，來自 {loggers}；"
+    print(f"測試檔 {len(MODULES)} 個({'、'.join(m.__name__.split('.')[-1] for m in MODULES)})；"
+          f"全部 {r.testsRun} 項，失敗 {len(r.failures) + len(r.errors)}；錯誤紀錄 {len(errs)} 筆，來自 {loggers}；"
           f"非注入的程式錯誤：{bad or '無'}")
     # 前提(第19種)：攔截真的裝上了——至少攔到兩個不同模組寫的錯誤(測試裡有注入到網頁入口與引擎)
     if len(loggers) < 2:
