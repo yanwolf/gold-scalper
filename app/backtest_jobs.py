@@ -50,7 +50,8 @@ LABEL_PARAM_KEYS = ("symbol", "interval_seconds", "strategy_type", "daily_smc_fi
                     "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
                     # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
                     "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode",
-                    "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides", "mt5_cost_points")
+                    "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides", "mt5_cost_points",
+                    "profile_window_minutes", "value_area_method")
 # 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
 _MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
                  "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",

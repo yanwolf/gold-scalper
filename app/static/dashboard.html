@@ -501,6 +501,7 @@
     <option value="3000" selected>近3000筆</option>
     <option value="6000">近6000筆</option>
   </select>
+  <span style="font-size:11px; color:var(--muted);">筆數只在引擎「分價量表時間窗＝0」時有效</span>
 </div>
 
 <div class="panel">
@@ -518,7 +519,7 @@
       <div class="val mono" id="statVAL">--</div>
     </div>
     <div class="stat">
-      <div class="lbl">取樣成交筆數</div>
+      <div class="lbl">取樣範圍</div>
       <div class="val mono" id="statCount">--</div>
     </div>
   </div>
@@ -993,6 +994,18 @@
         <input type="number" id="backtestTrendSlowMult" placeholder="留空=沿用正式設定" step="0.5" min="1.5" max="6" />
       </div>
       <div class="settings-field">
+        <label>分價量表時間窗(分鐘；0＝舊做法：最後3000筆＝回測裡約750分鐘)</label>
+        <input type="number" id="backtestProfileWindow" placeholder="留空=沿用正式設定" step="30" min="0" max="4320" />
+      </div>
+      <div class="settings-field">
+        <label>Value Area 算法</label>
+        <select id="backtestVaMethod">
+          <option value="">沿用目前正式設定</option>
+          <option value="0">0＝舊：挑最大量價位</option>
+          <option value="1">1＝標準：從POC往兩側擴張</option>
+        </select>
+      </div>
+      <div class="settings-field">
         <label>日線SMC結構濾網(只存在回測，不會套用到引擎)</label>
         <select id="backtestDailySmcMode">
           <option value="">關閉(只分組統計)</option>
@@ -1432,6 +1445,8 @@ const els = {
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
+  backtestProfileWindow: document.getElementById('backtestProfileWindow'),   // r112
+  backtestVaMethod: document.getElementById('backtestVaMethod'),
   backtestDailySmcMode: document.getElementById('backtestDailySmcMode'),
   backtestDailySmcWeight: document.getElementById('backtestDailySmcWeight'),
   backtestCooldown: document.getElementById('backtestCooldown'),
@@ -1603,7 +1618,9 @@ function renderProfile(data, currentPrice){
   els.statPoc.textContent = data.poc != null ? data.poc.toFixed(2) : '--';
   els.statVAH.textContent = data.value_area_high != null ? data.value_area_high.toFixed(2) : '--';
   els.statVAL.textContent = data.value_area_low != null ? data.value_area_low.toFixed(2) : '--';
-  els.statCount.textContent = data.trade_count != null ? data.trade_count.toLocaleString() : '--';
+  els.statCount.textContent = data.trade_count != null
+    ? (data.source === 'candles' ? `最近${fmtMinutes(data.window_minutes)}` : `${data.trade_count.toLocaleString()}筆` + (data.covered_minutes != null ? `≈${fmtMinutes(data.covered_minutes)}` : ''))
+    : '--';
 
   const maxPct = Math.max(...profile.map(p => p.pct_of_max), 1);
   const sorted = [...profile].sort((a,b) => b.price_level - a.price_level);
@@ -1704,6 +1721,26 @@ function renderChan(data){
   `;
 }
 
+// r112：標出纏論用哪個週期、分價量表實際涵蓋多久(以前寫「中樞」「VAH」看不出是幾分K、幾分鐘)
+function fmtMinutes(m){
+  if(m == null || Number.isNaN(Number(m))) return '?';
+  m = Number(m);
+  if(m >= 120) return `${(m / 60).toFixed(m % 60 ? 1 : 0)}小時`;
+  return `${Math.round(m)}分鐘`;
+}
+function chanIntervalText(cd){
+  const sec = cd && cd.interval_seconds;
+  if(!sec) return '';
+  return sec >= 3600 ? `(${sec / 3600}小時K)` : `(${sec / 60}分K)`;
+}
+function profileSampleText(pd){
+  if(!pd) return '';
+  const va = Number(pd.value_area_method) === 1 ? '標準VA' : '舊VA';
+  if(pd.source === 'candles') return `最近${fmtMinutes(pd.window_minutes)}・1分K合成・${va}`;
+  const cov = pd.covered_minutes != null ? `≈${fmtMinutes(pd.covered_minutes)}` : '';
+  return `最後${pd.trade_count != null ? Number(pd.trade_count).toLocaleString() : '?'}筆成交${cov}・${va}`;
+}
+
 function renderSignal(data){
   const stage = data.stage || '中性';
   const direction = data.direction; // 'bullish' | 'bearish' | null
@@ -1722,7 +1759,7 @@ function renderSignal(data){
     const c = data.chan;
     parts.push(`
       <div class="signal-reason ${c.bias}">
-        <div class="src-label">纏論</div>
+        <div class="src-label">纏論${chanIntervalText(data.chan_detail)}</div>
         <div>${c.reason}</div>
       </div>
     `);
@@ -1731,7 +1768,7 @@ function renderSignal(data){
     const p = data.profile;
     parts.push(`
       <div class="signal-reason ${p.bias}">
-        <div class="src-label">分價量表</div>
+        <div class="src-label">分價量表${data.profile_detail ? `(${profileSampleText(data.profile_detail)})` : ''}</div>
         <div>${p.reason}</div>
       </div>
     `);
@@ -1764,6 +1801,30 @@ function fmtZone(z){
   const side = z.side === 'bullish' ? '多方' : '空方';
   return `${side}${z.kind} ${Number(z.bot).toFixed(0)}–${Number(z.top).toFixed(0)}`;
 }
+// r112：大級別流動性(還沒被掃過的波段高低點)與跌破後的空檔，純參考
+function fmtLevel(lv){
+  const src = lv.source && lv.source !== 'XAUUSDT' ? `，${lv.source}現貨` : '';
+  const date = lv.date ? (lv.source && lv.source !== 'XAUUSDT' ? lv.date.slice(0, 7) : fmtUtcDay(lv.date)) : '?';
+  const eq = lv.equal_count > 1 ? `，等${lv.kind === 'low' ? '低' : '高'}點×${lv.equal_count}` : '';
+  return `${Number(lv.price).toFixed(0)}(${date}${src}${eq})`;
+}
+function dailyLiquidityLines(liq){
+  if(!liq) return [];
+  const out = [];
+  const below = liq.below || [], above = liq.above || [];
+  if(below.length) out.push(`大級別低點(未被掃，賣方流動性)：${below.map(fmtLevel).join('、')}`);
+  else out.push(`下方${liq.xau_first_date ? `自 ${liq.xau_first_date} 以來` : ''}沒有還沒被掃過的大級別低點`);
+  if(above.length) out.push(`大級別高點(未被掃，買方流動性)：${above.map(fmtLevel).join('、')}`);
+  const v = liq.void_below;
+  if(v){
+    out.push(v.to != null
+      ? `收盤跌破 ${Number(v.from).toFixed(0)} 後，下一個大級別低點在 ${Number(v.to).toFixed(0)}${v.to_source && v.to_source !== 'XAUUSDT' ? `(${v.to_source}現貨)` : ''}，中間約 ${Number(v.points).toFixed(0)} 點沒有大級別結構`
+      : `收盤跌破 ${Number(v.from).toFixed(0)} 後，${liq.long_used ? '可查的歷史' : `XAUUSDT 有資料以來(${liq.xau_first_date || '?'})`}下方沒有更低的大級別低點`);
+  }
+  if(liq.long_error && !liq.long_used) out.push(`(更早的結構點用 PAXGUSDT 補，這次沒抓到：${liq.long_error})`);
+  return out;
+}
+
 function dailySmcSignalHtml(d, signalDirection){
   if(!d.available){
     return `<div class="signal-reason"><div class="src-label">日線結構(SMC，純參考)</div><div>${d.reason || '日線資料還沒抓到'}</div></div>`;
@@ -1787,7 +1848,9 @@ function dailySmcSignalHtml(d, signalDirection){
   if((d.zones_inside || []).length) zs.push(`現價在 ${d.zones_inside.map(fmtZone).join('、')} 裡`);
   if((d.zones_above || []).length) zs.push(`上方 ${d.zones_above.slice(0, 2).map(fmtZone).join('、')}`);
   if((d.zones_below || []).length) zs.push(`下方 ${d.zones_below.slice(0, 2).map(fmtZone).join('、')}`);
+  else zs.push('下方沒有還有效的多方 OB/FVG');   // r112：以前空白，看不出是「沒有」還是「沒算」
   if(zs.length) lines.push(zs.join('；'));
+  lines.push(...dailyLiquidityLines(d.liquidity));
   if(d.intraday_note) lines.push(`🟡 ${d.intraday_note}`);
   if(d.stale) lines.push('⚠️ 日線資料過期(超過 30 小時沒更新)，開倉標記會記成「未知」' + (d.last_error ? `：${d.last_error}` : ''));
   const conflict = signalDirection && d.bias && !d.stale && d.bias !== signalDirection ? '　與目前訊號方向相反(僅參考，不會擋單)' : '';
@@ -2753,6 +2816,8 @@ function backtestResultToEngineValues(data){
     paper_trend_filter_mode: data.trend_filter_mode,
     paper_trend_interval_seconds: data.trend_interval_seconds,
     paper_trend_slow_multiplier: data.trend_slow_multiplier,
+    paper_profile_window_minutes: data.profile_window_minutes,   // r112
+    paper_value_area_method: data.value_area_method,
   };
   if(data.smc_cfg){
     values.smc_touch_window = data.smc_cfg.touch_window;
@@ -2779,6 +2844,7 @@ const BT_FIELD_MAP = {
   paper_block_market_closed: 'backtestBlockMarketClosed', paper_min_atr_points: 'backtestMinAtr',
   paper_trend_filter_mode: 'backtestTrendMode', paper_trend_interval_seconds: 'backtestTrendInterval',
   paper_trend_slow_multiplier: 'backtestTrendSlowMult',
+  paper_profile_window_minutes: 'backtestProfileWindow', paper_value_area_method: 'backtestVaMethod',
   smc_touch_window: 'backtestSmcTouchWindow', smc_wt_level: 'backtestSmcWtLevel',
   smc_confirm_bos: 'backtestSmcConfirmBos', smc_require_ema: 'backtestSmcRequireEma',
   smc_exit_mode: 'backtestSmcExitMode', smc_min_rr: 'backtestSmcMinRr',
@@ -3455,6 +3521,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
   'paper_block_market_closed', 'paper_min_atr_points',
   'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier',
+  'paper_profile_window_minutes', 'paper_value_area_method',
   'smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr',
 ];
 
@@ -3582,6 +3649,8 @@ function buildBacktestParamOverrides(){
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
+  addIfPresent('profile_window_minutes', els.backtestProfileWindow);   // r112
+  addIfPresent('value_area_method', els.backtestVaMethod);
   addIfPresent('daily_smc_filter_mode', els.backtestDailySmcMode);
   addIfPresent('daily_smc_against_weight', els.backtestDailySmcWeight);
   addIfPresent('cooldown_hours', els.backtestCooldown);
@@ -3715,6 +3784,8 @@ function renderBacktestResult(data, el){
       paper_trend_filter_mode: data.trend_filter_mode,
       paper_trend_interval_seconds: data.trend_interval_seconds,
       paper_trend_slow_multiplier: data.trend_slow_multiplier,
+      paper_profile_window_minutes: data.profile_window_minutes,   // r112
+      paper_value_area_method: data.value_area_method,
       _strategy_type: data.strategy_type,
       _symbol: data.symbol,
       _smc_cfg: data.smc_cfg,
@@ -3792,6 +3863,10 @@ function btParamLabel(p){
   else parts.push(`趨勢:${Number(p.trend_filter_mode) === 2 ? '嚴格' : '擋逆勢'}${p.trend_interval_seconds ? ' ' + p.trend_interval_seconds/3600 + 'h' : ''}${p.trend_slow_multiplier ? ' ' + p.trend_slow_multiplier + 'x' : ''}`);
   if(Number(p.cooldown_hours) > 0) parts.push(`冷卻${Number(p.cooldown_hours)}h`);
   if(p.mt5_cost_points != null && p.mt5_cost_points !== '') parts.push(`MT5成本${Number(p.mt5_cost_points)}`);
+  // r112：分價量表取樣(只有纏論類策略才有意義)
+  if(p.profile_window_minutes != null && p.profile_window_minutes !== '')
+    parts.push(Number(p.profile_window_minutes) > 0 ? `量表${fmtMinutes(Number(p.profile_window_minutes))}` : '量表:舊3000筆');
+  if(p.value_area_method != null && p.value_area_method !== '') parts.push(Number(p.value_area_method) === 1 ? 'VA:標準' : 'VA:舊');
   return parts.join('・');
 }
 
@@ -4025,6 +4100,7 @@ const SETTINGS_GROUPS = [
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points',
                               'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier'] },
+  { title: '分價量表取樣(r112，纏論引擎用)', keys: ['paper_profile_window_minutes', 'paper_value_area_method'] },
   { title: 'SMC結構策略(只影響 smc_structure_3600 引擎)', keys: ['smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr'], collapsed: true },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },

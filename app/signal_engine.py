@@ -28,7 +28,7 @@ from app.binance_client import binance_streamer
 from app.analysis import (
     build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile,
     compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
-    compute_trend_filter,
+    compute_trend_filter, candles_to_synthetic_trades, trades_in_window,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
 from app import smc_structure
@@ -96,7 +96,8 @@ def signal_band_touch(hourly, current_price, now_ms=None):
 def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                                 current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
                                 trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
-                                smc_candles=None, smc_cfg=None):
+                                smc_candles=None, smc_cfg=None,
+                                profile_window_minutes=0, value_area_method=0, profile_trades=None):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -104,6 +105,13 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     trades必須是時間遞增排序、格式為[{"time","price","qty",...}, ...]。
     trade_limit只影響分價量表的取樣範圍，纏論一律用CHAN_LOOKBACK_TRADES內的資料
     (如果傳進來的trades本身就比較短，就整份都用)。
+
+    r112 分價量表的取樣方式：
+      - profile_window_minutes=0(預設)：照舊取最後 trade_limit 筆。注意即時(真實逐筆，3000筆常常只有幾分鐘)
+        跟回測(每根1分K拆4筆，3000筆＝750分鐘)涵蓋的時間差很多，這是 r111 以前就有的落差。
+      - profile_window_minutes>0：改成「最近N分鐘」。profile_trades 有給(即時路徑：1分K合成成交)就從它取，
+        沒給(回測：本來就是1分K合成成交)就從 trades 取——兩邊都是同一種合成方式，即時跟回測一致。
+      - value_area_method：0＝舊算法、1＝標準(從POC相鄰擴張)，見 analysis.poc_and_value_area()。
 
     current_price可以外部指定(例如即時模式想用bid/ask中價而不是最後一筆成交價)，
     不指定的話預設用trades最後一筆的成交價。這個值必須在呼叫generate_signal()
@@ -172,9 +180,15 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     atr = compute_atr(candles)  # 給ATR動態停損模式用，資料不足時是None(呼叫端要處理)
     choppiness_index = compute_choppiness_index(candles)  # 給震盪濾網用，資料不足時是None
 
-    profile_trades = trades[-trade_limit:] if len(trades) > trade_limit else trades
+    window = int(profile_window_minutes or 0)
+    if window > 0:
+        profile_trades = trades_in_window(profile_trades if profile_trades is not None else trades, window)
+        profile_source = "candles"
+    else:
+        profile_trades = trades[-trade_limit:] if len(trades) > trade_limit else trades
+        profile_source = "trades"
     profile = compute_volume_profile(profile_trades, bucket_size=bucket_size)
-    poc_info = poc_and_value_area(profile)
+    poc_info = poc_and_value_area(profile, method=value_area_method)
 
     if current_price is None:
         current_price = trades[-1]["price"] if trades else None
@@ -213,6 +227,12 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     result["profile_detail"] = {
         "bucket_size": bucket_size,
         "trade_count": len(profile_trades),
+        # r112：這份分價量表實際涵蓋多久、怎麼取樣的(網頁標示用；以前看不出來只有幾分鐘)
+        "source": profile_source,
+        "window_minutes": window or None,
+        "value_area_method": int(value_area_method or 0),
+        "covered_minutes": (round((profile_trades[-1]["time"] - profile_trades[0]["time"]) / 60000, 1)
+                            if len(profile_trades) >= 2 else 0),
         "profile": profile,
         **poc_info,
         # 多空分布的文字解讀(主動買賣比、價格相對VA/POC位置、上下籌碼、HVN/LVN)
@@ -221,12 +241,15 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     return result
 
 
+PROFILE_WINDOW_MAX_MINUTES = 4320   # r112：即時1分K快取預設保留3天(MINUTE_BAR_HISTORY_DAYS)；回測窗口20000筆合成成交≈83小時
+
 TREND_CANDLE_LIMIT = 300  # 給趨勢濾網的大週期K棒數上限(ST period=10只需要幾十根，多留一些讓Wilder平滑穩定)
 
 
 def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                          strategy_type="chan_profile", resonance_min_conditions=4,
-                         trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0):
+                         trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
+                         profile_window_minutes=0, value_area_method=0):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
@@ -287,6 +310,12 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     if trend_interval_seconds:
         tc = binance_streamer.get_recent_candles(interval_seconds=int(trend_interval_seconds), limit=TREND_CANDLE_LIMIT + 1)
         trend_candles = tc[:-1] if len(tc) > 1 else None
+    # r112：分價量表用時間窗時，從1分K快取合成成交(跟回測同一種拆法)；不受逐筆成交緩衝區長度限制
+    profile_trades = None
+    window = min(int(profile_window_minutes or 0), PROFILE_WINDOW_MAX_MINUTES)
+    if window > 0 and strategy_type not in ("smc_structure", "band_touch"):
+        minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=window)
+        profile_trades = candles_to_synthetic_trades(minute_bars)
     result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
@@ -299,6 +328,9 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         trend_candles=trend_candles,
         trend_fast_multiplier=trend_fast_multiplier,
         trend_slow_multiplier=trend_slow_multiplier,
+        profile_window_minutes=window,
+        value_area_method=value_area_method,
+        profile_trades=profile_trades,
     )
     result["bid"] = bid
     result["ask"] = ask

@@ -29,6 +29,7 @@ from app import smc_structure
 from app import mean_reversion
 from app import pullback_resume
 from app import breakout_trend
+from app import cost_profiles
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -243,6 +244,7 @@ def run_backtest(
     bo_trail_trigger_atr=None,
     bo_trail_atr=None,
     bo_max_hold_days=None,
+    mt5_cost_points=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -837,6 +839,8 @@ def run_backtest(
     # 這個假設值概估交易成本對績效的影響，抓大概的量級參考用
     # (修正記錄見README)。預設值0時，這組數字會跟raw stats完全一樣。
     stats_spread_adjusted = compute_stats(closed_trades, spread_cost_points=spread_cost_points)
+    # r111：同一批交易用 MT5 券商的成本(點差＋佣金＋隔夜庫存費)重算，只是統計，不影響回測本身
+    mt5_view = cost_profiles.view(closed_trades, cost_points=mt5_cost_points)
     readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
 
     return {
@@ -902,5 +906,6 @@ def run_backtest(
         "symbol": symbol,
         "stats_spread_adjusted": stats_spread_adjusted,
         "readiness_spread_adjusted": readiness_spread_adjusted,
+        "mt5_view": mt5_view,
         "assumed_spread_points": spread_cost_points,
     }

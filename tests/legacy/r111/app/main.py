@@ -1092,6 +1092,7 @@ async def backtest_run(
     bo_trail_trigger_atr: Optional[float] = None,
     bo_trail_atr: Optional[float] = None,
     bo_max_hold_days: Optional[int] = None,
+    mt5_cost_points: Optional[float] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -1172,7 +1173,7 @@ async def backtest_run(
         pr_exit_mode=pr_exit_mode,
         bo_channel=bo_channel, bo_big_bar_atr=bo_big_bar_atr, bo_trend=bo_trend, bo_sides=bo_sides,
         bo_sl_atr=bo_sl_atr, bo_trail_trigger_atr=bo_trail_trigger_atr, bo_trail_atr=bo_trail_atr,
-        bo_max_hold_days=bo_max_hold_days,
+        bo_max_hold_days=bo_max_hold_days, mt5_cost_points=mt5_cost_points,
     )
 
 
@@ -1233,6 +1234,7 @@ def _backtest_job_params(
     bo_trail_trigger_atr: Optional[float] = None,
     bo_trail_atr: Optional[float] = None,
     bo_max_hold_days: Optional[int] = None,
+    mt5_cost_points: Optional[float] = None,
 ):
     """背景回測任務的參數：跟 /backtest/run 同一組(天數、結束日期、段數另外給)。"""
     return dict(locals())
