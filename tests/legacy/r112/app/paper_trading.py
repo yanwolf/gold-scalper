@@ -28,6 +28,7 @@ from app.signal_engine import compute_full_signal
 from app import db
 from app import trading_core
 from app import abandoned
+from app import cost_profiles
 from app import settings as settings_module
 from app import notifier as notifier_module
 from app import alert_cadence
@@ -1420,6 +1421,9 @@ class PaperTradingEngine:
             # 趨勢濾網開啟時才多算一份大週期K棒的雙SuperTrend
             trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600)) if trend_mode else None,
             trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0)),
+            # r112：分價量表時間窗／VA算法(預設 0／0＝跟 r111 一樣)
+            profile_window_minutes=int(s.get("paper_profile_window_minutes", 0) or 0),
+            value_area_method=int(s.get("paper_value_area_method", 0) or 0),
         )
         current_price = result.get("current_price")
         if current_price is None:
@@ -2422,6 +2426,7 @@ class PaperTradingEngine:
         # 預設值0時，這組數字會跟raw stats完全一樣，不影響任何既有行為。
         spread_points = s.get("execution_assumed_spread_points", 0.0)
         stats_spread_adjusted = compute_stats(stats_trades, spread_cost_points=spread_points)
+        mt5_view = self._safe("MT5成本重算", lambda: cost_profiles.view(stats_trades), default=None)
         from app.trading_stats import real_usd_summary
         real_usd = real_usd_summary(stats_trades)
         readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
@@ -2470,6 +2475,7 @@ class PaperTradingEngine:
             },
             "stats_spread_adjusted": stats_spread_adjusted,
             "readiness_spread_adjusted": readiness_spread_adjusted,
+            "mt5_view": mt5_view,   # r111：同一批交易用 MT5 券商成本重算(只是統計)
             "assumed_spread_points": spread_points,
             "slippage_impact": slippage_impact,
             "daily_smc_breakdown": daily_smc_breakdown,

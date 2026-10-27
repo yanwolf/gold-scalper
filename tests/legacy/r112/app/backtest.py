@@ -24,11 +24,12 @@ from datetime import datetime, timezone
 
 import requests
 
-from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE
+from app.signal_engine import compute_signal_from_trades, DEFAULT_STRATEGY_TYPE, PROFILE_WINDOW_MAX_MINUTES
 from app import smc_structure
 from app import mean_reversion
 from app import pullback_resume
 from app import breakout_trend
+from app import cost_profiles
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -243,6 +244,9 @@ def run_backtest(
     bo_trail_trigger_atr=None,
     bo_trail_atr=None,
     bo_max_hold_days=None,
+    mt5_cost_points=None,
+    profile_window_minutes=None,
+    value_area_method=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -318,6 +322,20 @@ def run_backtest(
         trend_interval_seconds = int(s.get("paper_trend_interval_seconds", 3600) or 3600)
     if trend_slow_multiplier is None:
         trend_slow_multiplier = float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0)
+    # r112：分價量表時間窗／VA算法，沒填沿用正式設定(跟其他交易參數一樣，一鍵套用會帶過去)
+    if profile_window_minutes is None:
+        profile_window_minutes = int(s.get("paper_profile_window_minutes", 0) or 0)
+    if value_area_method is None:
+        value_area_method = int(s.get("paper_value_area_method", 0) or 0)
+    try:
+        profile_window_minutes = int(profile_window_minutes)
+        value_area_method = int(value_area_method)
+    except (TypeError, ValueError):
+        return {"error": "分價量表時間窗／VA算法要填整數"}
+    if not 0 <= profile_window_minutes <= PROFILE_WINDOW_MAX_MINUTES:
+        return {"error": f"分價量表時間窗要在 0～{PROFILE_WINDOW_MAX_MINUTES} 分鐘之間"}
+    if value_area_method not in (0, 1):
+        return {"error": "VA算法只有 0(舊)或 1(標準)"}
     if strategy_type is None:
         strategy_type = DEFAULT_STRATEGY_TYPE
     if strategy_type == "band_touch":
@@ -666,6 +684,8 @@ def run_backtest(
                 current_price=current_price,
                 strategy_type=strategy_type,
                 resonance_min_conditions=resonance_min_conditions,
+                profile_window_minutes=profile_window_minutes,
+                value_area_method=value_area_method,
             )
 
         # ATR動態停損模式：每一步都用「當下的ATR x 倍數」重新計算距離，
@@ -837,6 +857,8 @@ def run_backtest(
     # 這個假設值概估交易成本對績效的影響，抓大概的量級參考用
     # (修正記錄見README)。預設值0時，這組數字會跟raw stats完全一樣。
     stats_spread_adjusted = compute_stats(closed_trades, spread_cost_points=spread_cost_points)
+    # r111：同一批交易用 MT5 券商的成本(點差＋佣金＋隔夜庫存費)重算，只是統計，不影響回測本身
+    mt5_view = cost_profiles.view(closed_trades, cost_points=mt5_cost_points)
     readiness_spread_adjusted = assess_readiness(stats_spread_adjusted)
 
     return {
@@ -884,6 +906,8 @@ def run_backtest(
         "trend_filter_mode": trend_filter_mode,
         "trend_interval_seconds": trend_interval_seconds,
         "trend_slow_multiplier": trend_slow_multiplier,
+        "profile_window_minutes": profile_window_minutes,   # r112：0＝舊做法(最後 trade_limit 筆合成成交＝trade_limit/4 分鐘)
+        "value_area_method": value_area_method,
         "skipped_trend": skipped_trend,  # 被趨勢濾網擋掉的進場訊號數
         "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
         "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數
@@ -902,5 +926,6 @@ def run_backtest(
         "symbol": symbol,
         "stats_spread_adjusted": stats_spread_adjusted,
         "readiness_spread_adjusted": readiness_spread_adjusted,
+        "mt5_view": mt5_view,
         "assumed_spread_points": spread_cost_points,
     }

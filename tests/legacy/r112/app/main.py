@@ -1092,6 +1092,9 @@ async def backtest_run(
     bo_trail_trigger_atr: Optional[float] = None,
     bo_trail_atr: Optional[float] = None,
     bo_max_hold_days: Optional[int] = None,
+    mt5_cost_points: Optional[float] = None,
+    profile_window_minutes: Optional[int] = None,
+    value_area_method: Optional[int] = None,
 ):
     """
     歷史回測：抓Binance過去N天(上限7天)的K線資料，套用跟即時模擬單完全相同的
@@ -1172,7 +1175,8 @@ async def backtest_run(
         pr_exit_mode=pr_exit_mode,
         bo_channel=bo_channel, bo_big_bar_atr=bo_big_bar_atr, bo_trend=bo_trend, bo_sides=bo_sides,
         bo_sl_atr=bo_sl_atr, bo_trail_trigger_atr=bo_trail_trigger_atr, bo_trail_atr=bo_trail_atr,
-        bo_max_hold_days=bo_max_hold_days,
+        bo_max_hold_days=bo_max_hold_days, mt5_cost_points=mt5_cost_points,
+        profile_window_minutes=profile_window_minutes, value_area_method=value_area_method,
     )
 
 
@@ -1233,6 +1237,9 @@ def _backtest_job_params(
     bo_trail_trigger_atr: Optional[float] = None,
     bo_trail_atr: Optional[float] = None,
     bo_max_hold_days: Optional[int] = None,
+    mt5_cost_points: Optional[float] = None,
+    profile_window_minutes: Optional[int] = None,
+    value_area_method: Optional[int] = None,
 ):
     """背景回測任務的參數：跟 /backtest/run 同一組(天數、結束日期、段數另外給)。"""
     return dict(locals())
@@ -1457,6 +1464,9 @@ async def signal_latest(interval_seconds: int = 300, bucket_size: float = 1.0, t
         interval_seconds=interval_seconds, bucket_size=bucket_size, trade_limit=trade_limit,
         trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600) or 3600),
         trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0) or 3.0),
+        # r112：主畫面的分價量表跟這個週期的纏論引擎用同一種取樣(時間窗／VA算法)
+        profile_window_minutes=int(s.get("paper_profile_window_minutes", 0) or 0),
+        value_area_method=int(s.get("paper_value_area_method", 0) or 0),
     )
     if result.get("trend_filter") is not None:
         result["trend_filter"]["filter_mode"] = int(s.get("paper_trend_filter_mode", 0) or 0)

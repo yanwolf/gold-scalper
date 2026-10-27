@@ -323,6 +323,54 @@ def candles_to_synthetic_trades(candles, interval_ms=60_000):
     return out
 
 
+PROFILE_ANCHOR_WINDOW = 0     # 最近N分鐘(r112)
+PROFILE_ANCHOR_SESSION = 1    # r113：每天紐約 17:00 換日重置(黃金 CFD／期貨的交易日)
+PROFILE_ANCHOR_ZHONGSHU = 2   # r113：從目前(最新)中樞的第一筆開始
+SESSION_MIN_MINUTES = 60      # 換日後不到這麼久，連前一個交易日一起算(剛換日時只有幾根K，量表沒有意義)
+ZHONGSHU_FALLBACK_BARS = 50   # 還沒有中樞時，退回最近 50 根(跟 15分K 配 12.5 小時同一個比例)
+
+
+def ny_session_start_ms(t_ms, rollover_hour=17):
+    """r113：t_ms 所在交易日的開始＝最近一次(含當下)紐約 rollover_hour:00。含夏令時間(用 cost_profiles 的時區)。"""
+    from datetime import timedelta
+    from app.cost_profiles import NY
+    t = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).astimezone(NY)
+    d = t.date()
+    start = datetime(d.year, d.month, d.day, rollover_hour, tzinfo=NY)
+    if start > t:
+        d = d - timedelta(days=1)
+        start = datetime(d.year, d.month, d.day, rollover_hour, tzinfo=NY)
+    return int(start.timestamp() * 1000)
+
+
+def profile_anchor_start_ms(anchor, last_ms, chan_data=None, interval_seconds=900):
+    """
+    r113：分價量表從哪個時間點開始算(含)。回傳 (start_ms, 說明)。
+      - SESSION：今天這個交易日(紐約17:00換日)；換日不到 SESSION_MIN_MINUTES 分鐘就從前一個交易日開始
+      - ZHONGSHU：最新中樞第一筆的起點；還沒有中樞就退回最近 ZHONGSHU_FALLBACK_BARS 根K
+    """
+    if anchor == PROFILE_ANCHOR_SESSION:
+        start = ny_session_start_ms(last_ms)
+        if last_ms - start < SESSION_MIN_MINUTES * 60_000:
+            return ny_session_start_ms(start - 1), "前一交易日起(剛換日)"
+        return start, "今日交易日起"
+    if anchor == PROFILE_ANCHOR_ZHONGSHU:
+        zs = (chan_data or {}).get("latest_zhongshu")
+        if zs and zs.get("start_time") is not None:
+            return int(zs["start_time"]), "最新中樞起"
+        return last_ms - ZHONGSHU_FALLBACK_BARS * int(interval_seconds) * 1000, f"沒有中樞，退回最近{ZHONGSHU_FALLBACK_BARS}根"
+    raise ValueError(f"不認得的分價量表錨點: {anchor}")
+
+
+def trades_since(trades, start_ms):
+    """r113：只留 time >= start_ms 的成交(trades 時間遞增)。"""
+    import bisect
+    if not trades:
+        return []
+    times = [t["time"] for t in trades]
+    return trades[bisect.bisect_left(times, int(start_ms)):]
+
+
 def trades_in_window(trades, window_minutes):
     """r112：只留最後一筆成交往回 window_minutes 分鐘內的成交(trades 時間遞增)。"""
     if not trades or not window_minutes:

@@ -1,5 +1,5 @@
 """
-r112 的測試：分價量表取樣(時間窗、即時跟回測一致)、標準 Value Area、日線大級別流動性。
+r112／r113 的測試：分價量表取樣(r113 加：每日換日、錨定中樞)(時間窗、即時跟回測一致)、標準 Value Area、日線大級別流動性。
 
 背景(r112 查到的落差)：分價量表一直取「最後 3000 筆成交」。即時是真實逐筆，成交熱的時候只有幾分鐘；
 回測是每根1分K拆4筆合成成交，3000 筆＝750 分鐘。同一個設定，即時跟回測看的時間差了上百倍，
@@ -174,6 +174,87 @@ class Sampling(unittest.TestCase):
         self.assertIn((60, SE.PROFILE_WINDOW_MAX_MINUTES), seen)
 
 
+def _utc_ms(iso):
+    from datetime import datetime, timezone
+    return int(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+class Anchor(unittest.TestCase):
+    """r113：分價量表從「交易日開始」或「最新中樞開始」算(只存在回測)。"""
+
+    def test_ny_session_start_handles_dst(self):
+        self.assertEqual(A.ny_session_start_ms(_utc_ms("2026-10-27T22:30:00")), _utc_ms("2026-10-27T21:00:00"),
+                         "夏令：紐約17:00＝UTC 21:00")
+        self.assertEqual(A.ny_session_start_ms(_utc_ms("2026-10-27T20:59:00")), _utc_ms("2026-10-26T21:00:00"),
+                         "還沒到17:00 → 前一天17:00")
+        self.assertEqual(A.ny_session_start_ms(_utc_ms("2026-10-27T21:00:00")), _utc_ms("2026-10-27T21:00:00"), "剛好換日那一刻算新的一天")
+        self.assertEqual(A.ny_session_start_ms(_utc_ms("2026-01-15T21:30:00")), _utc_ms("2026-01-14T22:00:00"),
+                         "冬令：紐約17:00＝UTC 22:00")
+
+    def test_session_anchor_and_just_rolled_over(self):
+        last = _utc_ms("2026-10-27T23:00:00")
+        start, note = A.profile_anchor_start_ms(A.PROFILE_ANCHOR_SESSION, last)
+        self.assertEqual((start, note), (_utc_ms("2026-10-27T21:00:00"), "今日交易日起"))
+        early = _utc_ms("2026-10-27T21:30:00")
+        start, note = A.profile_anchor_start_ms(A.PROFILE_ANCHOR_SESSION, early)
+        self.assertEqual(start, _utc_ms("2026-10-26T21:00:00"), "換日不到60分鐘：連前一個交易日一起算")
+        self.assertIn("前一交易日", note)
+
+    def test_zhongshu_anchor_and_fallback(self):
+        last = T0 + 1000 * MIN
+        start, note = A.profile_anchor_start_ms(A.PROFILE_ANCHOR_ZHONGSHU, last,
+                                                {"latest_zhongshu": {"start_time": T0 + 400 * MIN}}, 900)
+        self.assertEqual((start, note), (T0 + 400 * MIN, "最新中樞起"))
+        start, note = A.profile_anchor_start_ms(A.PROFILE_ANCHOR_ZHONGSHU, last, {"latest_zhongshu": None}, 900)
+        self.assertEqual(start, last - 50 * 900 * 1000, "沒有中樞：退回最近50根15分K")
+        self.assertIn("退回", note)
+        with self.assertRaises(ValueError):
+            A.profile_anchor_start_ms(9, last)
+
+    def test_trades_since(self):
+        trades = A.candles_to_synthetic_trades(_minute_bars(10))
+        got = A.trades_since(trades, T0 + 6 * MIN)
+        self.assertEqual(len(trades), 40, "前提")
+        self.assertEqual(len(got), 16, "從第6根的開盤(含)開始，4根×4筆")
+        self.assertEqual(A.trades_since([], 0), [])
+
+    def test_signal_uses_latest_zhongshu_start(self):
+        trades = A.candles_to_synthetic_trades(_minute_bars(1200))
+        self.assertEqual(len(trades), 4800, "前提")
+        zs_start = trades[-1]["time"] - 300 * MIN + 1
+        real = SE.analyze_chan
+
+        def fake_chan(candles):
+            out = real(candles)
+            out["latest_zhongshu"] = {"start_time": zs_start}
+            return out
+        with mock.patch.object(SE, "analyze_chan", side_effect=fake_chan):
+            r = SE.compute_signal_from_trades(trades, interval_seconds=900, profile_anchor=2, value_area_method=1)
+        pd = r["profile_detail"]
+        self.assertEqual((pd["source"], pd["profile_anchor"], pd["anchor_start_ms"]), ("anchor", 2, zs_start))
+        ref = A.poc_and_value_area(A.compute_volume_profile(A.trades_since(trades, zs_start)), method=1)
+        self.assertEqual((pd["poc"], pd["value_area_low"], pd["value_area_high"]),
+                         (ref["poc"], ref["value_area_low"], ref["value_area_high"]))
+        self.assertLess(pd["trade_count"], len(trades), "只取中樞之後的")
+
+    def test_anchor_overrides_window(self):
+        trades = A.candles_to_synthetic_trades(_minute_bars(3000))
+        self.assertEqual(len(trades), 12000, "前提")
+        r = SE.compute_signal_from_trades(trades, interval_seconds=900, profile_window_minutes=60, profile_anchor=1)
+        pd = r["profile_detail"]
+        self.assertEqual(pd["source"], "anchor")
+        start = A.ny_session_start_ms(trades[-1]["time"])
+        if trades[-1]["time"] - start < A.SESSION_MIN_MINUTES * MIN:
+            start = A.ny_session_start_ms(start - 1)
+        self.assertEqual(pd["anchor_start_ms"], start)
+        self.assertEqual(pd["trade_count"], len(A.trades_since(trades, start)))
+
+    def test_not_an_engine_setting(self):
+        self.assertIn("paper_profile_window_minutes", S.FIELD_META, "前提：時間窗是引擎設定(對照組)")
+        self.assertNotIn("profile_anchor", S.FIELD_META, "只存在回測：一鍵套用不會帶過去")
+        self.assertNotIn("paper_profile_anchor", S.FIELD_META)
+
+
 class SettingsAndEngine(unittest.TestCase):
     def test_defaults_keep_old_behaviour(self):
         for k in ("paper_profile_window_minutes", "paper_value_area_method"):
@@ -233,10 +314,24 @@ class Backtest(unittest.TestCase):
             self.assertIn("error", r, kw)
             self.assertEqual(seen, [], "參數錯就不要跑")
 
+    def test_anchor_reaches_signal_and_is_echoed(self):
+        r, seen = self._run(profile_anchor=2)
+        self.assertTrue(seen, "前提")
+        self.assertTrue(all(k["profile_anchor"] == 2 for k in seen))
+        self.assertEqual(r["profile_anchor"], 2)
+        r, seen = self._run()
+        self.assertTrue(seen, "前提")
+        self.assertEqual(r["profile_anchor"], 0, "預設 0＝時間窗(跟 r112 一樣)")
+        for bad in (3, -1, "x"):
+            r, seen = self._run(profile_anchor=bad)
+            self.assertIn("error", r, bad)
+            self.assertEqual(seen, [])
+
     def test_job_label_keys(self):
         from app import backtest_jobs as J
         self.assertIn("profile_window_minutes", J.LABEL_PARAM_KEYS)
         self.assertIn("value_area_method", J.LABEL_PARAM_KEYS)
+        self.assertIn("profile_anchor", J.LABEL_PARAM_KEYS)
 
 
 def _daily(lows_highs, start=T0):
@@ -354,7 +449,8 @@ class Dashboard(unittest.TestCase):
         for needle in ("backtestProfileWindow", "backtestVaMethod", "addIfPresent('profile_window_minutes'",
                        "addIfPresent('value_area_method'", "paper_profile_window_minutes: data.profile_window_minutes",
                        "'paper_profile_window_minutes', 'paper_value_area_method'", "function profileSampleText",
-                       "function chanIntervalText", "function dailyLiquidityLines", "下方沒有還有效的多方 OB/FVG"):
+                       "function chanIntervalText", "function dailyLiquidityLines", "下方沒有還有效的多方 OB/FVG",
+                       "backtestProfileAnchor", "addIfPresent('profile_anchor'", "量表:錨定中樞", "分價量表錨點"):
             self.assertIn(needle, html, needle)
         self.assertEqual(html.count("paper_profile_window_minutes: data.profile_window_minutes"), 2,
                          "回測結果的兩個「套用」入口都要帶過去")

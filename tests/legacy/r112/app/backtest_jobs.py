@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from app import backtest as backtest_module
 from app import db
 from app import trading_stats   # 用模組取函式(呼叫時才找)：測試會把 app/ 的舊版檔換進來，舊版沒有新函式時不能在匯入時就崩
+from app import cost_profiles   # r111：MT5 券商成本重算
 
 logger = logging.getLogger("backtest_jobs")
 
@@ -49,7 +50,8 @@ LABEL_PARAM_KEYS = ("symbol", "interval_seconds", "strategy_type", "daily_smc_fi
                     "trend_filter_mode", "trend_interval_seconds", "trend_slow_multiplier", "cooldown_hours",
                     # r100：只存在回測的1小時K策略，清單上也要分得出設定(以前只有結果頁看得到)
                     "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode",
-                    "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides")
+                    "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides", "mt5_cost_points",
+                    "profile_window_minutes", "value_area_method")
 # 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
 _MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
                  "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",
@@ -123,6 +125,11 @@ def _window_row(idx, res, start_ms, end_ms):
     row["assumed_spread_points"] = res.get("assumed_spread_points")
     row["net_pnl_points"] = adj.get("total_pnl_points")
     row["net_profit_factor"] = adj.get("profit_factor")
+    mv = res.get("mt5_view") or {}
+    row["mt5_cost_points"] = mv.get("cost_points")
+    row["mt5_net_pnl_points"] = mv.get("total_pnl_points")
+    row["mt5_profit_factor"] = mv.get("profit_factor")
+    row["mt5_swap_total"] = mv.get("swap_total")
     return row
 
 
@@ -136,8 +143,16 @@ def _aggregate(results):
     cost = next((float(r.get("assumed_spread_points") or 0) for r in results
                  if isinstance(r, dict) and not r.get("error")), 0.0)
     net = trading_stats.compute_stats(trades, spread_cost_points=cost) if cost > 0 else None
+    # r111：MT5 成本的合計(各段同一個成本設定；取第一個有結果的段)
+    mt5_cost = next(((r.get("mt5_view") or {}).get("cost_points") for r in results
+                     if isinstance(r, dict) and not r.get("error") and r.get("mt5_view")), None)
+    mt5 = cost_profiles.view(trades, cost_points=mt5_cost) if trades else None
     return {"total_trades": st["total_trades"], "win_rate": st["win_rate"], "total_pnl_points": st["total_pnl_points"],
             "assumed_spread_points": cost,
+            "mt5_cost_points": mt5["cost_points"] if mt5 else None,
+            "mt5_net_pnl_points": mt5["total_pnl_points"] if mt5 else None,
+            "mt5_profit_factor": mt5["profit_factor"] if mt5 else None,
+            "mt5_swap_total": mt5["swap_total"] if mt5 else None,
             "net_pnl_points": net["total_pnl_points"] if net else None,
             "net_profit_factor": net["profit_factor"] if net else None,
             "profit_factor": st["profit_factor"],

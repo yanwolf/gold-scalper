@@ -159,6 +159,23 @@ FIELD_META = {
         "help": "慢線SuperTrend的ATR倍數(快線固定1.0)。倍數越大越不容易翻轉、趨勢判定越保守，"
                 "但轉折時反應越慢。常見設定3.0。",
     },
+    # ---- r112：分價量表取樣(纏論+分價量表引擎用；SMC/布林觸軌引擎不讀) ----
+    "paper_profile_window_minutes": {
+        "label": "分價量表時間窗 (分鐘，0 = 舊做法：最後3000筆逐筆成交)",
+        "type": "int", "step": 30, "min": 0, "max": 4320,
+        "default": int(os.getenv("PAPER_PROFILE_WINDOW_MINUTES", "0")),
+        "help": "0＝r111以前的做法：取最後3000筆成交。即時是真實逐筆，成交熱的時候只有幾分鐘；"
+                "回測是每根1分K拆4筆，3000筆＝750分鐘(12.5小時)——同一個設定，即時跟回測看的時間差很多。"
+                "填分鐘數＝改看最近N分鐘，即時跟回測都用1分K合成成交，兩邊一致。"
+                "750＝回測過去實際測到的長度；1440＝一天。上限4320(即時只保留3天1分K)。",
+    },
+    "paper_value_area_method": {
+        "label": "Value Area 算法 (0 = 舊：挑最大量價位 / 1 = 標準：從POC往兩側擴張)",
+        "type": "int", "step": 1, "min": 0, "max": 1,
+        "default": int(os.getenv("PAPER_VALUE_AREA_METHOD", "0")),
+        "help": "0＝r111以前的算法：把成交量最大的價位挑出來湊滿70%，取最高最低，可能跨過中間的低量區。"
+                "1＝Volume Profile 標準做法：從POC開始，每次把上下相鄰量比較大的那一側併進來，區間連續。",
+    },
     # ---- SMC結構策略(smc_structure_3600引擎)專用，其他引擎不讀這些欄位 ----
     "smc_touch_window": {
         "label": "SMC：碰區域/交叉允許視窗(根1小時K)",
@@ -372,6 +389,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_use_chop_filter", "paper_chop_threshold",
     "paper_block_market_closed", "paper_min_atr_points",
     "paper_trend_filter_mode", "paper_trend_interval_seconds", "paper_trend_slow_multiplier",
+    "paper_profile_window_minutes", "paper_value_area_method",
     "smc_touch_window", "smc_wt_level", "smc_confirm_bos", "smc_require_ema", "smc_exit_mode", "smc_min_rr",
 }
 
