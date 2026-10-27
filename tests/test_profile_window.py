@@ -1,5 +1,5 @@
 """
-r112／r113 的測試：分價量表取樣(r113 加：每日換日、錨定中樞)(時間窗、即時跟回測一致)、標準 Value Area、日線大級別流動性。
+r112／r113／r114 的測試：分價量表取樣(r113 加：每日換日、錨定中樞；r114 變成引擎設定)(時間窗、即時跟回測一致)、標準 Value Area、日線大級別流動性。
 
 背景(r112 查到的落差)：分價量表一直取「最後 3000 筆成交」。即時是真實逐筆，成交熱的時候只有幾分鐘；
 回測是每根1分K拆4筆合成成交，3000 筆＝750 分鐘。同一個設定，即時跟回測看的時間差了上百倍，
@@ -249,10 +249,11 @@ class Anchor(unittest.TestCase):
         self.assertEqual(pd["anchor_start_ms"], start)
         self.assertEqual(pd["trade_count"], len(A.trades_since(trades, start)))
 
-    def test_not_an_engine_setting(self):
-        self.assertIn("paper_profile_window_minutes", S.FIELD_META, "前提：時間窗是引擎設定(對照組)")
-        self.assertNotIn("profile_anchor", S.FIELD_META, "只存在回測：一鍵套用不會帶過去")
-        self.assertNotIn("paper_profile_anchor", S.FIELD_META)
+    def test_is_an_engine_setting(self):
+        # r114：從「只存在回測」改成引擎設定，lab 引擎才能前瞻測試
+        m = S.FIELD_META["paper_profile_anchor"]
+        self.assertEqual((m["default"], m["min"], m["max"]), (0, 0, 2), "預設 0＝時間窗(跟 r113 以前一樣)")
+        self.assertIn("paper_profile_anchor", S.TRADING_RELEVANT_KEYS, "改了會影響交易，要算進設定變更時間")
 
 
 class SettingsAndEngine(unittest.TestCase):
@@ -279,6 +280,80 @@ class SettingsAndEngine(unittest.TestCase):
             eng._tick()
         self.assertEqual(len(calls), 1, "前提：這一輪真的算了訊號")
         self.assertEqual((calls[0]["profile_window_minutes"], calls[0]["value_area_method"]), (750, 1))
+
+    def test_engine_passes_anchor_to_signal(self):
+        eng = pt.PaperTradingEngine(interval_seconds=900, label="測試15分", strategy_type="chan_profile",
+                                    execution_index=99, engine_id="chan_profile_test")
+        eng._seeded_from_db = True
+        real = pt.settings_module.get_settings
+        calls = []
+        neutral = {"stage": "中性", "direction": None, "current_price": None}
+        with mock.patch.object(pt.settings_module, "settings_loaded", return_value=True), \
+             mock.patch.object(pt.settings_module, "get_settings",
+                               side_effect=lambda *a, **k: dict(real(*a, **k), paper_profile_anchor=1)), \
+             mock.patch.object(pt.db, "load_closed_paper_trades", return_value=(True, [])), \
+             mock.patch.object(pt, "compute_full_signal", side_effect=lambda **k: calls.append(k) or dict(neutral)):
+            eng._tick()
+        self.assertEqual(len(calls), 1, "前提：這一輪真的算了訊號")
+        self.assertEqual(calls[0]["profile_anchor"], 1)
+
+    def _live(self, strategy_type="chan_profile", **kw):
+        """compute_full_signal 的即時路徑：假的行情來源，記下拿了哪些1分K、傳了什麼給 compute_signal_from_trades"""
+        bars = _minute_bars(5000)
+        candle_calls, seen = [], []
+        streamer = mock.MagicMock()
+        streamer.get_recent_trades.return_value = A.candles_to_synthetic_trades(bars[-10:])
+        streamer.get_book_freshness.return_value = {"stale": False}
+        streamer.get_latest.return_value = {"bid": 100.0, "ask": 100.2}
+
+        def candles(interval_seconds=60, limit=None):
+            candle_calls.append((interval_seconds, limit))
+            out = bars if interval_seconds == 60 else A.resample_candles(bars, interval_seconds)
+            return out[-limit:] if limit else out
+        streamer.get_recent_candles.side_effect = candles
+        with mock.patch.object(SE, "binance_streamer", streamer), \
+             mock.patch.object(SE, "compute_signal_from_trades", side_effect=lambda *a, **k: seen.append(k) or {}):
+            SE.compute_full_signal(interval_seconds=900, strategy_type=strategy_type, **kw)
+        self.assertEqual(len(seen), 1, "前提：真的算了一次")
+        return candle_calls, seen[0]
+
+    def test_live_anchor_takes_whole_minute_cache(self):
+        calls, k = self._live(profile_anchor=1, value_area_method=1)
+        self.assertIn((60, SE.PROFILE_WINDOW_MAX_MINUTES), calls, "錨點起點不固定，要拿整個3天1分K快取")
+        self.assertEqual(k["profile_anchor"], 1)
+        self.assertEqual(len(k["profile_trades"]), SE.PROFILE_WINDOW_MAX_MINUTES * 4,
+                         "1分K合成成交(跟回測同一種拆法)，切起點交給 compute_signal_from_trades")
+
+    def test_live_anchor_beats_window_and_default_unchanged(self):
+        calls, k = self._live(profile_anchor=2, profile_window_minutes=60)
+        self.assertIn((60, SE.PROFILE_WINDOW_MAX_MINUTES), calls, "錨點優先，不是拿60分鐘")
+        self.assertEqual(k["profile_anchor"], 2)
+        calls, k = self._live(profile_window_minutes=60)
+        self.assertIn((60, 60), calls, "沒開錨點：維持 r112 的時間窗")
+        self.assertEqual((k["profile_anchor"], len(k["profile_trades"])), (0, 240))
+        calls, k = self._live()
+        self.assertNotIn(60, [c[0] for c in calls], "全部預設：不拿1分K合成(跟 r111 一樣用逐筆成交)")
+        self.assertEqual((k["profile_anchor"], k["profile_trades"]), (0, None))
+
+    def test_main_screen_uses_engine_anchor(self):
+        # 主畫面的分價量表跟這個週期的纏論引擎用同一種取樣
+        import asyncio
+        import app.main as M
+        real = M.settings_module.get_settings
+        calls = []
+        with mock.patch.object(M.settings_module, "get_settings",
+                               side_effect=lambda *a, **k: dict(real(*a, **k), paper_profile_anchor=1)), \
+             mock.patch.object(M, "compute_full_signal", side_effect=lambda **k: calls.append(k) or {}):
+            try:
+                asyncio.run(M.signal_latest(interval_seconds=900))
+            except Exception:
+                pass   # 後面組裝畫面的部分不是這裡要測的
+        self.assertTrue(calls, "前提：真的算了訊號")
+        self.assertEqual(calls[0]["profile_anchor"], 1)
+
+    def test_live_anchor_ignored_for_non_chan(self):
+        calls, k = self._live(strategy_type="band_touch", profile_anchor=1)
+        self.assertEqual((k["profile_anchor"], k["profile_trades"]), (0, None), "布林觸軌／SMC 不用分價量表")
 
 
 class Backtest(unittest.TestCase):
@@ -326,6 +401,16 @@ class Backtest(unittest.TestCase):
             r, seen = self._run(profile_anchor=bad)
             self.assertIn("error", r, bad)
             self.assertEqual(seen, [])
+
+    def test_blank_anchor_uses_engine_setting(self):
+        # r114：變成引擎設定後，回測沒填就沿用正式設定(跟時間窗一樣)；「載入引擎參數」才對得起來
+        real = B.settings_module.get_settings
+        with mock.patch.object(B.settings_module, "get_settings",
+                               side_effect=lambda *a, **k: dict(real(*a, **k), paper_profile_anchor=1)):
+            r, seen = self._run()
+        self.assertTrue(seen, "前提")
+        self.assertEqual(r["profile_anchor"], 1)
+        self.assertTrue(all(k["profile_anchor"] == 1 for k in seen))
 
     def test_job_label_keys(self):
         from app import backtest_jobs as J
@@ -450,7 +535,8 @@ class Dashboard(unittest.TestCase):
                        "addIfPresent('value_area_method'", "paper_profile_window_minutes: data.profile_window_minutes",
                        "'paper_profile_window_minutes', 'paper_value_area_method'", "function profileSampleText",
                        "function chanIntervalText", "function dailyLiquidityLines", "下方沒有還有效的多方 OB/FVG",
-                       "backtestProfileAnchor", "addIfPresent('profile_anchor'", "量表:錨定中樞", "分價量表錨點"):
+                       "backtestProfileAnchor", "addIfPresent('profile_anchor'", "量表:錨定中樞",
+                       "paper_profile_anchor: data.profile_anchor", "paper_profile_anchor: 'backtestProfileAnchor'"):
             self.assertIn(needle, html, needle)
         self.assertEqual(html.count("paper_profile_window_minutes: data.profile_window_minutes"), 2,
                          "回測結果的兩個「套用」入口都要帶過去")

@@ -261,7 +261,7 @@ TREND_CANDLE_LIMIT = 300  # 給趨勢濾網的大週期K棒數上限(ST period=1
 def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                          strategy_type="chan_profile", resonance_min_conditions=4,
                          trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
-                         profile_window_minutes=0, value_area_method=0):
+                         profile_window_minutes=0, value_area_method=0, profile_anchor=0):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
@@ -325,9 +325,17 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     # r112：分價量表用時間窗時，從1分K快取合成成交(跟回測同一種拆法)；不受逐筆成交緩衝區長度限制
     profile_trades = None
     window = min(int(profile_window_minutes or 0), PROFILE_WINDOW_MAX_MINUTES)
-    if window > 0 and strategy_type not in ("smc_structure", "band_touch"):
-        minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=window)
-        profile_trades = candles_to_synthetic_trades(minute_bars)
+    anchor = int(profile_anchor or 0)
+    if strategy_type not in ("smc_structure", "band_touch"):
+        if anchor:
+            # r114：錨點起點不固定(換日最多約25小時、中樞可能更久)，先拿整個1分K快取，起點交給 compute_signal_from_trades 切
+            minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=PROFILE_WINDOW_MAX_MINUTES)
+            profile_trades = candles_to_synthetic_trades(minute_bars)
+        elif window > 0:
+            minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=window)
+            profile_trades = candles_to_synthetic_trades(minute_bars)
+    else:
+        anchor = 0
     result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
@@ -343,6 +351,7 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         profile_window_minutes=window,
         value_area_method=value_area_method,
         profile_trades=profile_trades,
+        profile_anchor=anchor,
     )
     result["bid"] = bid
     result["ask"] = ask

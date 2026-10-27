@@ -247,7 +247,7 @@ def run_backtest(
     mt5_cost_points=None,
     profile_window_minutes=None,
     value_area_method=None,
-    profile_anchor=0,
+    profile_anchor=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -328,6 +328,8 @@ def run_backtest(
         profile_window_minutes = int(s.get("paper_profile_window_minutes", 0) or 0)
     if value_area_method is None:
         value_area_method = int(s.get("paper_value_area_method", 0) or 0)
+    if profile_anchor is None:   # r114：變成引擎設定了，沒填沿用正式設定(跟時間窗一樣)
+        profile_anchor = int(s.get("paper_profile_anchor", 0) or 0)
     try:
         profile_window_minutes = int(profile_window_minutes)
         value_area_method = int(value_area_method)
@@ -337,7 +339,7 @@ def run_backtest(
         return {"error": f"分價量表時間窗要在 0～{PROFILE_WINDOW_MAX_MINUTES} 分鐘之間"}
     if value_area_method not in (0, 1):
         return {"error": "VA算法只有 0(舊)或 1(標準)"}
-    # r113：分價量表錨點(只存在回測，不是 settings 欄位，一鍵套用不會帶過去)。開了就取代時間窗
+    # r113 加、r114 起也是引擎設定(paper_profile_anchor)，一鍵套用會帶過去。開了就取代時間窗
     try:
         profile_anchor = int(profile_anchor or 0)
     except (TypeError, ValueError):
@@ -917,7 +919,7 @@ def run_backtest(
         "trend_slow_multiplier": trend_slow_multiplier,
         "profile_window_minutes": profile_window_minutes,   # r112：0＝舊做法(最後 trade_limit 筆合成成交＝trade_limit/4 分鐘)
         "value_area_method": value_area_method,
-        "profile_anchor": profile_anchor,          # r113：0＝時間窗、1＝每日換日、2＝錨定最新中樞(只存在回測)
+        "profile_anchor": profile_anchor,          # r113：0＝時間窗、1＝每日換日、2＝錨定最新中樞(r114 起也是引擎設定)
         "skipped_trend": skipped_trend,  # 被趨勢濾網擋掉的進場訊號數
         "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
         "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數

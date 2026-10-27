@@ -1006,7 +1006,7 @@
         </select>
       </div>
       <div class="settings-field">
-        <label>分價量表起點(只存在回測，不會套用到引擎)</label>
+        <label>分價量表起點</label>
         <select id="backtestProfileAnchor">
           <option value="0">時間窗(上面的分鐘數)</option>
           <option value="1">每日換日重置(紐約17:00)</option>
@@ -2827,6 +2827,7 @@ function backtestResultToEngineValues(data){
     paper_trend_interval_seconds: data.trend_interval_seconds,
     paper_trend_slow_multiplier: data.trend_slow_multiplier,
     paper_profile_window_minutes: data.profile_window_minutes,   // r112
+    paper_profile_anchor: data.profile_anchor,   // r114
     paper_value_area_method: data.value_area_method,
   };
   if(data.smc_cfg){
@@ -2855,6 +2856,7 @@ const BT_FIELD_MAP = {
   paper_trend_filter_mode: 'backtestTrendMode', paper_trend_interval_seconds: 'backtestTrendInterval',
   paper_trend_slow_multiplier: 'backtestTrendSlowMult',
   paper_profile_window_minutes: 'backtestProfileWindow', paper_value_area_method: 'backtestVaMethod',
+  paper_profile_anchor: 'backtestProfileAnchor',   // r114
   smc_touch_window: 'backtestSmcTouchWindow', smc_wt_level: 'backtestSmcWtLevel',
   smc_confirm_bos: 'backtestSmcConfirmBos', smc_require_ema: 'backtestSmcRequireEma',
   smc_exit_mode: 'backtestSmcExitMode', smc_min_rr: 'backtestSmcMinRr',
@@ -3531,7 +3533,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold',
   'paper_block_market_closed', 'paper_min_atr_points',
   'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier',
-  'paper_profile_window_minutes', 'paper_value_area_method',
+  'paper_profile_window_minutes', 'paper_value_area_method', 'paper_profile_anchor',
   'smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr',
 ];
 
@@ -3755,7 +3757,7 @@ function renderBacktestResult(data, el){
           會把上面「目前策略設定」卡片顯示的全部參數(停損/濾網，SMC策略再加上SMC專屬參數)寫成該引擎的專屬覆寫，需要設定密碼；
           該引擎的績效統計會從套用那一刻重新分界。真實下單槽位(execution_*)不會被動到。
         </div>
-        ${(data.cooldown_hours || data.daily_smc_filter_mode || data.profile_anchor) ? `<div style="font-size:11px; color:var(--gold); margin-top:4px;">🟡 這次回測開了${[data.daily_smc_filter_mode ? '日線SMC濾網' : '', data.cooldown_hours ? '出場後冷卻' : '', data.profile_anchor ? '分價量表錨點' : ''].filter(Boolean).join('、')}：這些只存在回測，套用時不會帶過去，引擎實際跑出來會跟這次回測不同。</div>` : ''}
+        ${(data.cooldown_hours || data.daily_smc_filter_mode) ? `<div style="font-size:11px; color:var(--gold); margin-top:4px;">🟡 這次回測開了${[data.daily_smc_filter_mode ? '日線SMC濾網' : '', data.cooldown_hours ? '出場後冷卻' : ''].filter(Boolean).join('、')}：這些只存在回測，套用時不會帶過去，引擎實際跑出來會跟這次回測不同。</div>` : ''}
         <div id="backtestApplyResult" class="notify-result"></div>
       </div>`}
       <div id="backtestDrawdownPeriod"></div>
@@ -3796,6 +3798,7 @@ function renderBacktestResult(data, el){
       paper_trend_interval_seconds: data.trend_interval_seconds,
       paper_trend_slow_multiplier: data.trend_slow_multiplier,
       paper_profile_window_minutes: data.profile_window_minutes,   // r112
+      paper_profile_anchor: data.profile_anchor,   // r114
       paper_value_area_method: data.value_area_method,
       _strategy_type: data.strategy_type,
       _symbol: data.symbol,
@@ -4113,7 +4116,7 @@ const SETTINGS_GROUPS = [
                               'paper_use_atr_stops', 'paper_atr_sl_multiplier', 'paper_atr_trigger_multiplier', 'paper_atr_trail_multiplier'] },
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points',
                               'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier'] },
-  { title: '分價量表取樣(r112，纏論引擎用)', keys: ['paper_profile_window_minutes', 'paper_value_area_method'] },
+  { title: '分價量表取樣(r112，纏論引擎用)', keys: ['paper_profile_window_minutes', 'paper_value_area_method', 'paper_profile_anchor'] },
   { title: 'SMC結構策略(只影響 smc_structure_3600 引擎)', keys: ['smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr'], collapsed: true },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },

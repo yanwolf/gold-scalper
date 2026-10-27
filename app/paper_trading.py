@@ -1424,6 +1424,7 @@ class PaperTradingEngine:
             # r112：分價量表時間窗／VA算法(預設 0／0＝跟 r111 一樣)
             profile_window_minutes=int(s.get("paper_profile_window_minutes", 0) or 0),
             value_area_method=int(s.get("paper_value_area_method", 0) or 0),
+            profile_anchor=int(s.get("paper_profile_anchor", 0) or 0),   # r114
         )
         current_price = result.get("current_price")
         if current_price is None:

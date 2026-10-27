@@ -226,13 +226,21 @@ def compute_volume_profile(trades, bucket_size=1.0):
     return result
 
 
-def poc_and_value_area(volume_profile, value_area_pct=0.70):
+VA_METHOD_LEGACY = 0     # r111 以前：挑成交量最大的價位湊滿70%，取最高/最低(可能跳過中間的低量價位)
+VA_METHOD_STANDARD = 1   # r112：從 POC 往上下相鄰擴張，每次加量比較大的那一側(Volume Profile 標準做法)
+
+
+def poc_and_value_area(volume_profile, value_area_pct=0.70, method=VA_METHOD_LEGACY):
     """
     從分價量表算出 POC(Point of Control，成交量最大的價位)
     和 Value Area(累積約70%成交量的價格區間)，這是Volume Profile的標準延伸指標。
+
+    method(r112)：0＝舊算法(預設，行為跟 r111 完全一樣)；1＝標準算法，見 value_area_contiguous()。
     """
     if not volume_profile:
         return {"poc": None, "value_area_high": None, "value_area_low": None}
+    if int(method or 0) == VA_METHOD_STANDARD:
+        return value_area_contiguous(volume_profile, value_area_pct)
 
     by_volume = sorted(volume_profile, key=lambda x: x["volume"], reverse=True)
     poc = by_volume[0]["price_level"]
@@ -253,6 +261,124 @@ def poc_and_value_area(volume_profile, value_area_pct=0.70):
         "value_area_high": max(included_levels),
         "value_area_low": min(included_levels),
     }
+
+
+def value_area_contiguous(volume_profile, value_area_pct=0.70):
+    """
+    r112：標準 Value Area。從 POC 開始，每次比較「上方下一個價位」和「下方下一個價位」的成交量，
+    把量大的那一側併進來(一樣大時兩側都併)，直到累積量達到 value_area_pct。
+    價位一律依「實際有成交的價位」排序後相鄰擴張，所以區間是連續的、一定包含 POC。
+    舊算法挑的是全場最大量的那些價位，量分布有兩個峰時，區間會橫跨中間的低量區，看起來比實際寬或窄都有可能。
+    """
+    if not volume_profile:
+        return {"poc": None, "value_area_high": None, "value_area_low": None}
+    rows = sorted(volume_profile, key=lambda x: x["price_level"])
+    vols = [float(r["volume"]) for r in rows]
+    total = sum(vols)
+    poc_i = max(range(len(rows)), key=lambda i: (vols[i], -abs(i - len(rows) / 2)))
+    target = total * value_area_pct
+    lo = hi = poc_i
+    acc = vols[poc_i]
+    while acc < target and (lo > 0 or hi < len(rows) - 1):
+        up = vols[hi + 1] if hi < len(rows) - 1 else -1.0
+        dn = vols[lo - 1] if lo > 0 else -1.0
+        if up >= dn and hi < len(rows) - 1:
+            hi += 1
+            acc += vols[hi]
+            if up == dn and lo > 0 and acc < target:
+                lo -= 1
+                acc += vols[lo]
+        else:
+            lo -= 1
+            acc += vols[lo]
+    return {
+        "poc": rows[poc_i]["price_level"],
+        "value_area_high": rows[hi]["price_level"],
+        "value_area_low": rows[lo]["price_level"],
+    }
+
+
+def candles_to_synthetic_trades(candles, interval_ms=60_000):
+    """
+    r112：專案標準K棒({bucket_start,open,high,low,close,volume}) → 合成成交，跟回測的
+    backtest.klines_to_synthetic_trades() 拆法完全一樣(開/高/低/收四筆、時間點一樣、量各1/4)。
+    即時引擎的分價量表改用「時間窗」時走這裡，讓即時跟回測吃到同一種資料，回測結果才代表實盤。
+    """
+    out = []
+    for c in candles or []:
+        try:
+            ot = int(c["bucket_start"])
+            o, h, l, cl, v = (float(c["open"]), float(c["high"]), float(c["low"]),
+                              float(c["close"]), float(c.get("volume") or 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        ct = ot + interval_ms - 1
+        span = max(ct - ot, 4)
+        q = v / 4 if v > 0 else 0.0001
+        out.append({"time": ot, "price": o, "qty": q})
+        out.append({"time": ot + span // 3, "price": h, "qty": q})
+        out.append({"time": ot + span * 2 // 3, "price": l, "qty": q})
+        out.append({"time": ct, "price": cl, "qty": q})
+    out.sort(key=lambda t: t["time"])
+    return out
+
+
+PROFILE_ANCHOR_WINDOW = 0     # 最近N分鐘(r112)
+PROFILE_ANCHOR_SESSION = 1    # r113：每天紐約 17:00 換日重置(黃金 CFD／期貨的交易日)
+PROFILE_ANCHOR_ZHONGSHU = 2   # r113：從目前(最新)中樞的第一筆開始
+SESSION_MIN_MINUTES = 60      # 換日後不到這麼久，連前一個交易日一起算(剛換日時只有幾根K，量表沒有意義)
+ZHONGSHU_FALLBACK_BARS = 50   # 還沒有中樞時，退回最近 50 根(跟 15分K 配 12.5 小時同一個比例)
+
+
+def ny_session_start_ms(t_ms, rollover_hour=17):
+    """r113：t_ms 所在交易日的開始＝最近一次(含當下)紐約 rollover_hour:00。含夏令時間(用 cost_profiles 的時區)。"""
+    from datetime import timedelta
+    from app.cost_profiles import NY
+    t = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc).astimezone(NY)
+    d = t.date()
+    start = datetime(d.year, d.month, d.day, rollover_hour, tzinfo=NY)
+    if start > t:
+        d = d - timedelta(days=1)
+        start = datetime(d.year, d.month, d.day, rollover_hour, tzinfo=NY)
+    return int(start.timestamp() * 1000)
+
+
+def profile_anchor_start_ms(anchor, last_ms, chan_data=None, interval_seconds=900):
+    """
+    r113：分價量表從哪個時間點開始算(含)。回傳 (start_ms, 說明)。
+      - SESSION：今天這個交易日(紐約17:00換日)；換日不到 SESSION_MIN_MINUTES 分鐘就從前一個交易日開始
+      - ZHONGSHU：最新中樞第一筆的起點；還沒有中樞就退回最近 ZHONGSHU_FALLBACK_BARS 根K
+    """
+    if anchor == PROFILE_ANCHOR_SESSION:
+        start = ny_session_start_ms(last_ms)
+        if last_ms - start < SESSION_MIN_MINUTES * 60_000:
+            return ny_session_start_ms(start - 1), "前一交易日起(剛換日)"
+        return start, "今日交易日起"
+    if anchor == PROFILE_ANCHOR_ZHONGSHU:
+        zs = (chan_data or {}).get("latest_zhongshu")
+        if zs and zs.get("start_time") is not None:
+            return int(zs["start_time"]), "最新中樞起"
+        return last_ms - ZHONGSHU_FALLBACK_BARS * int(interval_seconds) * 1000, f"沒有中樞，退回最近{ZHONGSHU_FALLBACK_BARS}根"
+    raise ValueError(f"不認得的分價量表錨點: {anchor}")
+
+
+def trades_since(trades, start_ms):
+    """r113：只留 time >= start_ms 的成交(trades 時間遞增)。"""
+    import bisect
+    if not trades:
+        return []
+    times = [t["time"] for t in trades]
+    return trades[bisect.bisect_left(times, int(start_ms)):]
+
+
+def trades_in_window(trades, window_minutes):
+    """r112：只留最後一筆成交往回 window_minutes 分鐘內的成交(trades 時間遞增)。"""
+    if not trades or not window_minutes:
+        return list(trades or [])
+    cutoff = trades[-1]["time"] - int(window_minutes) * 60_000
+    import bisect
+    times = [t["time"] for t in trades]
+    return trades[bisect.bisect_right(times, cutoff):]
 
 
 def interpret_volume_profile(volume_profile, poc_info, current_price, bucket_size=1.0):

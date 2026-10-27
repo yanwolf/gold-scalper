@@ -1421,6 +1421,9 @@ class PaperTradingEngine:
             # 趨勢濾網開啟時才多算一份大週期K棒的雙SuperTrend
             trend_interval_seconds=int(s.get("paper_trend_interval_seconds", 3600)) if trend_mode else None,
             trend_slow_multiplier=float(s.get("paper_trend_slow_multiplier", 3.0)),
+            # r112：分價量表時間窗／VA算法(預設 0／0＝跟 r111 一樣)
+            profile_window_minutes=int(s.get("paper_profile_window_minutes", 0) or 0),
+            value_area_method=int(s.get("paper_value_area_method", 0) or 0),
         )
         current_price = result.get("current_price")
         if current_price is None:
