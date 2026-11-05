@@ -30,6 +30,7 @@ from app import mean_reversion
 from app import pullback_resume
 from app import breakout_trend
 from app import cost_profiles
+from app import trade_diagnostics
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -828,6 +829,8 @@ def run_backtest(
                     profile_reason=result["profile"]["reason"],
                 )
                 position["daily_smc"] = daily_tag
+                # r115：進出場診斷(事後統計用)：ATR、初始停損距離、進場種類與被突破的中樞邊界
+                position["diag"] = trade_diagnostics.entry_meta(strategy_type, result, atr, step_sl_points)
                 if size_weight != 1.0:
                     position["size_weight"] = size_weight
                 if strategy_type in HR_MODULES:
@@ -847,6 +850,10 @@ def run_backtest(
         if w is not None and w != 1.0 and t.get("pnl_points") is not None and "pnl_points_full" not in t:
             t["pnl_points_full"] = t["pnl_points"]
             t["pnl_points"] = t["pnl_points"] * w
+
+    # r115：進出場診斷——被洗出場比例、贏單最大逆向、中樞突破單有回抽／直接走(只是統計，不影響進出場)
+    trade_diagnostics.annotate(closed_trades, klines)
+    entry_diagnostics = trade_diagnostics.summarize(closed_trades)
 
     # r90：這個視窗裡日線偏多/偏空/未定各幾天(看這段回測是哪一種行情)
     daily_bias_days = {"bullish": 0, "bearish": 0, "none": 0}
@@ -939,5 +946,6 @@ def run_backtest(
         "stats_spread_adjusted": stats_spread_adjusted,
         "readiness_spread_adjusted": readiness_spread_adjusted,
         "mt5_view": mt5_view,
+        "entry_diagnostics": entry_diagnostics,   # r115
         "assumed_spread_points": spread_cost_points,
     }

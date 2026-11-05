@@ -28,7 +28,7 @@ from app.binance_client import binance_streamer
 from app.analysis import (
     build_candles, compute_volume_profile, poc_and_value_area, analyze_chan, interpret_volume_profile,
     compute_atr, compute_choppiness_index, compute_ema, compute_rsi, compute_macd, find_fvg,
-    compute_trend_filter, candles_to_synthetic_trades, trades_in_window,
+    compute_trend_filter, candles_to_synthetic_trades, trades_in_window, profile_anchor_start_ms, trades_since,
 )
 from app.signal import generate_signal, generate_signal_resonance_fvg
 from app import smc_structure
@@ -97,7 +97,8 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
                                 current_price=None, strategy_type=None, resonance_min_conditions=4, candles=None,
                                 trend_candles=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
                                 smc_candles=None, smc_cfg=None,
-                                profile_window_minutes=0, value_area_method=0, profile_trades=None):
+                                profile_window_minutes=0, value_area_method=0, profile_trades=None,
+                                profile_anchor=0):
     """
     純計算版本：輸入任意來源的逐筆成交清單(即時的或歷史重播的都可以)，
     回傳跟compute_full_signal()一樣格式的完整訊號結果。
@@ -181,7 +182,15 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
     choppiness_index = compute_choppiness_index(candles)  # 給震盪濾網用，資料不足時是None
 
     window = int(profile_window_minutes or 0)
-    if window > 0:
+    anchor = int(profile_anchor or 0)
+    anchor_note = anchor_start = None
+    if anchor and (profile_trades if profile_trades is not None else trades):
+        # r113：時段重置／錨定中樞(目前只在回測)。資料來源跟時間窗一樣(1分K合成成交)，起點換成錨點
+        src = profile_trades if profile_trades is not None else trades
+        anchor_start, anchor_note = profile_anchor_start_ms(anchor, src[-1]["time"], chan_data, interval_seconds)
+        profile_trades = trades_since(src, anchor_start)
+        profile_source = "anchor"
+    elif window > 0:
         profile_trades = trades_in_window(profile_trades if profile_trades is not None else trades, window)
         profile_source = "candles"
     else:
@@ -231,6 +240,9 @@ def compute_signal_from_trades(trades, interval_seconds=60, bucket_size=1.0, tra
         "source": profile_source,
         "window_minutes": window or None,
         "value_area_method": int(value_area_method or 0),
+        "profile_anchor": anchor,               # r113：0＝時間窗／筆數、1＝交易日、2＝最新中樞
+        "anchor_start_ms": anchor_start,
+        "anchor_note": anchor_note,
         "covered_minutes": (round((profile_trades[-1]["time"] - profile_trades[0]["time"]) / 60000, 1)
                             if len(profile_trades) >= 2 else 0),
         "profile": profile,
@@ -249,7 +261,7 @@ TREND_CANDLE_LIMIT = 300  # 給趨勢濾網的大週期K棒數上限(ST period=1
 def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
                          strategy_type="chan_profile", resonance_min_conditions=4,
                          trend_interval_seconds=None, trend_fast_multiplier=1.0, trend_slow_multiplier=3.0,
-                         profile_window_minutes=0, value_area_method=0):
+                         profile_window_minutes=0, value_area_method=0, profile_anchor=0):
     """
     即時版本：從binance_streamer抓最新的逐筆成交，current_price優先用bid/ask中價
     (比用最後一筆成交價更貼近實際可成交價格)，沒有報價時才退回用最後一筆成交價。
@@ -313,9 +325,17 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
     # r112：分價量表用時間窗時，從1分K快取合成成交(跟回測同一種拆法)；不受逐筆成交緩衝區長度限制
     profile_trades = None
     window = min(int(profile_window_minutes or 0), PROFILE_WINDOW_MAX_MINUTES)
-    if window > 0 and strategy_type not in ("smc_structure", "band_touch"):
-        minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=window)
-        profile_trades = candles_to_synthetic_trades(minute_bars)
+    anchor = int(profile_anchor or 0)
+    if strategy_type not in ("smc_structure", "band_touch"):
+        if anchor:
+            # r114：錨點起點不固定(換日最多約25小時、中樞可能更久)，先拿整個1分K快取，起點交給 compute_signal_from_trades 切
+            minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=PROFILE_WINDOW_MAX_MINUTES)
+            profile_trades = candles_to_synthetic_trades(minute_bars)
+        elif window > 0:
+            minute_bars = binance_streamer.get_recent_candles(interval_seconds=60, limit=window)
+            profile_trades = candles_to_synthetic_trades(minute_bars)
+    else:
+        anchor = 0
     result = compute_signal_from_trades(
         trades,
         interval_seconds=interval_seconds,
@@ -331,6 +351,7 @@ def compute_full_signal(interval_seconds=60, bucket_size=1.0, trade_limit=3000,
         profile_window_minutes=window,
         value_area_method=value_area_method,
         profile_trades=profile_trades,
+        profile_anchor=anchor,
     )
     result["bid"] = bid
     result["ask"] = ask

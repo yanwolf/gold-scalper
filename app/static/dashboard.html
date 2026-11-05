@@ -1878,6 +1878,51 @@ function dailySmcTagText(tag){
 }
 
 // r93：出場後多快再進場的分組(驗證「大賺出場後立刻再追、隨即被掃」這個模式)
+// r115：進出場診斷(被洗出場比例、贏單最大逆向、中樞突破單有回抽/直接走)
+function entryDiagnosticsHtml(d, title){
+  if(!d) return '';
+  const w = d.washed || {}, m = d.winner_mae || {}, b = d.breakout || {};
+  const pct = v => v == null ? '--' : v + '%';
+  const grp = (name, g) => {
+    if(!g || !g.trades) return `<tr><td style="padding-right:8px;">${name}</td><td class="mono">0</td><td>--</td><td>--</td><td>--</td><td>--</td></tr>`;
+    return `<tr><td style="white-space:nowrap; padding-right:8px;">${name}</td><td class="mono" style="padding-right:8px;">${g.trades}</td>
+      <td class="mono" style="padding-right:8px;">${g.win_rate}%</td>
+      <td class="mono ${g.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}" style="padding-right:8px;">${btNum(g.total_pnl_points)}</td>
+      <td class="mono ${g.avg_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}" style="padding-right:8px;">${btNum(g.avg_pnl_points, 2)}</td>
+      <td class="mono">${g.profit_factor != null ? Number(g.profit_factor).toFixed(2) : '∞'}</td></tr>`;
+  };
+  const kindName = {breakout: '中樞突破', beichi: '背馳', other: '其他(分價量表帶頭)', 'n/a': '(這個策略不分)'};
+  const kinds = Object.entries(d.kinds || {}).map(([k, g]) => grp(kindName[k] || k, g)).join('');
+  const byExit = Object.entries(w.by_exit || {}).map(([k, g]) => `${k} ${g.washed}/${g.judged}`).join('、');
+  const buckets = Object.entries(m.buckets || {}).map(([k, n]) => `${k}：${n}`).join('　');
+  const head = '<thead><tr style="color:var(--muted); text-align:left;"><th></th><th>筆數</th><th>勝率</th><th>損益</th><th>每筆</th><th>PF</th></tr></thead>';
+  return `
+    <div class="spread-adjusted-card" style="margin-top:10px;">
+      <div class="spread-adjusted-title">${title}</div>
+      <div style="font-size:12px; line-height:1.7;">
+        <b>1. 被洗出場</b>：虧損出場 ${w.losers ?? 0} 筆，看得完後面 ${w.after_hours} 小時的 ${w.judged ?? 0} 筆裡，
+        <b>${w.washed ?? 0} 筆(${pct(w.washed_pct)})</b> 出場後價格朝原方向走到「進場價 ± ${w.favorable_atr} 倍 ATR」——方向其實是對的；
+        這些單合計虧 ${btNum(w.washed_loss_points)} 點。${byExit ? `(依出場原因：${byExit})` : ''}<br/>
+        <b>2. 贏單的最大逆向</b>(佔初始停損距離)：贏單 ${m.winners ?? 0} 筆，${buckets}；
+        逆向到停損 75% 以上才回頭的 <b>${pct(m.near_stop_pct)}</b>，中位數 ${m.median_mae_ratio != null ? Math.round(m.median_mae_ratio * 100) + '%' : '--'}。
+      </div>
+      <div style="overflow-x:auto; margin-top:6px;">
+        <table style="width:100%; font-size:12px; border-collapse:collapse;">${head}
+          <tbody>
+            <tr><td colspan="6" style="color:var(--muted); padding-top:4px;">3. 依進場種類</td></tr>${kinds}
+            <tr><td colspan="6" style="color:var(--muted); padding-top:6px; border-top:1px solid var(--grid);">中樞突破單：${b.retest_hours} 小時內有沒有回測被突破的中樞邊界${b.unknown ? `(資料不夠判斷 ${b.unknown} 筆)` : ''}</td></tr>
+            ${grp('有回抽', b.retest)}${grp('直接走', b.runaway)}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:10.5px; color:var(--muted); margin-top:6px; line-height:1.6;">
+        怎麼看：1 很高＝常被洗；2 的「75% 以上」很高＝停損太緊(改結構停損值得試)；
+        3 的「直接走」賺很多、「有回抽」賠很多＝改成第三類買賣點會錯過大行情、但能躲掉假突破，兩者要一起比。
+        損益是帳面點數(還沒扣成本)。
+      </div>
+    </div>`;
+}
+
 function reentryBreakdownHtml(rb, title){
   if(!rb || !rb.groups) return '';
   const rows = rb.groups;
@@ -3773,7 +3818,8 @@ function renderBacktestResult(data, el){
     `;
 
     renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
-    document.getElementById('backtestReentry').innerHTML = reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場');
+    document.getElementById('backtestReentry').innerHTML = reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場')
+      + entryDiagnosticsHtml(data.entry_diagnostics, '進出場診斷(只是統計，不影響回測)');
     document.getElementById('backtestDailySmc').innerHTML = dailySmcBreakdownHtml(
       data.daily_smc_breakdown, `依開倉時日線SMC結構分組${data.daily_smc_filter_mode ? '（已開日線濾網：被擋的單不在這裡）' : '（沒開日線濾網：順勢那組≈開濾網的近似結果）'}`);
 
@@ -3967,6 +4013,7 @@ function renderBacktestJob(job){
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
     ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
     ${ag ? reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場') : ''}
+    ${ag ? entryDiagnosticsHtml(ag.entry_diagnostics, '全部段落合計：進出場診斷') : ''}
     <div id="backtestDetail" style="margin-top:12px;"></div>`;
   el.querySelectorAll('.bt-win[data-idx]').forEach(card => card.addEventListener('click', () => {
     const w = wins[Number(card.dataset.idx)];
