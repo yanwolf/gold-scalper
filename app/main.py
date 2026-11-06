@@ -1094,6 +1094,7 @@ async def backtest_run(
     bo_max_hold_days: Optional[int] = None,
     mt5_cost_points: Optional[float] = None,
     split_entry: Optional[int] = None,
+    max_zs_height_atr: Optional[float] = None,
     profile_window_minutes: Optional[int] = None,
     value_area_method: Optional[int] = None,
     profile_anchor: Optional[int] = None,
@@ -1178,6 +1179,7 @@ async def backtest_run(
         bo_channel=bo_channel, bo_big_bar_atr=bo_big_bar_atr, bo_trend=bo_trend, bo_sides=bo_sides,
         bo_sl_atr=bo_sl_atr, bo_trail_trigger_atr=bo_trail_trigger_atr, bo_trail_atr=bo_trail_atr,
         bo_max_hold_days=bo_max_hold_days, mt5_cost_points=mt5_cost_points, split_entry=split_entry,
+        max_zs_height_atr=max_zs_height_atr,
         profile_window_minutes=profile_window_minutes, value_area_method=value_area_method,
         profile_anchor=profile_anchor,
     )
@@ -1242,6 +1244,7 @@ def _backtest_job_params(
     bo_max_hold_days: Optional[int] = None,
     mt5_cost_points: Optional[float] = None,
     split_entry: Optional[int] = None,
+    max_zs_height_atr: Optional[float] = None,
     profile_window_minutes: Optional[int] = None,
     value_area_method: Optional[int] = None,
     profile_anchor: Optional[int] = None,

@@ -964,6 +964,10 @@
         </select>
       </div>
       <div class="settings-field">
+        <label>中樞突破只做窄中樞：中樞高度 &lt; 幾倍 ATR(只對纏論中樞突破；背馳照常；留空=不限)</label>
+        <input type="number" id="backtestMaxZsHeight" placeholder="留空=不限" step="0.1" min="0" max="10" />
+      </div>
+      <div class="settings-field">
         <label>分批進場(只對纏論中樞突破；只有回測)</label>
         <select id="backtestSplitEntry">
           <option value="">關閉(突破就全倉進場)</option>
@@ -1458,6 +1462,7 @@ const els = {
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestMt5Cost: document.getElementById('backtestMt5Cost'),
   backtestSplitEntry: document.getElementById('backtestSplitEntry'),
+  backtestMaxZsHeight: document.getElementById('backtestMaxZsHeight'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
@@ -3735,6 +3740,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('min_atr_points', els.backtestMinAtr);
   addIfPresent('mt5_cost_points', els.backtestMt5Cost);   // r111
   addIfPresent('split_entry', els.backtestSplitEntry);    // r116
+  addIfPresent('max_zs_height_atr', els.backtestMaxZsHeight);   // r117
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
@@ -3956,6 +3962,7 @@ function btParamLabel(p){
   if(Number(p.cooldown_hours) > 0) parts.push(`冷卻${Number(p.cooldown_hours)}h`);
   if(p.mt5_cost_points != null && p.mt5_cost_points !== '') parts.push(`MT5成本${Number(p.mt5_cost_points)}`);
   if(Number(p.split_entry) === 1) parts.push('分批進場');
+  if(Number(p.max_zs_height_atr) > 0) parts.push(`窄中樞<${Number(p.max_zs_height_atr)}ATR`);
   // r112：分價量表取樣(只有纏論類策略才有意義)
   if(Number(p.profile_anchor) === 1) parts.push('量表:每日換日');
   else if(Number(p.profile_anchor) === 2) parts.push('量表:錨定中樞');
@@ -3998,6 +4005,7 @@ function btWinCard(title, bias, r, extraClass, idx){
     </div>
     ${Number(r.assumed_spread_points) > 0 && r.total_trades ? `<div class="bt-win-split">扣成本(每筆 ${Number(r.assumed_spread_points)} 點)：損益 <span class="${r.net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.net_pnl_points)}</span>，PF ${r.net_profit_factor != null ? Number(r.net_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     ${splitStatsHtml(r.split_stats)}
+    ${r.skipped_zs_height ? `<div class="bt-win-split">中樞太寬沒進場：${r.skipped_zs_height} 次</div>` : ''}
     ${r.mt5_net_pnl_points != null && r.total_trades ? `<div class="bt-win-split">MT5(每筆 ${Number(r.mt5_cost_points)} 點＋庫存費 ${btNum(r.mt5_swap_total)})：損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
   </div>`;
