@@ -19,33 +19,86 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIN = 60_000
 
 
+DAY = 1440
+
+
 def bars(ranges):
-    """每根 1 分K 的高低差照給的數字(開=收=4000)。"""
+    """每根 1 分K 的高低差照給的數字(開=收=4000)。T0 對齊 UTC 整點。"""
     return [[T0 + i * MIN, "4000", str(4000 + r / 2), str(4000 - r / 2), "4000", "1", T0 + (i + 1) * MIN - 1]
             for i, r in enumerate(ranges)]
 
 
+def session_ranges(days, quiet=0.5, busy=3.0, busy_hour=13):
+    """亞洲盤小、紐約開盤(UTC 13 點)那一小時大——跟真實黃金一樣的時段差異。"""
+    out = []
+    for i in range(days * DAY):
+        h = ((T0 + i * MIN) // 3_600_000) % 24
+        out.append(busy if h == busy_hour else quiet)
+    return out
+
+
+def at_hour(day, hour):
+    """第 day 天(從 0 起)UTC hour 點整那根的索引。"""
+    base_h = (T0 // 3_600_000) % 24
+    return day * DAY + ((hour - base_h) % 24) * 60
+
+
 class Detect(unittest.TestCase):
-    def test_spike_after_enough_history(self):
-        shocks = D.shock_times(bars([1.0] * 300 + [6.0] + [1.0] * 10))
-        self.assertEqual(shocks, [T0 + 301 * MIN - 1])
+    def test_session_open_is_not_news(self):
+        r = session_ranges(8)
+        shocks = D.shock_times(bars(r))
+        self.assertEqual(shocks, [], "紐約開盤每天都大：跟同時段比不算消息(r119 的定義會整小時都報)")
+        legacy_like = sum(1 for i in range(DAY, len(r)) if r[i] >= 5 * sorted(r[i - DAY:i])[DAY // 2])
+        self.assertGreater(legacy_like, 300, "對照：用「前 24 小時中位數」的舊定義，同樣的資料會報出好幾百次")
 
-    def test_not_big_enough(self):
-        shocks = D.shock_times(bars([1.0] * 300 + [4.0]))
-        self.assertEqual(shocks, [], "4 倍不到 5 倍")
-        self.assertEqual(D.shock_times(bars([1.0] * 300 + [5.0])), [T0 + 301 * MIN - 1], "對照：剛好 5 倍算")
+    def test_real_spike_in_quiet_hour(self):
+        r = session_ranges(8)
+        i = at_hour(7, 2)
+        r[i] = 3.0                                                     # 安靜時段突然一根 3 點
+        self.assertEqual(D.shock_times(bars(r)), [T0 + (i + 1) * MIN - 1])
+        r2 = session_ranges(8)
+        r2[i] = 2.0                                                    # 只有同時段的 4 倍
+        self.assertEqual(D.shock_times(bars(r2)), [], "不到 5 倍不算")
 
-    def test_needs_history_and_is_causal(self):
-        self.assertEqual(D.shock_times(bars([1.0] * 100 + [9.0] + [1.0] * 300)), [], "前面不到 4 小時：不判斷")
-        early = D.shock_times(bars([1.0] * 300 + [6.0]))
-        later = D.shock_times(bars([1.0] * 300 + [6.0] + [50.0] * 5))
+    def test_must_also_beat_hourly_average(self):
+        r = session_ranges(8, quiet=0.5)
+        h2 = [at_hour(d, 2) + m for d in range(8) for m in range(60)]
+        for j in h2:
+            r[j] = 0.01                                                # UTC 2 點這一小時平常幾乎不動
+        i = at_hour(7, 2) + 30
+        r[i] = 0.1                                                     # 是同時段的 10 倍，但比小時K 平均波幅小
+        self.assertEqual(D.shock_times(bars(r)), [], "絕對波幅太小：不算消息")
+        r[i] = 0.8
+        self.assertEqual(D.shock_times(bars(r)), [T0 + (i + 1) * MIN - 1], "對照：夠大就算")
+
+    def test_needs_five_days_of_same_hour(self):
+        r = session_ranges(8)
+        early = at_hour(3, 2)                                          # 第 4 天：同時段只有 3 天樣本
+        r[early] = 9.0
+        self.assertNotIn(T0 + (early + 1) * MIN - 1, D.shock_times(bars(r)) or [])
+        late = at_hour(6, 2)
+        r[late] = 9.0
+        self.assertIn(T0 + (late + 1) * MIN - 1, D.shock_times(bars(r)), "對照：樣本夠了就判斷")
+
+    def test_same_hour_median_uses_last_20_days(self):
+        days = 42
+        r = session_ranges(days)
+        for d in range(days):
+            for m in range(60):
+                r[at_hour(d, 2) + m] = 2.0 if d < 21 else 0.1          # 前 21 天這個時段很大，後 21 天變小
+        i = at_hour(days - 1, 2) + 30
+        r[i] = 0.8
+        self.assertIn(T0 + (i + 1) * MIN - 1, D.shock_times(bars(r)), "只看前 20 天：更早的大波動不算進中位數")
+
+    def test_causal(self):
+        r = session_ranges(8)
+        i = at_hour(7, 2)
+        r[i] = 3.0
+        early = D.shock_times(bars(r[:i + 1]))
+        later = D.shock_times(bars(r + [50.0] * 30))
         self.assertEqual(len(early), 1, "前提：先認出一次")
-        self.assertTrue(later, "前提：後面那幾根也有結果")
+        self.assertTrue(later, "前提：後面也有結果")
         self.assertEqual(later[0], early[0], "後面的K線不影響前面的判斷")
-
-    def test_median_uses_only_last_24h(self):
-        shocks = D.shock_times(bars([10.0] * 1500 + [1.0] * 1500 + [6.0]))
-        self.assertIn(T0 + 3001 * MIN - 1, shocks, "中位數只看前 1440 根(24 小時)：更早的大波動不算進來")
 
     def test_not_one_minute_bars(self):
         k = bars([1.0] * 300)
@@ -63,13 +116,13 @@ class Detect(unittest.TestCase):
         self.assertIsNone(D.recent_shock(None, T0))
 
 
-SHOCK_AT = 300
-PATH = [4002.0] * SHOCK_AT + [4003.5] * 180 + [3990.0] * 30   # 第 300 分鐘跳 1.5 點(遠大於平常 0.1)，最後跌破停損出場
+SHOCK_AT = 7 * DAY + 120                                           # 第 8 天，資料夠了之後
+PATH = [4002.0] * SHOCK_AT + [4003.5] * 180 + [3990.0] * 30        # 震盪後一路持平，最後跌破停損出場
 
 
 def spiked():
     k = kl(PATH)
-    k[SHOCK_AT][2] = "4005.0"    # 這根 1 分K 高低差 1.55，平常只有 0.1：消息震盪
+    k[SHOCK_AT][2] = "4005.0"    # 這根 1 分K 高低差約 3 點，平常只有 0.1：消息震盪
     return k
 
 
@@ -80,7 +133,7 @@ def run(news):
         return dict(BEICHI) if trades[-1]["time"] >= shock_close else dict(NEUTRAL)
     with mock.patch.object(B, "compute_signal_from_trades", side_effect=sig), \
          mock.patch.object(B, "fetch_historical_klines", return_value=[]):
-        return B.run_backtest(days=1, interval_seconds=900, klines=spiked(), daily_klines=[], trend_filter_mode=0,
+        return B.run_backtest(days=9, interval_seconds=900, klines=spiked(), daily_klines=[], trend_filter_mode=0,
                               use_chop_filter=False, block_market_closed=False, min_atr_points=0, use_atr=False,
                               sl_points=5.0, trail_trigger_points=50, trail_distance_points=50, reversal_confirm_count=3,
                               news_cooldown=news)
@@ -113,6 +166,7 @@ class Backtest(unittest.TestCase):
             h = f.read()
         self.assertIn("addIfPresent('news_cooldown'", h)
         self.assertIn("d.news_shock", h)
+        self.assertIn("d.by_direction", h)
         from app import backtest_jobs as J, main
         self.assertIn("news_cooldown", J.LABEL_PARAM_KEYS)
         self.assertIn("news_cooldown", main._backtest_job_params())

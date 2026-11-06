@@ -135,6 +135,9 @@ class Summarize(unittest.TestCase):
         self.assertEqual((b["runaway"]["trades"], b["runaway"]["biggest_win"]), (1, 10.0))
         self.assertEqual(s["kinds"]["breakout"]["trades"], 3)
         self.assertIsNone(D.summarize([{"pnl_points": 1.0}]), "沒有 diag 的交易：沒有診斷")
+        bd = s["by_direction"]                       # r121：多單／空單分開
+        self.assertEqual((bd["bullish"]["trades"], bd["bullish"]["total_pnl_points"]), (3, 9.0))
+        self.assertEqual((bd["bearish"]["trades"], bd["bearish"]["total_pnl_points"]), (4, -8.0))
 
 
 class Wiring(unittest.TestCase):

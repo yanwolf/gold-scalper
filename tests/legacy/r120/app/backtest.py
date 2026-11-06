@@ -29,6 +29,7 @@ from app import smc_structure
 from app import mean_reversion
 from app import pullback_resume
 from app import breakout_trend
+from app import fib_pullback
 from app import cost_profiles
 from app import trade_diagnostics
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
@@ -91,7 +92,7 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 
 
 SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
-HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume", "breakout_trend")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
+HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume", "breakout_trend", "fib_pullback")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
 # r99：只存在回測、介面相同的1小時K策略(build_cfg / precompute / evaluate_at，結果放在 "mr")
 # r116：分批進場(只在回測、只對纏論中樞突破)：突破時先進半倉，SPLIT_WINDOW_MS 內出現第三類買賣點才加另一半。
 #   回抽：價格回到被突破的邊界附近(SPLIT_TOUCH_ATR 倍 ATR 以內)；
@@ -119,7 +120,8 @@ def split_add_decision(sp, price, now_ms):
 
 
 HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume,
-              "breakout_trend": breakout_trend}   # r105：4小時K突破(用1小時K組4小時K)
+              "breakout_trend": breakout_trend,   # r105：4小時K突破(用1小時K組4小時K)
+              "fib_pullback": fib_pullback}       # r120：斐波那契回檔掛單(限價單，用1分K判斷成交)
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
 
 
@@ -276,6 +278,12 @@ def run_backtest(
     profile_anchor=None,
     split_entry=0,
     max_zs_height_atr=None,
+    news_cooldown=0,
+    fp_impulse_atr=None,
+    fp_entry_fib=None,
+    fp_stop_fib=None,
+    fp_sides=None,
+    fp_max_hold_hours=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -405,6 +413,15 @@ def run_backtest(
         interval_seconds = 3600
         reversal_confirm_count = 10 ** 6   # 「賺賠都走」：只用持有時間出場，反向訊號不提前出場
     # r105：大週期突破(breakout_trend.py，只存在回測)。訊號只在4小時K收盤那一小時給；出場只靠停損/移動停損/持有天數
+    # r120：斐波那契回檔掛單(fib_pullback.py，只存在回測)。訊號＝掛限價單，成交才進場；出場只靠停損/停利/持有時間
+    if strategy_type == "fib_pullback":
+        mr_cfg, mr_err = fib_pullback.build_cfg({
+            "impulse_atr": fp_impulse_atr, "entry_fib": fp_entry_fib, "stop_fib": fp_stop_fib, "sides": fp_sides,
+            "max_hold_hours": fp_max_hold_hours})
+        if mr_err:
+            return {"error": mr_err}
+        interval_seconds = 3600
+        reversal_confirm_count = 10 ** 6
     if strategy_type == "breakout_trend":
         mr_cfg, mr_err = breakout_trend.build_cfg({
             "channel": bo_channel, "big_bar_atr": bo_big_bar_atr, "trend": bo_trend, "sides": bo_sides,
@@ -619,10 +636,16 @@ def run_backtest(
     kline_highs = [float(k[2]) for k in klines]
     kline_lows = [float(k[3]) for k in klines]
     intrabar_checks = 0
+    # r119：消息震盪(1 分K 高低差 ≥ 5 倍前 24h 中位數)。不是 1 分K(長天數)時不判斷(None)
+    shocks = trade_diagnostics.shock_times(klines)
+    news_cooldown = int(news_cooldown or 0) if shocks is not None else 0
+    skipped_news = 0
 
     position = None
     closed_trades = []
     split_stats = {"first": 0, "added": 0, "invalidated": 0, "expired": 0}   # r116：分批進場的加碼次數
+    pending = None                                    # r120：掛著的限價單(只活到下一個訊號步)
+    limit_stats = {"placed": 0, "filled": 0}
     split_entry = int(split_entry or 0) if strategy_type == "chan_profile" else 0
     # r117：中樞突破只做「中樞高度 < N 倍 ATR」(窄中樞＝壓縮後的突破)；背馳／其他不受影響。0 或留空＝關閉
     if max_zs_height_atr is None:   # r118：變成引擎設定了，沒填沿用正式設定(跟分價量表起點一樣)
@@ -684,6 +707,31 @@ def run_backtest(
             if closed:
                 closed_trades.append(closed)
         last_signal_step_time = step_time
+        # r120：限價單——上一步到這一步之間的1分K有碰到限價就以限價成交，成交後同一段K線接著跑停損/停利
+        if pending is not None and position is None and prev_step_time is not None:
+            lo_i = bisect.bisect_right(kline_close_times, prev_step_time)
+            hi_i = bisect.bisect_right(kline_close_times, step_time - 1)
+            for fi in range(lo_i, hi_i):
+                hit = (kline_lows[fi] <= pending["limit"]) if pending["direction"] == "bullish" else (kline_highs[fi] >= pending["limit"])
+                if not hit:
+                    continue
+                fill_iso = datetime.fromtimestamp(kline_close_times[fi] / 1000, tz=timezone.utc).isoformat()
+                position = trading_core.open_position(direction=pending["direction"], current_price=pending["limit"],
+                                                      entry_time=fill_iso, sl_points=abs(pending["limit"] - pending["stop"]),
+                                                      chan_reason=pending["chan_reason"], profile_reason=pending["profile_reason"])
+                position["sl_price"] = pending["stop"]
+                position["tp_price"] = pending["tp"]
+                position["mr_setup"] = pending["setup"]
+                position["daily_smc"] = pending["daily_tag"]
+                position["diag"] = pending["diag"]
+                position["limit_order"] = {"placed": pending["placed_iso"], "price": pending["limit"]}
+                limit_stats["filled"] += 1
+                # 成交那根也算進停損檢查(同一根K碰到停損＝保守假設先停損)
+                position, closed = _run_intrabar_stops(position, kline_close_times[fi] - 1, step_time - 1)
+                if closed:
+                    closed_trades.append(closed)
+                break
+            pending = None
         # r116：分批進場——上一步到這一步之間的K線更新「回抽的極值」(加碼判斷在這一步拿到收盤價之後)
         if position and position.get("split") and prev_step_time is not None:
             _sp = position["split"]
@@ -888,8 +936,26 @@ def run_backtest(
             zs_ok, _ = trade_diagnostics.narrow_zs_allows(strategy_type, result, max_zs_height_atr, price=current_price)
             if not zs_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok:
                 skipped_zs_height += 1   # 只數「其他濾網都放行、只被中樞高度擋下」的
+            after_shock = trade_diagnostics.recent_shock(shocks, step_time)
+            news_ok = not (news_cooldown and after_shock)
+            if (not news_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok
+                    and cooldown_ok and zs_ok):
+                skipped_news += 1   # 只數「其他濾網都放行、只被消息震盪冷卻擋下」的
             if (not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok
-                    and not same_bar and zs_ok):
+                    and not same_bar and zs_ok and news_ok and (result.get("mr") or {}).get("limit_price") is not None):
+                # r120：限價單策略——不是馬上進場，是掛單到下一個訊號步(下一步開頭用1分K判斷有沒有成交)
+                _mr = result["mr"]
+                pending = {"direction": result["direction"], "limit": float(_mr["limit_price"]), "stop": float(_mr["sl_price"]),
+                           "tp": float(_mr["tp_price"]), "setup": _mr["setup"], "chan_reason": result["chan"]["reason"],
+                           "profile_reason": result["profile"]["reason"], "daily_tag": daily_tag,
+                           "placed_iso": step_dt.isoformat(),
+                           "diag": dict(trade_diagnostics.entry_meta(strategy_type, result, atr,
+                                                                     abs(float(_mr["limit_price"]) - float(_mr["sl_price"])),
+                                                                     price=float(_mr["limit_price"]), direction=result["direction"]),
+                                        after_shock=after_shock)}
+                limit_stats["placed"] += 1
+            elif (not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok
+                    and not same_bar and zs_ok and news_ok):
                 entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
@@ -903,6 +969,7 @@ def run_backtest(
                 # r115：進出場診斷(事後統計用)：ATR、初始停損距離、進場種類與被突破的中樞邊界
                 position["diag"] = trade_diagnostics.entry_meta(strategy_type, result, atr, step_sl_points,
                                                                 price=current_price, direction=result["direction"])
+                position["diag"]["after_shock"] = after_shock   # r119：消息震盪後 60 分鐘內進場(None＝不判斷)
                 # r116：分批進場——中樞突破先進半倉，第三類買賣點出現再加另一半(背馳／其他照全倉)
                 if split_entry and position["diag"]["kind"] == "breakout" and atr:
                     size_weight = size_weight * 0.5
@@ -1031,6 +1098,10 @@ def run_backtest(
         "split_entry": split_entry,               # r116：分批進場(0=關閉)與加碼統計
         "max_zs_height_atr": max_zs_height_atr,   # r117：中樞高度上限(0=關閉)與被它擋下的次數
         "skipped_zs_height": skipped_zs_height,
+        "news_cooldown": news_cooldown,           # r119：消息震盪後 60 分鐘不進場(0=關閉；不是 1 分K 時不判斷)
+        "skipped_news": skipped_news,
+        "news_shocks": len(shocks) if shocks is not None else None,
+        "limit_stats": limit_stats if strategy_type == "fib_pullback" else None,   # r120：掛單幾次、成交幾次
         "split_stats": (dict(split_stats, closed_before=split_stats["first"] - split_stats["added"]
                                   - split_stats["invalidated"] - split_stats["expired"]) if split_entry else None),
         "assumed_spread_points": spread_cost_points,

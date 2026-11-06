@@ -51,6 +51,41 @@ def entry_meta(strategy_type, result, atr, sl_points, price=None, direction=None
     return meta
 
 
+# r119：消息面震盪(不靠經濟日曆，直接從價格認)：某根 1 分K 的高低差 ≥ SHOCK_MULT 倍「前 24 小時 1 分K 高低差的中位數」
+# ＝有消息砸進來(排程數據、地緣政治、突發談話都算)。之後 SHOCK_COOLDOWN_MIN 分鐘內進場的單算「消息震盪後」。
+SHOCK_MULT = 5.0
+SHOCK_LOOKBACK_BARS = 1440
+SHOCK_MIN_HISTORY = 240     # 前面不到 4 小時的資料，中位數不可靠，不判斷
+SHOCK_COOLDOWN_MIN = 60
+
+
+def shock_times(klines):
+    """回傳消息震盪那幾根 1 分K 的收盤時間(遞增)。只用那根之前的K線算中位數(因果)。K線不是 1 分K 時回 None(不判斷)。"""
+    if len(klines) < 2 or int(klines[1][0]) - int(klines[0][0]) != 60_000:
+        return None
+    window, ordered, out = [], [], []
+    for k in klines:
+        rng = float(k[2]) - float(k[3])
+        if len(ordered) >= SHOCK_MIN_HISTORY:
+            med = ordered[len(ordered) // 2]
+            if med > 0 and rng >= SHOCK_MULT * med:
+                out.append(int(k[6]))
+        window.append(rng)
+        bisect.insort(ordered, rng)
+        if len(window) > SHOCK_LOOKBACK_BARS:
+            old = window.pop(0)
+            del ordered[bisect.bisect_left(ordered, old)]
+    return out
+
+
+def recent_shock(shocks, now_ms, minutes=SHOCK_COOLDOWN_MIN):
+    """now_ms 往前 minutes 分鐘內(含 now)有沒有消息震盪。shocks=None(不判斷)時回 None。"""
+    if shocks is None:
+        return None
+    i = bisect.bisect_right(shocks, now_ms)
+    return i > 0 and shocks[i - 1] > now_ms - minutes * 60_000
+
+
 def narrow_zs_allows(strategy_type, result, max_zs_height_atr, price=None):
     """
     r117 回測、r118 起即時引擎共用：中樞突破只做「中樞高度 < N 倍 ATR」(窄中樞＝壓縮後的突破)。
@@ -203,7 +238,14 @@ def summarize(trades):
     breakout_part = {"retest": _group(retest), "runaway": _group(runaway),
                      "unknown": len([t for t in bo if t.get("diag_retest") is None]), "retest_hours": RETEST_HOURS}
     breakout_part["features"] = feature_buckets(bo)
-    return {"washed": washed_part, "winner_mae": mae_part, "kinds": kinds, "breakout": breakout_part}
+    # r119：消息震盪後 SHOCK_COOLDOWN_MIN 分鐘內進場 vs 其他(全部進場種類)
+    shock_part = None
+    flagged = [t for t in ts if (t.get("diag") or {}).get("after_shock") is not None]
+    if flagged:
+        shock_part = {"after": _group([t for t in flagged if t["diag"]["after_shock"]]),
+                      "normal": _group([t for t in flagged if not t["diag"]["after_shock"]]),
+                      "cooldown_min": SHOCK_COOLDOWN_MIN, "mult": SHOCK_MULT}
+    return {"washed": washed_part, "winner_mae": mae_part, "kinds": kinds, "breakout": breakout_part, "news_shock": shock_part}
 
 
 FEATURES = (

@@ -996,7 +996,7 @@
         <input type="number" id="backtestMaxZsHeight" placeholder="留空=不限" step="0.1" min="0" max="10" />
       </div>
       <div class="settings-field">
-        <label>消息震盪後不進場(1 分K 高低差 ≥ 5 倍前 24 小時中位數，之後 60 分鐘不開新倉；只有回測)</label>
+        <label>消息震盪後不進場(1 分K 高低差 ≥ 5 倍「前 20 天同一時段」中位數、而且 ≥ 1 小時K 平均波幅，之後 60 分鐘不開新倉；只有回測)</label>
         <select id="backtestNewsCooldown">
           <option value="">關閉</option>
           <option value="1">開啟</option>
@@ -1991,9 +1991,12 @@ function entryDiagnosticsHtml(d, title){
           </tbody>
         </table>
       </div>
+      ${d.by_direction ? `<div style="overflow-x:auto; margin-top:8px;"><table style="width:100%; font-size:12px; border-collapse:collapse;">${head}
+        <tbody><tr><td colspan="6" style="color:var(--muted);">多單／空單分開(看虧損是不是主要來自某一邊)</td></tr>
+        ${grp('多單', d.by_direction.bullish)}${grp('空單', d.by_direction.bearish)}</tbody></table></div>` : ''}
       ${diagFeaturesHtml(b.features)}
       ${d.news_shock ? `<div style="overflow-x:auto; margin-top:8px;"><table style="width:100%; font-size:12px; border-collapse:collapse;">${head}
-        <tbody><tr><td colspan="6" style="color:var(--muted);">消息震盪(1 分K 高低差 ≥ ${d.news_shock.mult} 倍前 24h 中位數)後 ${d.news_shock.cooldown_min} 分鐘內進場的單(全部進場種類)</td></tr>
+        <tbody><tr><td colspan="6" style="color:var(--muted);">消息震盪(1 分K 高低差 ≥ ${d.news_shock.mult} 倍前 ${d.news_shock.days || 20} 天同一時段中位數、而且 ≥ 1 小時K 平均波幅)後 ${d.news_shock.cooldown_min} 分鐘內進場的單(全部進場種類)</td></tr>
         ${grp('震盪後進場', d.news_shock.after)}${grp('其他', d.news_shock.normal)}</tbody></table></div>` : ''}
       <div style="font-size:10.5px; color:var(--muted); margin-top:6px; line-height:1.6;">
         怎麼看：1 很高＝常被洗；2 的「75% 以上」很高＝停損太緊(改結構停損值得試)；
