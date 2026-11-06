@@ -964,6 +964,13 @@
         </select>
       </div>
       <div class="settings-field">
+        <label>分批進場(只對纏論中樞突破；只有回測)</label>
+        <select id="backtestSplitEntry">
+          <option value="">關閉(突破就全倉進場)</option>
+          <option value="1">開啟：突破先進半倉，第三類買賣點(回抽沒進中樞又彈回)再加另一半</option>
+        </select>
+      </div>
+      <div class="settings-field">
         <label>MT5 券商每筆成本(points，點差＋佣金；結果另外列一行 MT5 重算，含隔夜庫存費)</label>
         <input type="number" id="backtestMt5Cost" placeholder="留空=0.4" step="0.05" min="0" max="5" />
       </div>
@@ -1450,6 +1457,7 @@ const els = {
   backtestBlockMarketClosed: document.getElementById('backtestBlockMarketClosed'),
   backtestMinAtr: document.getElementById('backtestMinAtr'),
   backtestMt5Cost: document.getElementById('backtestMt5Cost'),
+  backtestSplitEntry: document.getElementById('backtestSplitEntry'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
@@ -1878,6 +1886,28 @@ function dailySmcTagText(tag){
 }
 
 // r93：出場後多快再進場的分組(驗證「大賺出場後立刻再追、隨即被掃」這個模式)
+// r116：中樞突破單依進場當下的特徵分組(突破距離、中樞高度、進場前 1 小時的走勢)：看能不能事前分出直接走的突破
+function diagFeaturesHtml(features){
+  if(!features || !features.length) return '';
+  return features.map(f => {
+    const rows = f.rows.map(r => `<tr><td style="white-space:nowrap; padding-right:8px;">${r.label}</td>
+      <td class="mono" style="padding-right:8px;">${r.trades}</td>
+      <td class="mono" style="padding-right:8px;">${r.retest_pct != null ? r.retest_pct + '%' : '--'}</td>
+      <td class="mono ${r.trades ? (r.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg') : ''}" style="padding-right:8px;">${r.trades ? btNum(r.total_pnl_points) : '--'}</td>
+      <td class="mono ${r.trades ? (r.avg_pnl_points >= 0 ? 'bt-pos' : 'bt-neg') : ''}" style="padding-right:8px;">${r.trades ? btNum(r.avg_pnl_points, 2) : '--'}</td>
+      <td class="mono">${r.trades ? (r.profit_factor != null ? Number(r.profit_factor).toFixed(2) : '∞') : '--'}</td></tr>`).join('');
+    return `<div style="overflow-x:auto; margin-top:8px;"><table style="width:100%; font-size:12px; border-collapse:collapse;">
+      <thead><tr style="color:var(--muted); text-align:left;"><th>${f.label}</th><th>筆數</th><th>回抽率</th><th>損益</th><th>每筆</th><th>PF</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }).join('');
+}
+
+function splitStatsHtml(st){
+  // r116：分批進場的加碼統計
+  if(!st || !st.first) return '';
+  return `<div class="bt-win-split">分批進場：突破半倉 ${st.first} 筆 → 加碼 ${st.added}、回抽太深放棄 ${st.invalidated}、2 小時內沒等到 ${st.expired}、加碼前就出場 ${st.closed_before}</div>`;
+}
+
 // r115：進出場診斷(被洗出場比例、贏單最大逆向、中樞突破單有回抽/直接走)
 function entryDiagnosticsHtml(d, title){
   if(!d) return '';
@@ -1915,6 +1945,7 @@ function entryDiagnosticsHtml(d, title){
           </tbody>
         </table>
       </div>
+      ${diagFeaturesHtml(b.features)}
       <div style="font-size:10.5px; color:var(--muted); margin-top:6px; line-height:1.6;">
         怎麼看：1 很高＝常被洗；2 的「75% 以上」很高＝停損太緊(改結構停損值得試)；
         3 的「直接走」賺很多、「有回抽」賠很多＝改成第三類買賣點會錯過大行情、但能躲掉假突破，兩者要一起比。
@@ -3703,6 +3734,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('block_market_closed', els.backtestBlockMarketClosed);
   addIfPresent('min_atr_points', els.backtestMinAtr);
   addIfPresent('mt5_cost_points', els.backtestMt5Cost);   // r111
+  addIfPresent('split_entry', els.backtestSplitEntry);    // r116
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
@@ -3818,7 +3850,7 @@ function renderBacktestResult(data, el){
     `;
 
     renderSpreadAdjusted(document.getElementById('backtestSpreadAdjusted'), data);
-    document.getElementById('backtestReentry').innerHTML = reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場')
+    document.getElementById('backtestReentry').innerHTML = splitStatsHtml(data.split_stats) + reentryBreakdownHtml(data.reentry_breakdown, '出場後多快再進場')
       + entryDiagnosticsHtml(data.entry_diagnostics, '進出場診斷(只是統計，不影響回測)');
     document.getElementById('backtestDailySmc').innerHTML = dailySmcBreakdownHtml(
       data.daily_smc_breakdown, `依開倉時日線SMC結構分組${data.daily_smc_filter_mode ? '（已開日線濾網：被擋的單不在這裡）' : '（沒開日線濾網：順勢那組≈開濾網的近似結果）'}`);
@@ -3923,6 +3955,7 @@ function btParamLabel(p){
   else parts.push(`趨勢:${Number(p.trend_filter_mode) === 2 ? '嚴格' : '擋逆勢'}${p.trend_interval_seconds ? ' ' + p.trend_interval_seconds/3600 + 'h' : ''}${p.trend_slow_multiplier ? ' ' + p.trend_slow_multiplier + 'x' : ''}`);
   if(Number(p.cooldown_hours) > 0) parts.push(`冷卻${Number(p.cooldown_hours)}h`);
   if(p.mt5_cost_points != null && p.mt5_cost_points !== '') parts.push(`MT5成本${Number(p.mt5_cost_points)}`);
+  if(Number(p.split_entry) === 1) parts.push('分批進場');
   // r112：分價量表取樣(只有纏論類策略才有意義)
   if(Number(p.profile_anchor) === 1) parts.push('量表:每日換日');
   else if(Number(p.profile_anchor) === 2) parts.push('量表:錨定中樞');
@@ -3964,6 +3997,7 @@ function btWinCard(title, bias, r, extraClass, idx){
       <div><div class="lbl">回撤</div><div class="num mono">${r.total_trades ? Number(r.max_drawdown_points).toFixed(1) : '--'}</div></div>
     </div>
     ${Number(r.assumed_spread_points) > 0 && r.total_trades ? `<div class="bt-win-split">扣成本(每筆 ${Number(r.assumed_spread_points)} 點)：損益 <span class="${r.net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.net_pnl_points)}</span>，PF ${r.net_profit_factor != null ? Number(r.net_profit_factor).toFixed(2) : '∞'}</div>` : ''}
+    ${splitStatsHtml(r.split_stats)}
     ${r.mt5_net_pnl_points != null && r.total_trades ? `<div class="bt-win-split">MT5(每筆 ${Number(r.mt5_cost_points)} 點＋庫存費 ${btNum(r.mt5_swap_total)})：損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
   </div>`;

@@ -93,6 +93,31 @@ MAX_TARGET_STEP_COUNT = 6000  # 單次回測允許的步數上限，避免手滑
 SMC_MAX_BACKTEST_DAYS = 400  # SMC結構策略(1小時K)的長天數回測上限：用15分K當停損步，資料量可控
 HOURLY_STRATEGIES = ("smc_structure", "mean_reversion", "pullback_resume", "breakout_trend")  # 訊號看1小時K收盤的策略(共用1小時K warmup／長天數停損步)
 # r99：只存在回測、介面相同的1小時K策略(build_cfg / precompute / evaluate_at，結果放在 "mr")
+# r116：分批進場(只在回測、只對纏論中樞突破)：突破時先進半倉，SPLIT_WINDOW_MS 內出現第三類買賣點才加另一半。
+#   回抽：價格回到被突破的邊界附近(SPLIT_TOUCH_ATR 倍 ATR 以內)；
+#   沒有深入中樞：回抽極值沒有越過邊界 SPLIT_DEEP_ATR 倍 ATR(越過＝這次突破失敗，不加碼)；
+#   彈回：收盤價回到邊界外、而且離回抽極值至少 SPLIT_BOUNCE_ATR 倍 ATR → 用這一步收盤價加碼，
+#   整筆停損收緊到回抽極值外 SPLIT_STOP_BUFFER_ATR 倍 ATR(不會放寬)。
+SPLIT_WINDOW_MS = 2 * 3600 * 1000
+SPLIT_TOUCH_ATR = 0.2
+SPLIT_DEEP_ATR = 0.5
+SPLIT_BOUNCE_ATR = 0.3
+SPLIT_STOP_BUFFER_ATR = 0.2
+
+
+def split_add_decision(sp, price, now_ms):
+    """回傳 "add"／"invalidated"(回抽太深＝突破失敗)／"expired"(時間到沒回抽或沒彈回)／None(繼續等)。"""
+    s, lvl, atr, ext = sp["sign"], sp["level"], sp["atr"], sp["extreme"]
+    if s * (lvl - ext) > SPLIT_DEEP_ATR * atr:          # 回抽越過邊界太深
+        return "invalidated"
+    touched = s * (ext - lvl) <= SPLIT_TOUCH_ATR * atr
+    if touched and s * (price - lvl) > 0 and s * (price - ext) >= SPLIT_BOUNCE_ATR * atr:
+        return "add"
+    if now_ms >= sp["deadline"]:
+        return "expired"
+    return None
+
+
 HR_MODULES = {"mean_reversion": mean_reversion, "pullback_resume": pullback_resume,
               "breakout_trend": breakout_trend}   # r105：4小時K突破(用1小時K組4小時K)
 SMC_LONG_RANGE_STOP_INTERVAL = "15m"  # 超過MAX_BACKTEST_DAYS時，停損步改用這個週期的K線
@@ -249,6 +274,7 @@ def run_backtest(
     profile_window_minutes=None,
     value_area_method=None,
     profile_anchor=None,
+    split_entry=0,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -595,6 +621,8 @@ def run_backtest(
 
     position = None
     closed_trades = []
+    split_stats = {"first": 0, "added": 0, "invalidated": 0, "expired": 0}   # r116：分批進場的加碼次數
+    split_entry = int(split_entry or 0) if strategy_type == "chan_profile" else 0
     mr_funnel = {}   # r96：均值回歸各種進場(A/B)出現幾次訊號
     mr_last_entry_bar = None   # 同一根1小時K只進場一次(出場後同一小時內不再用同一根K的訊號重開)
     smc_funnel = {}  # SMC策略診斷：每個訊號步的stage/理由分佈，看訊號稀疏是卡在哪一關
@@ -644,11 +672,22 @@ def run_backtest(
         if progress_cb and step_no % 200 == 0:
             progress_cb(step_no, total_steps)
         # 先把上一個訊號步到這一步之間的每根1分K走一遍停損檢查
+        prev_step_time = last_signal_step_time
         if position and last_signal_step_time is not None:
             position, closed = _run_intrabar_stops(position, last_signal_step_time, step_time - 1)
             if closed:
                 closed_trades.append(closed)
         last_signal_step_time = step_time
+        # r116：分批進場——上一步到這一步之間的K線更新「回抽的極值」(加碼判斷在這一步拿到收盤價之後)
+        if position and position.get("split") and prev_step_time is not None:
+            _sp = position["split"]
+            lo_i = bisect.bisect_right(kline_close_times, prev_step_time)
+            hi_i = bisect.bisect_right(kline_close_times, step_time)
+            if hi_i > lo_i:
+                if _sp["sign"] > 0:
+                    _sp["extreme"] = min(_sp["extreme"], min(kline_lows[lo_i:hi_i]))
+                else:
+                    _sp["extreme"] = max(_sp["extreme"], max(kline_highs[lo_i:hi_i]))
 
         # 二分搜尋定位「這個時間點為止」的邊界，取代線性掃描，避免look-ahead bias
         cutoff_index = bisect.bisect_right(trade_times, step_time)
@@ -752,6 +791,29 @@ def run_backtest(
         if strategy_type == "resonance_fvg" and result.get("emas"):
             current_ema9 = result["emas"].get(9)
 
+        if position and position.get("split"):
+            # r116：分批進場的第二批(第三類買賣點)：回抽到中樞邊界附近、沒有深入中樞、又往突破方向彈回來才加碼
+            _sp = position["split"]
+            _decision = split_add_decision(_sp, current_price, step_time)
+            if _decision == "add":
+                w_half = _sp["half_weight"]
+                position["entry_price"] = (position["entry_price"] + current_price) / 2   # 兩批各半：均價
+                position["size_weight"] = 2 * w_half
+                if position["size_weight"] == 1.0:
+                    position.pop("size_weight", None)
+                buf = SPLIT_STOP_BUFFER_ATR * _sp["atr"]
+                if _sp["sign"] > 0:
+                    position["sl_price"] = max(position["sl_price"], _sp["extreme"] - buf)
+                else:
+                    position["sl_price"] = min(position["sl_price"], _sp["extreme"] + buf)
+                position["split_added"] = {"time": datetime.fromtimestamp(step_time / 1000, tz=timezone.utc).isoformat(),
+                                           "price": current_price, "extreme": _sp["extreme"]}
+                position.pop("split", None)
+                split_stats["added"] += 1
+            elif _decision in ("invalidated", "expired"):
+                position.pop("split", None)
+                split_stats[_decision] += 1
+
         if position:
             trading_core.update_trailing_stop(position, current_price, step_trail_trigger_points, step_trail_distance_points)
             exit_reason = trading_core.check_exit(
@@ -830,7 +892,17 @@ def run_backtest(
                 )
                 position["daily_smc"] = daily_tag
                 # r115：進出場診斷(事後統計用)：ATR、初始停損距離、進場種類與被突破的中樞邊界
-                position["diag"] = trade_diagnostics.entry_meta(strategy_type, result, atr, step_sl_points)
+                position["diag"] = trade_diagnostics.entry_meta(strategy_type, result, atr, step_sl_points,
+                                                                price=current_price, direction=result["direction"])
+                # r116：分批進場——中樞突破先進半倉，第三類買賣點出現再加另一半(背馳／其他照全倉)
+                if split_entry and position["diag"]["kind"] == "breakout" and atr:
+                    size_weight = size_weight * 0.5
+                    position["split"] = {"level": position["diag"]["level"],
+                                         "sign": 1 if result["direction"] == "bullish" else -1,
+                                         "atr": atr, "half_weight": size_weight, "extreme": current_price,
+                                         "deadline": step_time + SPLIT_WINDOW_MS}
+                    position["split_first_price"] = current_price
+                    split_stats["first"] += 1
                 if size_weight != 1.0:
                     position["size_weight"] = size_weight
                 if strategy_type in HR_MODULES:
@@ -947,5 +1019,8 @@ def run_backtest(
         "readiness_spread_adjusted": readiness_spread_adjusted,
         "mt5_view": mt5_view,
         "entry_diagnostics": entry_diagnostics,   # r115
+        "split_entry": split_entry,               # r116：分批進場(0=關閉)與加碼統計
+        "split_stats": (dict(split_stats, closed_before=split_stats["first"] - split_stats["added"]
+                                  - split_stats["invalidated"] - split_stats["expired"]) if split_entry else None),
         "assumed_spread_points": spread_cost_points,
     }

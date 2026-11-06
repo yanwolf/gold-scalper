@@ -176,6 +176,13 @@ FIELD_META = {
         "help": "0＝r111以前的算法：把成交量最大的價位挑出來湊滿70%，取最高最低，可能跨過中間的低量區。"
                 "1＝Volume Profile 標準做法：從POC開始，每次把上下相鄰量比較大的那一側併進來，區間連續。",
     },
+    "paper_profile_anchor": {
+        "label": "分價量表起點 (0 = 用上面的時間窗 / 1 = 每日換日重置(紐約17:00) / 2 = 錨定最新中樞)",
+        "type": "int", "step": 1, "min": 0, "max": 2,
+        "default": int(os.getenv("PAPER_PROFILE_ANCHOR", "0")),
+        "help": "r114：1＝從今天紐約17:00(MT5換日)開始算，換日不到60分鐘連前一天一起算；"
+                "2＝從纏論最新中樞第一筆開始算。開了就取代上面的時間窗。即時只保留3天1分K，更早的起點會從3天前算起。",
+    },
     # ---- SMC結構策略(smc_structure_3600引擎)專用，其他引擎不讀這些欄位 ----
     "smc_touch_window": {
         "label": "SMC：碰區域/交叉允許視窗(根1小時K)",
@@ -389,7 +396,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_use_chop_filter", "paper_chop_threshold",
     "paper_block_market_closed", "paper_min_atr_points",
     "paper_trend_filter_mode", "paper_trend_interval_seconds", "paper_trend_slow_multiplier",
-    "paper_profile_window_minutes", "paper_value_area_method",
+    "paper_profile_window_minutes", "paper_value_area_method", "paper_profile_anchor",
     "smc_touch_window", "smc_wt_level", "smc_confirm_bos", "smc_require_ema", "smc_exit_mode", "smc_min_rr",
 }
 

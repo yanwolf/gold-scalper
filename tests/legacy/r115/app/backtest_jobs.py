@@ -23,6 +23,7 @@ from app import backtest as backtest_module
 from app import db
 from app import trading_stats   # 用模組取函式(呼叫時才找)：測試會把 app/ 的舊版檔換進來，舊版沒有新函式時不能在匯入時就崩
 from app import cost_profiles   # r111：MT5 券商成本重算
+from app import trade_diagnostics   # r115：進出場診斷
 
 logger = logging.getLogger("backtest_jobs")
 
@@ -148,6 +149,7 @@ def _aggregate(results):
                      if isinstance(r, dict) and not r.get("error") and r.get("mt5_view")), None)
     mt5 = cost_profiles.view(trades, cost_points=mt5_cost) if trades else None
     return {"total_trades": st["total_trades"], "win_rate": st["win_rate"], "total_pnl_points": st["total_pnl_points"],
+            "entry_diagnostics": trade_diagnostics.summarize(trades),   # r115：全部段落合計的進出場診斷
             "assumed_spread_points": cost,
             "mt5_cost_points": mt5["cost_points"] if mt5 else None,
             "mt5_net_pnl_points": mt5["total_pnl_points"] if mt5 else None,

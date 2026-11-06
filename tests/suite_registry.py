@@ -40,6 +40,7 @@ REGISTRY = {
     "test_breakout_trend.py": (set(), _BACKTEST),
     "test_cost_profiles.py": (set(), "成本重算只是統計(回測結果、引擎績效)，不碰交易所下單路徑；r111 新功能，不重跑舊版"),
     "test_trade_diagnostics.py": (set(), "進出場診斷只是回測的事後統計，不碰交易所下單路徑；r115 新功能，不重跑舊版"),
+    "test_split_entry.py": (set(), "分批進場只存在回測(不碰即時引擎與下單路徑)；r116 新功能，不重跑舊版"),
     "test_profile_window.py": (set(), _BACKTEST + "。r112：分價量表時間窗／標準VA／日線大級別流動性；"
                                "引擎那項只攔 compute_full_signal 看傳了什麼，不走下單路徑"),
 }

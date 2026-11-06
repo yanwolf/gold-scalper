@@ -30,6 +30,7 @@ from app import mean_reversion
 from app import pullback_resume
 from app import breakout_trend
 from app import cost_profiles
+from app import trade_diagnostics
 from app.analysis import resample_candles, compute_supertrend, trend_filter_allows, compute_atr, compute_choppiness_index
 from app import trading_core
 from app import settings as settings_module
@@ -247,7 +248,7 @@ def run_backtest(
     mt5_cost_points=None,
     profile_window_minutes=None,
     value_area_method=None,
-    profile_anchor=0,
+    profile_anchor=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -328,6 +329,8 @@ def run_backtest(
         profile_window_minutes = int(s.get("paper_profile_window_minutes", 0) or 0)
     if value_area_method is None:
         value_area_method = int(s.get("paper_value_area_method", 0) or 0)
+    if profile_anchor is None:   # r114：變成引擎設定了，沒填沿用正式設定(跟時間窗一樣)
+        profile_anchor = int(s.get("paper_profile_anchor", 0) or 0)
     try:
         profile_window_minutes = int(profile_window_minutes)
         value_area_method = int(value_area_method)
@@ -337,7 +340,7 @@ def run_backtest(
         return {"error": f"分價量表時間窗要在 0～{PROFILE_WINDOW_MAX_MINUTES} 分鐘之間"}
     if value_area_method not in (0, 1):
         return {"error": "VA算法只有 0(舊)或 1(標準)"}
-    # r113：分價量表錨點(只存在回測，不是 settings 欄位，一鍵套用不會帶過去)。開了就取代時間窗
+    # r113 加、r114 起也是引擎設定(paper_profile_anchor)，一鍵套用會帶過去。開了就取代時間窗
     try:
         profile_anchor = int(profile_anchor or 0)
     except (TypeError, ValueError):
@@ -826,6 +829,8 @@ def run_backtest(
                     profile_reason=result["profile"]["reason"],
                 )
                 position["daily_smc"] = daily_tag
+                # r115：進出場診斷(事後統計用)：ATR、初始停損距離、進場種類與被突破的中樞邊界
+                position["diag"] = trade_diagnostics.entry_meta(strategy_type, result, atr, step_sl_points)
                 if size_weight != 1.0:
                     position["size_weight"] = size_weight
                 if strategy_type in HR_MODULES:
@@ -845,6 +850,10 @@ def run_backtest(
         if w is not None and w != 1.0 and t.get("pnl_points") is not None and "pnl_points_full" not in t:
             t["pnl_points_full"] = t["pnl_points"]
             t["pnl_points"] = t["pnl_points"] * w
+
+    # r115：進出場診斷——被洗出場比例、贏單最大逆向、中樞突破單有回抽／直接走(只是統計，不影響進出場)
+    trade_diagnostics.annotate(closed_trades, klines)
+    entry_diagnostics = trade_diagnostics.summarize(closed_trades)
 
     # r90：這個視窗裡日線偏多/偏空/未定各幾天(看這段回測是哪一種行情)
     daily_bias_days = {"bullish": 0, "bearish": 0, "none": 0}
@@ -917,7 +926,7 @@ def run_backtest(
         "trend_slow_multiplier": trend_slow_multiplier,
         "profile_window_minutes": profile_window_minutes,   # r112：0＝舊做法(最後 trade_limit 筆合成成交＝trade_limit/4 分鐘)
         "value_area_method": value_area_method,
-        "profile_anchor": profile_anchor,          # r113：0＝時間窗、1＝每日換日、2＝錨定最新中樞(只存在回測)
+        "profile_anchor": profile_anchor,          # r113：0＝時間窗、1＝每日換日、2＝錨定最新中樞(r114 起也是引擎設定)
         "skipped_trend": skipped_trend,  # 被趨勢濾網擋掉的進場訊號數
         "daily_smc_filter_mode": daily_smc_filter_mode,   # r89：日線SMC濾網(只存在回測)
         "skipped_daily_smc": skipped_daily_smc,            # 只被日線濾網擋掉的進場訊號數
@@ -937,5 +946,6 @@ def run_backtest(
         "stats_spread_adjusted": stats_spread_adjusted,
         "readiness_spread_adjusted": readiness_spread_adjusted,
         "mt5_view": mt5_view,
+        "entry_diagnostics": entry_diagnostics,   # r115
         "assumed_spread_points": spread_cost_points,
     }
