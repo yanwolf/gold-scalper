@@ -85,3 +85,95 @@ class NarrowZs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from app import paper_trading as pt  # noqa: E402
+from app import settings as S  # noqa: E402
+from app import trade_diagnostics as TD  # noqa: E402
+
+
+class SharedRule(unittest.TestCase):
+    def test_allows(self):
+        self.assertEqual(TD.narrow_zs_allows("chan_profile", WIDE, 0), (True, None), "0＝關閉")
+        ok, note = TD.narrow_zs_allows("chan_profile", WIDE, 1.0)
+        self.assertEqual(ok, False)
+        self.assertIn("5.00 倍 ATR", note)
+        self.assertEqual(TD.narrow_zs_allows("chan_profile", NARROW, 1.0), (True, None))
+        self.assertEqual(TD.narrow_zs_allows("chan_profile", BEICHI, 1.0), (True, None), "背馳不受影響")
+        self.assertEqual(TD.narrow_zs_allows("band_touch", WIDE, 1.0), (True, None), "別的策略不受影響")
+        ok2, note2 = TD.narrow_zs_allows("chan_profile", dict(NARROW, atr=None), 1.0)
+        self.assertEqual(ok2, False, "算不出高度：不當成窄中樞")
+        self.assertIn("算不出", note2)
+
+    def test_setting(self):
+        meta = S.FIELD_META["paper_max_zs_height_atr"]
+        self.assertEqual((meta["type"], meta["min"]), ("float", 0))
+        self.assertEqual(float(meta["default"]), 0.0, "預設不限制：既有引擎行為不變")
+        self.assertIn("paper_max_zs_height_atr", S.TRADING_RELEVANT_KEYS, "改了要重新分界績效統計")
+
+    def test_backtest_defaults_to_engine_setting(self):
+        real = B.settings_module.get_settings
+        with mock.patch.object(B.settings_module, "get_settings",
+                               side_effect=lambda *a, **k: dict(real(*a, **k), paper_max_zs_height_atr=1.0)):
+            r, _ = run(WIDE, None)
+        self.assertEqual(r["max_zs_height_atr"], 1.0, "沒填就沿用正式設定")
+        self.assertEqual(r["total_trades"], 0)
+        with mock.patch.object(B.settings_module, "get_settings",
+                               side_effect=lambda *a, **k: dict(real(*a, **k), paper_max_zs_height_atr=1.0)):
+            r2, _ = run(WIDE, 0)
+        self.assertEqual(r2["total_trades"], 1, "填 0：明確關閉，蓋過正式設定")
+
+
+class LiveEngine(unittest.TestCase):
+    def setUp(self):
+        self.eng = pt.PaperTradingEngine(interval_seconds=900, label="測試纏論", engine_id="chan_zs_test", execution_index=98)
+        self.eng._seeded_from_db = True
+        real = pt.settings_module.get_settings
+        self.over = {"paper_trend_filter_mode": 0, "paper_use_chop_filter": 0, "paper_min_atr_points": 0}
+        self.ps = [
+            mock.patch.object(pt.settings_module, "settings_loaded", return_value=True),
+            mock.patch.object(pt.settings_module, "get_settings", side_effect=lambda *a, **k: dict(real(*a, **k), **self.over)),
+            mock.patch.object(pt.trading_core, "is_gold_market_closed", return_value=(False, "")),
+            mock.patch.object(pt.notifier_module.notifier, "notify_trade_event"),
+            mock.patch.object(pt.db, "load_closed_paper_trades", return_value=(True, [])),
+        ]
+        for p in self.ps:
+            p.start()
+
+    def tearDown(self):
+        for p in self.ps:
+            p.stop()
+
+    def tick(self, sig):
+        r = dict(sig, strategy_type="chan_profile", current_price=4002.0, bid=4001.9, ask=4002.1, book_stale=None,
+                 trend_filter={"direction": None})
+        with mock.patch.object(pt, "compute_full_signal", return_value=r):
+            self.eng._tick()
+
+    def test_off_by_default_opens_wide(self):
+        self.tick(WIDE)
+        self.assertIsNotNone(self.eng._position, "設定 0：寬中樞照開(既有行為不變)")
+
+    def test_setting_blocks_wide_and_counts(self):
+        self.over["paper_max_zs_height_atr"] = 1.0
+        self.tick(WIDE)
+        self.assertIsNone(self.eng._position)
+        self.assertEqual(self.eng._zs_skips, 1)
+        with mock.patch.object(pt.db, "is_enabled", return_value=False):
+            self.assertEqual(self.eng.get_summary()["zs_skips"], 1)
+
+    def test_setting_allows_narrow_and_beichi(self):
+        self.over["paper_max_zs_height_atr"] = 1.0
+        self.tick(NARROW)
+        self.assertIsNotNone(self.eng._position, "窄中樞照開")
+        self.eng._position = None
+        self.tick(BEICHI)
+        self.assertIsNotNone(self.eng._position, "背馳不受影響")
+
+    def test_dashboard_settings_wiring(self):
+        with open(os.path.join(ROOT, "app/static/dashboard.html"), encoding="utf-8") as f:
+            h = f.read()
+        self.assertIn("paper_max_zs_height_atr: 'backtestMaxZsHeight'", h)
+        self.assertIn("paper_max_zs_height_atr: data.max_zs_height_atr", h)
+        self.assertIn("keys: ['paper_max_zs_height_atr']", h)
+        self.assertIn("data.zs_skips", h)

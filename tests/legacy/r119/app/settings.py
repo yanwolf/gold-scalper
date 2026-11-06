@@ -183,6 +183,14 @@ FIELD_META = {
         "help": "r114：1＝從今天紐約17:00(MT5換日)開始算，換日不到60分鐘連前一天一起算；"
                 "2＝從纏論最新中樞第一筆開始算。開了就取代上面的時間窗。即時只保留3天1分K，更早的起點會從3天前算起。",
     },
+    "paper_max_zs_height_atr": {
+        "label": "中樞突破只做窄中樞：中樞高度 < 幾倍 ATR (0 = 不限制)",
+        "type": "float", "step": 0.1, "min": 0, "max": 10,
+        "default": float(os.getenv("PAPER_MAX_ZS_HEIGHT_ATR", "0")),
+        "help": "r118：纏論引擎的「中樞突破」訊號，只有中樞高度(ZG−ZD)小於這個倍數的 ATR 才開倉(窄中樞＝壓縮後的突破)；"
+                "背馳／其他進場照常；布林觸軌、SMC 引擎不受影響。回測(r117)：前半年 MT5 PF 1.41、近半年 1.04，"
+                "沒過事先定的標準，所以只建議在 lab 模擬引擎做前瞻測試，不要匯出到正式端。",
+    },
     # ---- SMC結構策略(smc_structure_3600引擎)專用，其他引擎不讀這些欄位 ----
     "smc_touch_window": {
         "label": "SMC：碰區域/交叉允許視窗(根1小時K)",
@@ -397,6 +405,7 @@ TRADING_RELEVANT_KEYS = {
     "paper_block_market_closed", "paper_min_atr_points",
     "paper_trend_filter_mode", "paper_trend_interval_seconds", "paper_trend_slow_multiplier",
     "paper_profile_window_minutes", "paper_value_area_method", "paper_profile_anchor",
+    "paper_max_zs_height_atr",
     "smc_touch_window", "smc_wt_level", "smc_confirm_bos", "smc_require_ema", "smc_exit_mode", "smc_min_rr",
 }
 

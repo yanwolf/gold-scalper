@@ -23,7 +23,7 @@ HOUR_MS = 3_600_000
 MAE_BUCKETS = ((0.25, "<25%"), (0.5, "25~50%"), (0.75, "50~75%"), (1.0, "75~100%"), (float("inf"), "≥100%"))
 
 
-def entry_meta(strategy_type, result, atr, sl_points):
+def entry_meta(strategy_type, result, atr, sl_points, price=None, direction=None):
     """
     開倉當下要記的診斷資訊(放在部位的 diag 欄位)：ATR、初始停損距離、進場種類(中樞突破／背馳／其他)
     與被突破的中樞邊界。只有纏論+分價量表(chan_profile)分得出種類，其他策略記 "n/a"。
@@ -41,7 +41,35 @@ def entry_meta(strategy_type, result, atr, sl_points):
         meta["kind"], meta["level"] = "breakout", float(zs["zd"])
     else:
         meta["kind"] = "other"
+    # r116：進場當下就看得到的特徵(看能不能事前分出「有回抽」和「直接走」)
+    if meta["kind"] == "breakout" and atr:
+        sign = 1 if direction == "bullish" else -1
+        if price is not None:
+            meta["break_atr"] = round(sign * (float(price) - meta["level"]) / atr, 3)   # 進場價離被突破的邊界幾倍 ATR
+        if zs.get("zg") is not None and zs.get("zd") is not None:
+            meta["zs_height_atr"] = round((float(zs["zg"]) - float(zs["zd"])) / atr, 3)   # 中樞高度幾倍 ATR
     return meta
+
+
+def narrow_zs_allows(strategy_type, result, max_zs_height_atr, price=None):
+    """
+    r117 回測、r118 起即時引擎共用：中樞突破只做「中樞高度 < N 倍 ATR」(窄中樞＝壓縮後的突破)。
+    回傳 (允許, 說明)。N <= 0＝關閉；不是纏論中樞突破(背馳／其他／別的策略)一律允許；
+    中樞突破但算不出高度(沒有 ATR 或中樞)＝不當成窄中樞，不允許。
+    """
+    n = float(max_zs_height_atr or 0)
+    if n <= 0:
+        return True, None
+    meta = entry_meta(strategy_type, result, (result or {}).get("atr"), None,
+                      price=price, direction=(result or {}).get("direction"))
+    if meta["kind"] != "breakout":
+        return True, None
+    h = meta.get("zs_height_atr")
+    if h is None:
+        return False, "中樞突破但算不出中樞高度(沒有 ATR)，不當成窄中樞"
+    if h >= n:
+        return False, f"中樞高度 {h:.2f} 倍 ATR，不小於 {n:g}(只做窄中樞突破)"
+    return True, None
 
 
 def _ms(iso):
@@ -103,6 +131,13 @@ def annotate(trades, klines):
                                              ((hi2 >= target) if sign > 0 else (lo2 <= target)))
             else:
                 t["diag_after_favorable"] = None   # 資料不夠看完 N 小時，不算
+        # r116：進場前 1 小時往突破方向走了幾倍 ATR(進場當下就知道，只用進場前的K線)
+        if d.get("kind") == "breakout" and atr and "momentum_atr" not in d:
+            a, b = bars.span(ent - HOUR_MS, ent + 1)
+            if b - a >= 2:
+                first_open = float(klines[a][1])
+                last_close = float(klines[b - 1][4])
+                d["momentum_atr"] = round(sign * (last_close - first_open) / atr, 3)
         # 中樞突破單：RETEST_HOURS 小時內有沒有回測被突破的邊界
         if d.get("kind") == "breakout" and d.get("level") is not None:
             if end_of_data is not None and ent + RETEST_HOURS * HOUR_MS <= end_of_data:
@@ -167,4 +202,41 @@ def summarize(trades):
     runaway = [t for t in bo if t.get("diag_retest") is False]
     breakout_part = {"retest": _group(retest), "runaway": _group(runaway),
                      "unknown": len([t for t in bo if t.get("diag_retest") is None]), "retest_hours": RETEST_HOURS}
+    breakout_part["features"] = feature_buckets(bo)
     return {"washed": washed_part, "winner_mae": mae_part, "kinds": kinds, "breakout": breakout_part}
+
+
+FEATURES = (
+    ("break_atr", "突破距離(進場價離中樞邊界，ATR)", (0.25, 0.5, 1.0, 2.0)),
+    ("zs_height_atr", "中樞高度(ATR)", (1.0, 2.0, 4.0)),
+    ("momentum_atr", "進場前 1 小時往突破方向的漲跌(ATR)", (1.0, 2.0, 3.0)),
+)
+
+
+def _bucket_label(edges, i):
+    if i == 0:
+        return f"<{edges[0]:g}"
+    if i == len(edges):
+        return f"≥{edges[-1]:g}"
+    return f"{edges[i - 1]:g}~{edges[i]:g}"
+
+
+def feature_buckets(breakouts):
+    """
+    r116：中樞突破單依進場當下的特徵分組，每組列「有回抽」的比例與損益。某一組的回抽比例明顯低、損益明顯好，
+    才代表這個特徵事前就分得出直接走的突破(之後才值得當進場門檻測試)。
+    """
+    out = []
+    for key, label, edges in FEATURES:
+        rows = []
+        for i in range(len(edges) + 1):
+            lo = edges[i - 1] if i > 0 else float("-inf")
+            hi = edges[i] if i < len(edges) else float("inf")
+            sub = [t for t in breakouts if (t.get("diag") or {}).get(key) is not None and lo <= t["diag"][key] < hi]
+            judged = [t for t in sub if t.get("diag_retest") is not None]
+            g = _group(sub)
+            g["label"] = _bucket_label(edges, i)
+            g["retest_pct"] = round(100 * sum(1 for t in judged if t["diag_retest"]) / len(judged), 1) if judged else None
+            rows.append(g)
+        out.append({"key": key, "label": label, "rows": rows})
+    return out

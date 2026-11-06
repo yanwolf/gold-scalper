@@ -275,6 +275,7 @@ def run_backtest(
     value_area_method=None,
     profile_anchor=None,
     split_entry=0,
+    max_zs_height_atr=None,
 ):
     """
     執行完整回測流程：抓歷史資料 -> 還原成成交 -> 逐根K線重播 -> 套用交易規則 -> 統計績效。
@@ -623,6 +624,11 @@ def run_backtest(
     closed_trades = []
     split_stats = {"first": 0, "added": 0, "invalidated": 0, "expired": 0}   # r116：分批進場的加碼次數
     split_entry = int(split_entry or 0) if strategy_type == "chan_profile" else 0
+    # r117：中樞突破只做「中樞高度 < N 倍 ATR」(窄中樞＝壓縮後的突破)；背馳／其他不受影響。0 或留空＝關閉
+    if max_zs_height_atr is None:   # r118：變成引擎設定了，沒填沿用正式設定(跟分價量表起點一樣)
+        max_zs_height_atr = float(s.get("paper_max_zs_height_atr", 0) or 0)
+    max_zs_height_atr = float(max_zs_height_atr or 0) if strategy_type == "chan_profile" else 0.0
+    skipped_zs_height = 0
     mr_funnel = {}   # r96：均值回歸各種進場(A/B)出現幾次訊號
     mr_last_entry_bar = None   # 同一根1小時K只進場一次(出場後同一小時內不再用同一根K的訊號重開)
     smc_funnel = {}  # SMC策略診斷：每個訊號步的stage/理由分佈，看訊號稀疏是卡在哪一關
@@ -879,8 +885,11 @@ def run_backtest(
                     if not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok:
                         skipped_cooldown += 1   # 只數「其他濾網都放行、只被冷卻擋下」的
             same_bar = strategy_type in HR_MODULES and mr_bar is not None and mr_bar == mr_last_entry_bar
+            zs_ok, _ = trade_diagnostics.narrow_zs_allows(strategy_type, result, max_zs_height_atr, price=current_price)
+            if not zs_ok and not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok:
+                skipped_zs_height += 1   # 只數「其他濾網都放行、只被中樞高度擋下」的
             if (not is_choppy and not market_closed and not atr_too_low and trend_ok and daily_ok and cooldown_ok
-                    and not same_bar):
+                    and not same_bar and zs_ok):
                 entry_time_iso = step_dt.isoformat()
                 position = trading_core.open_position(
                     direction=result["direction"],
@@ -1020,6 +1029,8 @@ def run_backtest(
         "mt5_view": mt5_view,
         "entry_diagnostics": entry_diagnostics,   # r115
         "split_entry": split_entry,               # r116：分批進場(0=關閉)與加碼統計
+        "max_zs_height_atr": max_zs_height_atr,   # r117：中樞高度上限(0=關閉)與被它擋下的次數
+        "skipped_zs_height": skipped_zs_height,
         "split_stats": (dict(split_stats, closed_before=split_stats["first"] - split_stats["added"]
                                   - split_stats["invalidated"] - split_stats["expired"]) if split_entry else None),
         "assumed_spread_points": spread_cost_points,

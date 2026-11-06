@@ -38,10 +38,13 @@ REGISTRY = {
     "test_mean_reversion.py": (set(), _BACKTEST),
     "test_pullback_resume.py": (set(), _BACKTEST),
     "test_breakout_trend.py": (set(), _BACKTEST),
+    "test_fib_pullback.py": (set(), _BACKTEST),
     "test_cost_profiles.py": (set(), "成本重算只是統計(回測結果、引擎績效)，不碰交易所下單路徑；r111 新功能，不重跑舊版"),
     "test_trade_diagnostics.py": (set(), "進出場診斷只是回測的事後統計，不碰交易所下單路徑；r115 新功能，不重跑舊版"),
     "test_split_entry.py": (set(), "分批進場只存在回測(不碰即時引擎與下單路徑)；r116 新功能，不重跑舊版"),
-    "test_narrow_zs.py": (set(), "窄中樞條件只存在回測(不碰即時引擎與下單路徑)；r117 新功能，不重跑舊版"),
+    "test_news_shock.py": (set(), "消息震盪的診斷與冷卻只存在回測(不碰即時引擎與下單路徑)；r119 新功能，不重跑舊版"),
+    "test_narrow_zs.py": ({"error_scan"}, "窄中樞條件(r117 回測、r118 起也在即時引擎的 _tick)：走即時引擎的 _tick，錯誤掃描適用；"
+                                          "模擬引擎不碰真實下單的部位查詢，不參加突變；新功能，不重跑舊版"),
     "test_profile_window.py": (set(), _BACKTEST + "。r112：分價量表時間窗／標準VA／日線大級別流動性；"
                                "引擎那項只攔 compute_full_signal 看傳了什麼，不走下單路徑"),
 }

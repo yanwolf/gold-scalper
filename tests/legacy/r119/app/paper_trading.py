@@ -29,6 +29,7 @@ from app import db
 from app import trading_core
 from app import abandoned
 from app import cost_profiles
+from app import trade_diagnostics
 from app import settings as settings_module
 from app import notifier as notifier_module
 from app import alert_cadence
@@ -1532,7 +1533,13 @@ class PaperTradingEngine:
                 band_ok, band_note = band_entry_allowed(result, self._band_last_bar)
                 if not band_ok:
                     logger.info(f"{self.label}: {band_note}")
-            if not is_choppy and not market_closed and not atr_too_low and trend_ok and band_ok:
+            # r118：中樞突破只做窄中樞(引擎設定 paper_max_zs_height_atr，0＝不限；跟回測 r117 同一個判斷)
+            zs_ok, zs_note = trade_diagnostics.narrow_zs_allows(result.get("strategy_type") or "chan_profile", result,
+                                                                s.get("paper_max_zs_height_atr", 0), price=current_price)
+            if not zs_ok:
+                self._zs_skips = getattr(self, "_zs_skips", 0) + 1
+                logger.info(f"{self.label}: {zs_note}")
+            if not is_choppy and not market_closed and not atr_too_low and trend_ok and band_ok and zs_ok:
                 self._open_position(result, current_price, sl_points)
 
     def _maybe_reconcile_abandoned(self):
@@ -2477,6 +2484,7 @@ class PaperTradingEngine:
             "stats_spread_adjusted": stats_spread_adjusted,
             "readiness_spread_adjusted": readiness_spread_adjusted,
             "mt5_view": mt5_view,   # r111：同一批交易用 MT5 券商成本重算(只是統計)
+            "zs_skips": getattr(self, "_zs_skips", 0),   # r118：重啟以來被「只做窄中樞」擋下的訊號步數
             "assumed_spread_points": spread_points,
             "slippage_impact": slippage_impact,
             "daily_smc_breakdown": daily_smc_breakdown,

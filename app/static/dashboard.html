@@ -675,6 +675,7 @@
       <option value="mean_reversion">均值回歸(1小時K，只有回測)</option>
       <option value="pullback_resume">回拉轉強(1小時K，持有一根，只有回測)</option>
       <option value="breakout_trend">大週期突破(4小時K大行情，只有回測)</option>
+      <option value="fib_pullback">斐波那契回檔掛單(1小時K，只有回測)</option>
     </select>
     <select id="backtestResonanceThreshold">
       <option value="4" selected>4/4項條件(嚴格AND)</option>
@@ -895,6 +896,33 @@
         <input type="number" id="backtestPrHoldBars" placeholder="留空=1" step="1" min="1" max="6" />
       </div>
 
+      <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">斐波那契回檔掛單參數(只在策略選斐波那契回檔時有效，留空=預設值)</div>
+      <div class="settings-field">
+        <label>推動段至少幾倍 ATR</label>
+        <input type="number" id="backtestFpImpulse" placeholder="留空=2" step="0.5" min="0.5" max="10" />
+      </div>
+      <div class="settings-field">
+        <label>掛單回檔比例</label>
+        <input type="number" id="backtestFpEntry" placeholder="留空=0.618" step="0.001" min="0.2" max="0.9" />
+      </div>
+      <div class="settings-field">
+        <label>停損回檔比例(再往外 0.1 倍 ATR)</label>
+        <input type="number" id="backtestFpStop" placeholder="留空=0.786" step="0.001" min="0.3" max="1" />
+      </div>
+      <div class="settings-field">
+        <label>方向</label>
+        <select id="backtestFpSides">
+          <option value="">預設(多空都做)</option>
+          <option value="1">只做多</option>
+          <option value="2">只做空</option>
+          <option value="3">多空都做</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>最長持有(小時)</label>
+        <input type="number" id="backtestFpMaxHold" placeholder="留空=48" step="1" min="1" max="240" />
+      </div>
+
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">大週期突破參數(只在策略選大週期突破時有效，留空=預設值；4小時K，天數可選 90/180 天)</div>
       <div class="settings-field">
         <label>突破前幾根4小時K的高低點</label>
@@ -966,6 +994,13 @@
       <div class="settings-field">
         <label>中樞突破只做窄中樞：中樞高度 &lt; 幾倍 ATR(只對纏論中樞突破；背馳照常；留空=不限)</label>
         <input type="number" id="backtestMaxZsHeight" placeholder="留空=不限" step="0.1" min="0" max="10" />
+      </div>
+      <div class="settings-field">
+        <label>消息震盪後不進場(1 分K 高低差 ≥ 5 倍前 24 小時中位數，之後 60 分鐘不開新倉；只有回測)</label>
+        <select id="backtestNewsCooldown">
+          <option value="">關閉</option>
+          <option value="1">開啟</option>
+        </select>
       </div>
       <div class="settings-field">
         <label>分批進場(只對纏論中樞突破；只有回測)</label>
@@ -1463,6 +1498,12 @@ const els = {
   backtestMt5Cost: document.getElementById('backtestMt5Cost'),
   backtestSplitEntry: document.getElementById('backtestSplitEntry'),
   backtestMaxZsHeight: document.getElementById('backtestMaxZsHeight'),
+  backtestNewsCooldown: document.getElementById('backtestNewsCooldown'),
+  backtestFpImpulse: document.getElementById('backtestFpImpulse'),
+  backtestFpEntry: document.getElementById('backtestFpEntry'),
+  backtestFpStop: document.getElementById('backtestFpStop'),
+  backtestFpSides: document.getElementById('backtestFpSides'),
+  backtestFpMaxHold: document.getElementById('backtestFpMaxHold'),
   backtestTrendMode: document.getElementById('backtestTrendMode'),
   backtestTrendInterval: document.getElementById('backtestTrendInterval'),
   backtestTrendSlowMult: document.getElementById('backtestTrendSlowMult'),
@@ -1951,6 +1992,9 @@ function entryDiagnosticsHtml(d, title){
         </table>
       </div>
       ${diagFeaturesHtml(b.features)}
+      ${d.news_shock ? `<div style="overflow-x:auto; margin-top:8px;"><table style="width:100%; font-size:12px; border-collapse:collapse;">${head}
+        <tbody><tr><td colspan="6" style="color:var(--muted);">消息震盪(1 分K 高低差 ≥ ${d.news_shock.mult} 倍前 24h 中位數)後 ${d.news_shock.cooldown_min} 分鐘內進場的單(全部進場種類)</td></tr>
+        ${grp('震盪後進場', d.news_shock.after)}${grp('其他', d.news_shock.normal)}</tbody></table></div>` : ''}
       <div style="font-size:10.5px; color:var(--muted); margin-top:6px; line-height:1.6;">
         怎麼看：1 很高＝常被洗；2 的「75% 以上」很高＝停損太緊(改結構停損值得試)；
         3 的「直接走」賺很多、「有回抽」賠很多＝改成第三類買賣點會錯過大行情、但能躲掉假突破，兩者要一起比。
@@ -2910,6 +2954,7 @@ function backtestResultToEngineValues(data){
     paper_profile_window_minutes: data.profile_window_minutes,   // r112
     paper_profile_anchor: data.profile_anchor,   // r114
     paper_value_area_method: data.value_area_method,
+    paper_max_zs_height_atr: data.max_zs_height_atr,   // r118
   };
   if(data.smc_cfg){
     values.smc_touch_window = data.smc_cfg.touch_window;
@@ -2938,6 +2983,7 @@ const BT_FIELD_MAP = {
   paper_trend_slow_multiplier: 'backtestTrendSlowMult',
   paper_profile_window_minutes: 'backtestProfileWindow', paper_value_area_method: 'backtestVaMethod',
   paper_profile_anchor: 'backtestProfileAnchor',   // r114
+  paper_max_zs_height_atr: 'backtestMaxZsHeight',   // r118
   smc_touch_window: 'backtestSmcTouchWindow', smc_wt_level: 'backtestSmcWtLevel',
   smc_confirm_bos: 'backtestSmcConfirmBos', smc_require_ema: 'backtestSmcRequireEma',
   smc_exit_mode: 'backtestSmcExitMode', smc_min_rr: 'backtestSmcMinRr',
@@ -3053,7 +3099,8 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
   }
 
   const sessionHtml = `<div class="cfg-row"><span class="cfg-label">休市不開新倉</span><span class="cfg-value ${s.paper_block_market_closed ? 'on' : ''}">${s.paper_block_market_closed ? '開啟' : '關閉'}</span></div>`
-    + `<div class="cfg-row"><span class="cfg-label">最小ATR門檻</span><span class="cfg-value ${Number(s.paper_min_atr_points) > 0 ? 'on' : ''}">${Number(s.paper_min_atr_points) > 0 ? s.paper_min_atr_points + 'pt' : '不限制'}</span></div>`;
+    + `<div class="cfg-row"><span class="cfg-label">最小ATR門檻</span><span class="cfg-value ${Number(s.paper_min_atr_points) > 0 ? 'on' : ''}">${Number(s.paper_min_atr_points) > 0 ? s.paper_min_atr_points + 'pt' : '不限制'}</span></div>`
+    + (Number(s.paper_max_zs_height_atr) > 0 ? `<div class="cfg-row"><span class="cfg-label">只做窄中樞突破</span><span class="cfg-value on">中樞高度 &lt; ${s.paper_max_zs_height_atr} 倍 ATR</span></div>` : '');
   const trendModeLabel = {0:'關閉', 1:'只擋逆勢', 2:'嚴格'}[Number(s.paper_trend_filter_mode) || 0];
   const trendIntervalLabel = s.paper_trend_interval_seconds ? (Number(s.paper_trend_interval_seconds) >= 3600 ? (Number(s.paper_trend_interval_seconds)/3600) + '小時K' : (Number(s.paper_trend_interval_seconds)/60) + '分K') : '';
   const trendHtml = `<div class="cfg-row"><span class="cfg-label">趨勢濾網(雙ST)</span><span class="cfg-value ${Number(s.paper_trend_filter_mode) ? 'on' : ''}">${trendModeLabel}${Number(s.paper_trend_filter_mode) ? `(${trendIntervalLabel}，慢線 ${s.paper_trend_slow_multiplier}x)` : ''}</span></div>`;
@@ -3086,7 +3133,7 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
   // 不然兩組SMC回測(移動停損 vs 結構停利)的設定卡長得一模一樣，分不出哪張是哪張
   let strategyHtml = '';
   if(s._strategy_type){
-    const stratLabel = {chan_profile:'纏論+分價量表', resonance_fvg:'多條件共振+FVG', smc_structure:'SMC市場結構+WaveTrend(1小時K)', mean_reversion:'均值回歸(1小時K)', pullback_resume:'回拉轉強(1小時K)', breakout_trend:'大週期突破(4小時K)'}[s._strategy_type] || s._strategy_type;
+    const stratLabel = {chan_profile:'纏論+分價量表', resonance_fvg:'多條件共振+FVG', smc_structure:'SMC市場結構+WaveTrend(1小時K)', mean_reversion:'均值回歸(1小時K)', pullback_resume:'回拉轉強(1小時K)', breakout_trend:'大週期突破(4小時K)', fib_pullback:'斐波那契回檔掛單(1小時K)'}[s._strategy_type] || s._strategy_type;
     strategyHtml = `<div class="cfg-row"><span class="cfg-label">策略</span><span class="cfg-value on">${stratLabel}</span></div>`
       + (s._symbol ? `<div class="cfg-row"><span class="cfg-label">商品</span><span class="cfg-value">${s._symbol}</span></div>` : '');
     const c = s._smc_cfg;
@@ -3098,6 +3145,12 @@ function renderActiveConfig(el, activeSettings, label, settingsChangedAt, exclud
     const m = s._strategy_type === 'mean_reversion' ? s._mr_cfg : null;
     const pr = s._strategy_type === 'pullback_resume' ? s._mr_cfg : null;
     const bo = s._strategy_type === 'breakout_trend' ? s._mr_cfg : null;
+    const fp = s._strategy_type === 'fib_pullback' ? s._mr_cfg : null;
+    if(fp){
+      strategyHtml += `<div class="cfg-row"><span class="cfg-label">進場</span><span class="cfg-value on">EMA50 趨勢中、推動段≥${fp.impulse_atr}×ATR，回檔到 ${fp.entry_fib} 掛限價單／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(fp.sides)]}</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">停損在 ${fp.stop_fib} 外 0.1×ATR／停利回到推動段高低點／最長 ${fp.max_hold_hours} 小時</span></div>`
+        + `<div class="cfg-row"><span class="cfg-label">注意</span><span class="cfg-value">下面的停損點數/ATR倍數這個策略不用</span></div>`;
+    }
     if(bo){
       strategyHtml += `<div class="cfg-row"><span class="cfg-label">進場</span><span class="cfg-value on">4小時K收盤突破前${bo.channel}根高/低點${Number(bo.big_bar_atr) > 0 ? '、波幅≥' + bo.big_bar_atr + '×ATR' : ''}${Number(bo.trend) === 1 ? '、順EMA50' : ''}／${{1:'只做多', 2:'只做空', 3:'多空'}[Number(bo.sides)]}</span></div>`
         + `<div class="cfg-row"><span class="cfg-label">出場</span><span class="cfg-value">停損${bo.sl_atr}×ATR／浮盈${bo.trail_trigger_atr}×ATR後移動停損、回吐${bo.trail_atr}×ATR／${Number(bo.max_hold_days) > 0 ? '最長' + bo.max_hold_days + '天' : '不限時'}(ATR都是4小時K)</span></div>`
@@ -3167,6 +3220,11 @@ function renderPaperTrading(data, t){
     }
   }
   renderActiveConfig(document.getElementById(t.activeConfigId), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
+  if(Number(data.zs_skips) > 0){
+    // r118：重啟以來被「只做窄中樞」擋下的訊號步數(同一個訊號持續幾步會算幾次)
+    const cfgEl0 = document.getElementById(t.activeConfigId);
+    if(cfgEl0) cfgEl0.insertAdjacentHTML('beforeend', `<div style="font-size:11px; color:var(--muted); margin-top:4px;">重啟以來中樞太寬沒進場：${data.zs_skips} 次(訊號步數)</div>`);
+  }
   if(data.strategy_type === 'band_touch'){
     // r104：布林觸軌前瞻引擎的規則寫死、不吃設定——不顯示全域的停損/濾網設定，改列它實際用的規則
     const cfgEl = document.getElementById(t.activeConfigId);
@@ -3615,6 +3673,7 @@ const ENGINE_PARAM_ORDER = [
   'paper_block_market_closed', 'paper_min_atr_points',
   'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier',
   'paper_profile_window_minutes', 'paper_value_area_method', 'paper_profile_anchor',
+  'paper_max_zs_height_atr',
   'smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr',
 ];
 
@@ -3741,6 +3800,7 @@ function buildBacktestParamOverrides(){
   addIfPresent('mt5_cost_points', els.backtestMt5Cost);   // r111
   addIfPresent('split_entry', els.backtestSplitEntry);    // r116
   addIfPresent('max_zs_height_atr', els.backtestMaxZsHeight);   // r117
+  addIfPresent('news_cooldown', els.backtestNewsCooldown);       // r119
   addIfPresent('trend_filter_mode', els.backtestTrendMode);
   addIfPresent('trend_interval_seconds', els.backtestTrendInterval);
   addIfPresent('trend_slow_multiplier', els.backtestTrendSlowMult);
@@ -3778,6 +3838,14 @@ function buildBacktestParamOverrides(){
     addIfPresent('pr_sl_mode', els.backtestPrSlMode);
     addIfPresent('pr_hold_bars', els.backtestPrHoldBars);
     addIfPresent('pr_exit_mode', els.backtestPrExitMode);
+  }
+  // r120：斐波那契回檔參數只有選這個策略才送
+  if(els.backtestStrategy.value === 'fib_pullback'){
+    addIfPresent('fp_impulse_atr', els.backtestFpImpulse);
+    addIfPresent('fp_entry_fib', els.backtestFpEntry);
+    addIfPresent('fp_stop_fib', els.backtestFpStop);
+    addIfPresent('fp_sides', els.backtestFpSides);
+    addIfPresent('fp_max_hold_hours', els.backtestFpMaxHold);
   }
   // r105：大週期突破參數只有選這個策略才送
   if(els.backtestStrategy.value === 'breakout_trend'){
@@ -3829,7 +3897,7 @@ function renderBacktestResult(data, el){
       <div id="backtestSpreadAdjusted"></div>
       <div id="backtestDailySmc"></div>
       <div id="backtestReentry"></div>
-      ${(data.strategy_type === 'mean_reversion' || data.strategy_type === 'pullback_resume' || data.strategy_type === 'breakout_trend') ? `<div style="font-size:11px; color:var(--gold); margin-top:12px;">🟡 這個策略只存在回測，沒有對應的模擬引擎，不能套用。結果請先看「扣價差」那組數字(假設價差設 3.4＝幣安真實成本)。</div>` : `
+      ${(data.strategy_type === 'mean_reversion' || data.strategy_type === 'pullback_resume' || data.strategy_type === 'breakout_trend' || data.strategy_type === 'fib_pullback') ? `<div style="font-size:11px; color:var(--gold); margin-top:12px;">🟡 這個策略只存在回測，沒有對應的模擬引擎，不能套用。結果請先看「扣價差」那組數字(假設價差設 3.4＝幣安真實成本)。</div>` : `
       <div class="settings-group" style="margin-top:12px;">
         <div style="font-size:12px; color:var(--gold); margin-bottom:6px;">把這組回測參數套用到模擬引擎</div>
         <div class="controls">
@@ -3884,6 +3952,7 @@ function renderBacktestResult(data, el){
       paper_profile_window_minutes: data.profile_window_minutes,   // r112
       paper_profile_anchor: data.profile_anchor,   // r114
       paper_value_area_method: data.value_area_method,
+      paper_max_zs_height_atr: data.max_zs_height_atr,   // r118
       _strategy_type: data.strategy_type,
       _symbol: data.symbol,
       _smc_cfg: data.smc_cfg,
@@ -3893,7 +3962,7 @@ function renderBacktestResult(data, el){
 
     renderDrawdownPeriod(document.getElementById('backtestDrawdownPeriod'), data);
     setupBacktestApply(data);
-    renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades, null, data.strategy_type === 'pullback_resume' || data.strategy_type === 'breakout_trend');
+    renderTradeList(document.getElementById('backtestTradeList'), data.recent_trades, null, data.strategy_type === 'pullback_resume' || data.strategy_type === 'breakout_trend' || data.strategy_type === 'fib_pullback');
     // 回測筆數動輒上百筆，預設收合避免把績效數字擠到看不到，要看細節再展開
     // (修正記錄見README)
     document.getElementById('backtestTradesToggle').addEventListener('click', () => {
@@ -3939,6 +4008,14 @@ function btParamLabel(p){
   if(p.strategy_type === 'smc_structure') parts.push('SMC');
   else if(p.strategy_type === 'resonance_fvg') parts.push('共振FVG');
   else if(p.strategy_type === 'mean_reversion') parts.push('均值回歸' + ({1:'A', 2:'B'}[Number(p.mr_setups)] || ''));
+  else if(p.strategy_type === 'fib_pullback'){
+    // r120：只標跟預設不同的設定
+    const extra = [];
+    if(p.fp_impulse_atr != null && Number(p.fp_impulse_atr) !== 2) extra.push(`推動≥${p.fp_impulse_atr}ATR`);
+    if(p.fp_entry_fib != null && Number(p.fp_entry_fib) !== 0.618) extra.push(`掛${p.fp_entry_fib}`);
+    if(p.fp_stop_fib != null && Number(p.fp_stop_fib) !== 0.786) extra.push(`損${p.fp_stop_fib}`);
+    parts.push('斐波那契回檔' + ({1:'多', 2:'空'}[Number(p.fp_sides)] || '') + (extra.length ? '・' + extra.join('・') : ''));
+  }
   else if(p.strategy_type === 'breakout_trend'){
     // r105：只標跟預設不同的設定，預設那組就是「4小時K突破」
     const extra = [];
@@ -3963,6 +4040,7 @@ function btParamLabel(p){
   if(p.mt5_cost_points != null && p.mt5_cost_points !== '') parts.push(`MT5成本${Number(p.mt5_cost_points)}`);
   if(Number(p.split_entry) === 1) parts.push('分批進場');
   if(Number(p.max_zs_height_atr) > 0) parts.push(`窄中樞<${Number(p.max_zs_height_atr)}ATR`);
+  if(Number(p.news_cooldown) === 1) parts.push('消息震盪後不進場');
   // r112：分價量表取樣(只有纏論類策略才有意義)
   if(Number(p.profile_anchor) === 1) parts.push('量表:每日換日');
   else if(Number(p.profile_anchor) === 2) parts.push('量表:錨定中樞');
@@ -3980,6 +4058,10 @@ function btLabelParamsOf(job){
     ['trend_filter_mode', 'trend_interval_seconds', 'trend_slow_multiplier', 'strategy_type', 'daily_smc_filter_mode', 'daily_smc_against_weight', 'cooldown_hours']
       .forEach(k => { if(first.result[k] != null) p[k] = first.result[k]; });
     if(first.result.mr_cfg && first.result.strategy_type === 'mean_reversion') p.mr_setups = first.result.mr_cfg.setups;
+    if(first.result.mr_cfg && first.result.strategy_type === 'fib_pullback'){
+      const c = first.result.mr_cfg;
+      p.fp_impulse_atr = c.impulse_atr; p.fp_entry_fib = c.entry_fib; p.fp_stop_fib = c.stop_fib; p.fp_sides = c.sides;
+    }
     if(first.result.mr_cfg && first.result.strategy_type === 'breakout_trend'){
       const c = first.result.mr_cfg;
       p.bo_channel = c.channel; p.bo_big_bar_atr = c.big_bar_atr; p.bo_trend = c.trend; p.bo_sides = c.sides;
@@ -4006,6 +4088,8 @@ function btWinCard(title, bias, r, extraClass, idx){
     ${Number(r.assumed_spread_points) > 0 && r.total_trades ? `<div class="bt-win-split">扣成本(每筆 ${Number(r.assumed_spread_points)} 點)：損益 <span class="${r.net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.net_pnl_points)}</span>，PF ${r.net_profit_factor != null ? Number(r.net_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     ${splitStatsHtml(r.split_stats)}
     ${r.skipped_zs_height ? `<div class="bt-win-split">中樞太寬沒進場：${r.skipped_zs_height} 次</div>` : ''}
+    ${r.limit_stats ? `<div class="bt-win-split">掛單 ${r.limit_stats.placed} 次、成交 ${r.limit_stats.filled} 次</div>` : ''}
+    ${r.news_shocks != null ? `<div class="bt-win-split">消息震盪 ${r.news_shocks} 次${r.skipped_news ? `，震盪後沒進場 ${r.skipped_news} 次` : ''}</div>` : ''}
     ${r.mt5_net_pnl_points != null && r.total_trades ? `<div class="bt-win-split">MT5(每筆 ${Number(r.mt5_cost_points)} 點＋庫存費 ${btNum(r.mt5_swap_total)})：損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}</div>` : ''}
     <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
   </div>`;
@@ -4206,6 +4290,7 @@ const SETTINGS_GROUPS = [
   { title: '訊號濾網', keys: ['paper_reversal_confirm_count', 'paper_use_chop_filter', 'paper_chop_threshold', 'paper_block_market_closed', 'paper_min_atr_points',
                               'paper_trend_filter_mode', 'paper_trend_interval_seconds', 'paper_trend_slow_multiplier'] },
   { title: '分價量表取樣(r112，纏論引擎用)', keys: ['paper_profile_window_minutes', 'paper_value_area_method', 'paper_profile_anchor'] },
+  { title: '中樞突破只做窄中樞(r118，纏論引擎用；只建議 lab 前瞻測試)', keys: ['paper_max_zs_height_atr'] },
   { title: 'SMC結構策略(只影響 smc_structure_3600 引擎)', keys: ['smc_touch_window', 'smc_wt_level', 'smc_confirm_bos', 'smc_require_ema', 'smc_exit_mode', 'smc_min_rr'], collapsed: true },
   { title: '真實下單', keys: ['execution_engine_index', 'execution_engine_index_2', 'execution_quantity', 'execution_leverage', 'execution_margin_type', 'execution_hedge_mode', 'execution_assumed_spread_points', 'execution_min_edge_ratio', 'execution_max_spread_points'] },
   { title: '風控斷路器', keys: ['execution_daily_loss_limit_usd', 'execution_account_daily_loss_limit_usd', 'execution_max_consecutive_losses'] },
