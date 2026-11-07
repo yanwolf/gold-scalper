@@ -434,6 +434,24 @@
   }
   .tab-btn.active{ color: var(--gold); border-bottom-color: var(--gold); }
   .tab-btn:active{ opacity: 0.7; }
+
+/* r122：回測面板 */
+.bt-form { display:flex; flex-direction:column; gap:8px; margin-bottom:12px; }
+.bt-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.bt-lbl { font-size:12.5px; color:var(--muted); min-width:3.2em; }
+.bt-row select, .bt-row input[type=date] { flex:1 1 auto; min-width:0; max-width:100%; }
+.bt-hint { font-size:11.5px; color:var(--muted); line-height:1.6; }
+.bt-hint:empty { display:none; }
+.bt-adv { border:1px solid var(--grid); border-radius:8px; padding:8px 10px; }
+.bt-adv > summary { font-size:12px; color:var(--muted); cursor:pointer; }
+.bt-adv[open] > summary { margin-bottom:8px; }
+.bt-fold > summary { cursor:pointer; list-style:none; }
+.bt-fold > summary::-webkit-details-marker { display:none; }
+.bt-fold > summary .caret { color:var(--muted); font-size:11px; margin-left:6px; }
+.bt-fold[open] > summary .caret { transform:rotate(90deg); display:inline-block; }
+.bt-pair { border:1px solid var(--gold); border-radius:10px; padding:10px 12px; margin-top:12px; }
+.bt-pair table { width:100%; font-size:12px; border-collapse:collapse; }
+.bt-pair td, .bt-pair th { padding:3px 6px 3px 0; text-align:left; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -622,88 +640,112 @@
     可以先切到別的分頁做其他事，跑完結果會保留。
   </div>
 
-  <div class="controls">
-    <select id="backtestInterval">
-      <option value="60">1分K</option>
-      <option value="300">5分K</option>
-      <option value="900" selected>15分K</option>
-      <option value="3600">1小時K(SMC結構策略用)</option>
-    </select>
-    <select id="backtestDays">
-      <option value="1">回測 1 天</option>
-      <option value="2" selected>回測 2 天</option>
-      <option value="3">回測 3 天</option>
-      <option value="7">回測 7 天</option>
-      <option value="14">回測 14 天</option>
-      <option value="30">回測 30 天</option>
-      <option value="90">回測 90 天(限1小時K以上的策略)</option>
-      <option value="180">回測 180 天(限1小時K以上的策略)</option>
-      <option value="365">回測 365 天(限1小時K以上的策略)</option>
-    </select>
-    <select id="backtestResolution">
-      <option value="1200" selected>標準精細度(約1200步)</option>
-      <option value="3000">高精細度(約3000步，慢2.5倍)</option>
-      <option value="6000">最高精細度(約6000步，慢5倍)</option>
-    </select>
-  </div>
-  <div class="controls" style="margin-top:8px; align-items:center; flex-wrap:wrap;">
-    <label style="font-size:12px; color:var(--muted);">結束日期(UTC)</label>
-    <input type="date" id="backtestEndDate" />
-    <button type="button" id="backtestEndDateClear" class="btn-secondary" style="font-size:12px; padding:6px 10px;">到現在</button>
-    <select id="backtestWindows">
-      <option value="1" selected>只跑這一段</option>
-      <option value="2">往回連續 2 段</option>
-      <option value="3">往回連續 3 段</option>
-      <option value="4">往回連續 4 段</option>
-      <option value="6">往回連續 6 段</option>
-      <option value="12">往回連續 12 段</option>
-    </select>
-  </div>
-  <div style="font-size:11.5px; color:var(--muted); margin:4px 0 12px; line-height:1.6;">
-    ↑ 結束日期留空＝到現在。連續段數：從結束日期往回切成好幾段、每段用上面選的天數(例如 30 天 × 6 段＝往回半年)，每段各自一份結果，最後加一行合計。
-    回測在背景跑，網頁會每幾秒更新進度；關掉頁面或鎖屏也沒關係，回來後在下面「最近的回測」點開就看得到。一次只跑一個，後送的會排隊。
-  </div>
-  <div style="font-size:11.5px; color:var(--muted); margin:-4px 0 12px; line-height:1.6;">
-    ↑ 精細度=訊號檢查步數上限，回測時間跟步數成正比。訊號只在所選週期的K線收盤時檢查，停損/移動停損則一律用1分K高低價逐根檢查(不受精細度影響)。
-    1分K：標準精細度1天每根都看、2天隔一根、30天隔36根(不可信)。5分K：7天每根都看、30天隔7根(高精細度隔2根、最高精細度每根)。15分K：14天每根都看、30天隔一根(高精細度每根)。掃描沿用這個設定(時間再乘以組數)。
-  </div>
-  <div class="controls" style="margin-top:8px;">
-    <select id="backtestStrategy">
-      <option value="chan_profile" selected>纏論+分價量表(既有)</option>
-      <option value="resonance_fvg">多條件共振+FVG(實驗性)</option>
-      <option value="smc_structure">SMC市場結構+WaveTrend(1小時K，實驗性)</option>
-      <option value="mean_reversion">均值回歸(1小時K，只有回測)</option>
-      <option value="pullback_resume">回拉轉強(1小時K，持有一根，只有回測)</option>
-      <option value="breakout_trend">大週期突破(4小時K大行情，只有回測)</option>
-      <option value="fib_pullback">斐波那契回檔掛單(1小時K，只有回測)</option>
-    </select>
-    <select id="backtestResonanceThreshold">
-      <option value="4" selected>4/4項條件(嚴格AND)</option>
-      <option value="3">3/4項條件(放寬)</option>
-      <option value="2">2/4項條件(更寬鬆)</option>
-    </select>
-  </div>
-  <div style="font-size:11px; color:var(--muted); margin-top:6px;">
-    ↑「幾項條件」只有選擇「多條件共振+FVG」時才有作用，套用RSI/EMA-FVG/
-    價格行為/成交量四個子條件裡要符合幾個(含)以上才給訊號。
-  </div>
-  <div class="controls" style="margin-top:8px;">
-    <select id="backtestSymbol">
-      <option value="XAUUSDT" selected>黃金 XAUUSDT</option>
-      <option value="BTCUSDT">比特幣 BTCUSDT</option>
-      <option value="PAXGUSDT">黃金代幣 PAXGUSDT 期貨(2025/3 起)</option>
-      <option value="PAXGUSDT@spot">黃金代幣 PAXGUSDT 現貨(長歷史，只能回測)</option>
-    </select>
-    <select id="backtestBucketSize">
-      <option value="1">箱寬 1(適合黃金)</option>
-      <option value="50">箱寬 50(適合BTC)</option>
-      <option value="100">箱寬 100(適合BTC)</option>
-    </select>
-  </div>
-  <div style="font-size:11px; color:var(--muted); margin-top:6px;">
-    ↑ 換商品時記得箱寬也要跟著調整——黃金約4000多美元用箱寬1，BTC通常在
-    幾萬美元，箱寬還是1會切出大量沒意義的小格子。這是驗證這套訊號邏輯
-    換到別的商品適不適用的實驗功能，不影響即時模擬單(即時系統仍固定追蹤黃金)。
+  <!-- r122：回測面板重新排版——常用的只有「策略」跟「期間」放最上面；K線週期、精細度、商品、箱寬收進「進階」；
+       各策略專屬的參數只在選到那個策略時顯示。元素 id 都沒變，原本的程式照常讀。 -->
+  <div class="bt-form">
+    <div class="bt-row">
+      <label class="bt-lbl" for="backtestStrategy">策略</label>
+      <select id="backtestStrategy">
+        <option value="chan_profile" selected>15分K 纏論＋分價量表(正式端用的)</option>
+        <option value="resonance_fvg">多條件共振＋FVG(實驗)</option>
+        <option value="smc_structure">SMC 市場結構＋WaveTrend(1小時K)</option>
+        <option value="mean_reversion">均值回歸(1小時K，只有回測)</option>
+        <option value="pullback_resume">回拉轉強／布林觸軌(1小時K，只有回測)</option>
+        <option value="breakout_trend">大週期突破(4小時K，只有回測)</option>
+        <option value="fib_pullback">斐波那契回檔掛單(1小時K，只有回測)</option>
+      </select>
+    </div>
+    <div id="backtestStrategyHint" class="bt-hint"></div>
+    <div class="bt-row" id="backtestResonanceRow" style="display:none;">
+      <label class="bt-lbl" for="backtestResonanceThreshold">條件數</label>
+      <select id="backtestResonanceThreshold">
+        <option value="4" selected>4/4 項都符合(嚴格)</option>
+        <option value="3">3/4 項(放寬)</option>
+        <option value="2">2/4 項(更寬鬆)</option>
+      </select>
+    </div>
+    <div class="bt-row">
+      <label class="bt-lbl" for="backtestPeriod">期間</label>
+      <select id="backtestPeriod">
+        <option value="two_halves" selected>前後兩個半年(同一組參數送兩個任務)</option>
+        <option value="recent_half">近半年(到現在)</option>
+        <option value="custom">自訂</option>
+      </select>
+    </div>
+    <div id="backtestPeriodHint" class="bt-hint"></div>
+    <div id="backtestCustomPeriod" style="display:none;">
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestDays">每段</label>
+        <select id="backtestDays">
+          <option value="1">1 天</option>
+          <option value="2">2 天</option>
+          <option value="3">3 天</option>
+          <option value="7">7 天</option>
+          <option value="14">14 天</option>
+          <option value="30" selected>30 天</option>
+          <option value="90">90 天(限1小時K以上)</option>
+          <option value="180">180 天(限1小時K以上)</option>
+          <option value="365">365 天(限1小時K以上)</option>
+        </select>
+        <select id="backtestWindows">
+          <option value="1">只跑一段</option>
+          <option value="2">× 2 段</option>
+          <option value="3">× 3 段</option>
+          <option value="4">× 4 段</option>
+          <option value="6" selected>× 6 段</option>
+          <option value="12">× 12 段</option>
+        </select>
+      </div>
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestEndDate">結束日</label>
+        <input type="date" id="backtestEndDate" />
+        <button type="button" id="backtestEndDateClear" class="btn-secondary" style="font-size:12px; padding:6px 10px;">到現在</button>
+      </div>
+      <div class="bt-hint">結束日留空＝到現在(UTC)。從結束日往回切成好幾段，每段各自一份結果，最後加一行合計。</div>
+    </div>
+
+    <details id="backtestAdvanced" class="bt-adv">
+      <summary>進階(平常不用動)：<span id="backtestAdvSummary"></span></summary>
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestInterval">K線</label>
+        <select id="backtestInterval">
+          <option value="60">1分K</option>
+          <option value="300">5分K</option>
+          <option value="900" selected>15分K</option>
+          <option value="3600">1小時K</option>
+        </select>
+      </div>
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestResolution">精細度</label>
+        <select id="backtestResolution">
+          <option value="1200" selected>標準(約1200步)</option>
+          <option value="3000">高(約3000步，慢2.5倍)</option>
+          <option value="6000">最高(約6000步，慢5倍)</option>
+        </select>
+      </div>
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestSymbol">商品</label>
+        <select id="backtestSymbol">
+          <option value="XAUUSDT" selected>黃金 XAUUSDT</option>
+          <option value="BTCUSDT">比特幣 BTCUSDT</option>
+          <option value="PAXGUSDT">黃金代幣 PAXGUSDT 期貨(2025/3 起)</option>
+          <option value="PAXGUSDT@spot">黃金代幣 PAXGUSDT 現貨(長歷史)</option>
+        </select>
+      </div>
+      <div class="bt-row">
+        <label class="bt-lbl" for="backtestBucketSize">箱寬</label>
+        <select id="backtestBucketSize">
+          <option value="1">1(黃金)</option>
+          <option value="50">50(BTC)</option>
+          <option value="100">100(BTC)</option>
+        </select>
+      </div>
+      <div class="bt-hint">
+        K線週期會跟著策略自動切換(1小時K的策略一律用 1小時K)。精細度＝訊號檢查步數上限：15分K 30 天，標準是隔一根看一次、
+        高精細度每根都看；停損一律用 1分K 逐根檢查，不受精細度影響。換商品時箱寬要跟著調(黃金 1、BTC 50～100)。
+        回測在背景跑，關掉頁面也沒關係；一次只跑一個，後送的會排隊。
+      </div>
+    </details>
   </div>
 
   <div class="settings-group" style="margin-top:12px;">
@@ -719,6 +761,7 @@
         重新開始累積)。留空的欄位會沿用目前正式設定的值當基準。
       </div>
 
+      <div class="bt-strat-group" data-strategies="chan_profile resonance_fvg smc_structure">
       <div class="settings-field">
         <label>停損模式</label>
         <select id="backtestUseAtr">
@@ -756,6 +799,8 @@
         <input type="number" id="backtestTrailDistance" placeholder="留空=沿用正式設定" step="0.5" min="0.5" />
       </div>
 
+      </div>
+      <div class="bt-strat-group" data-strategies="smc_structure">
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">SMC結構策略參數(只在策略選SMC時有效，留空=沿用該引擎專屬設定)</div>
       <div class="settings-field">
         <label>碰區域/交叉允許視窗(根1小時K)</label>
@@ -790,6 +835,8 @@
         <input type="number" id="backtestSmcMinRr" placeholder="留空=沿用引擎設定(預設1.0)" step="0.5" min="0" max="5" />
       </div>
 
+      </div>
+      <div class="bt-strat-group" data-strategies="mean_reversion">
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">均值回歸參數(只在策略選均值回歸時有效，留空=預設值；停損一律用1小時K的ATR倍數，上面的停損點數這個策略不用)</div>
       <div class="settings-field">
         <label>進場方式</label>
@@ -837,6 +884,8 @@
         <input type="number" id="backtestMrMaxHold" placeholder="留空=12" step="1" min="0" max="240" />
       </div>
 
+      </div>
+      <div class="bt-strat-group" data-strategies="pullback_resume">
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">回拉轉強參數(只在策略選回拉轉強時有效，留空=預設值；上面的停損點數、移動停損這個策略不用)</div>
       <div class="settings-field">
         <label>方向</label>
@@ -896,6 +945,8 @@
         <input type="number" id="backtestPrHoldBars" placeholder="留空=1" step="1" min="1" max="6" />
       </div>
 
+      </div>
+      <div class="bt-strat-group" data-strategies="fib_pullback">
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">斐波那契回檔掛單參數(只在策略選斐波那契回檔時有效，留空=預設值)</div>
       <div class="settings-field">
         <label>推動段至少幾倍 ATR</label>
@@ -923,6 +974,8 @@
         <input type="number" id="backtestFpMaxHold" placeholder="留空=48" step="1" min="1" max="240" />
       </div>
 
+      </div>
+      <div class="bt-strat-group" data-strategies="breakout_trend">
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">大週期突破參數(只在策略選大週期突破時有效，留空=預設值；4小時K，天數可選 90/180 天)</div>
       <div class="settings-field">
         <label>突破前幾根4小時K的高低點</label>
@@ -966,6 +1019,7 @@
         <input type="number" id="backtestBoMaxHold" placeholder="留空=0" step="1" min="0" max="60" />
       </div>
 
+      </div>
       <div style="font-size:11px; color:var(--gold); margin:8px 0 4px;">通用參數</div>
       <div class="settings-field">
         <label>訊號反轉確認次數</label>
@@ -1089,6 +1143,7 @@
   <div class="controls" style="margin-top:8px;">
     <button id="backtestRunBtn" class="btn-secondary">執行回測</button>
   </div>
+  <div id="backtestPairCompare"></div>
   <div style="margin-top:10px;">
     <div style="font-size:12px; color:var(--muted);">最近的回測（點一下打開）</div>
     <div id="backtestJobList" class="bt-job-list"></div>
@@ -1446,6 +1501,7 @@ const els = {
   backtestDays: document.getElementById('backtestDays'),
   backtestResolution: document.getElementById('backtestResolution'),
   backtestStrategy: document.getElementById('backtestStrategy'),
+  backtestPeriod: document.getElementById('backtestPeriod'),   // r122
   backtestResonanceThreshold: document.getElementById('backtestResonanceThreshold'),
   backtestSymbol: document.getElementById('backtestSymbol'),
   backtestBucketSize: document.getElementById('backtestBucketSize'),
@@ -3033,6 +3089,7 @@ document.addEventListener('click', async (ev) => {
     }
     const body = document.getElementById('backtestParamsBody');
     if(body && body.style.display === 'none'){ body.style.display = ''; const c = document.getElementById('backtestParamsCaret'); if(c) c.textContent = '▾'; }
+    btFormSync();   // r122：策略換了，專屬參數區塊跟著切
     out.textContent = `已載入 ${filled} 個參數(${ps.version || ''})，精細度已設為最高，按「執行回測」`;
   }catch(e){ out.textContent = `載入失敗：${e.message}`; }
 });
@@ -3979,6 +4036,53 @@ function renderBacktestResult(data, el){
 
 let backtestPollTimer = null;
 const BT_JOB_KEY = 'gs_last_backtest_job';
+const BT_PAIR_KEY = 'gs_last_backtest_pair';   // r122：「前後兩個半年」送出的兩個任務
+
+// r122：前後兩個半年對照表(兩個任務都跑完才顯示數字)
+function btPairNum(v, d){ return v == null ? '--' : (v >= 0 ? '+' : '') + Number(v).toFixed(d == null ? 1 : d); }
+function btPairPf(v){ return v == null ? '∞' : Number(v).toFixed(2); }
+async function renderBacktestPair(){
+  const box = document.getElementById('backtestPairCompare');
+  if(!box) return;
+  let pair = null;
+  try{ pair = JSON.parse(localStorage.getItem(BT_PAIR_KEY) || 'null'); }catch(e){}
+  if(!pair || !pair.recent || !pair.early){ box.innerHTML = ''; return; }
+  try{
+    const [a, b] = await Promise.all([pair.early, pair.recent].map(id => fetch(`/backtest/jobs/${id}`).then(r => r.ok ? r.json() : null)));
+    if(!a || !b || !a.job_id || !b.job_id){ box.innerHTML = ''; return; }
+    const done = a.status === 'done' && b.status === 'done';
+    const label = btParamLabel(btLabelParamsOf(b));
+    if(!done){
+      box.innerHTML = `<div class="bt-pair"><div style="font-size:12px;"><b>前後兩個半年</b> <span class="bt-param-label">${label}</span></div>
+        <div style="font-size:11.5px; color:var(--muted); margin-top:4px;">還在跑(前半年：${a.status}，近半年：${b.status})，兩個都完成後這裡會出現對照表。</div></div>`;
+      if(!box.dataset.timer){ box.dataset.timer = '1'; setTimeout(() => { box.dataset.timer = ''; renderBacktestPair(); }, 8000); }
+      return;
+    }
+    const rows = [['前半年', a], ['近半年', b]].map(([name, j]) => {
+      const g = j.aggregate || {};
+      const d = g.entry_diagnostics || {};
+      const bd = d.by_direction || {};
+      const ns = d.news_shock || {};
+      const pass = g.mt5_net_pnl_points > 0 && g.mt5_profit_factor != null && g.mt5_profit_factor >= 1.15;
+      const cls = v => v == null ? '' : (v >= 0 ? 'bt-pos' : 'bt-neg');
+      return `<tr><td><b>${name}</b></td><td class="mono">${g.total_trades ?? '--'}</td>
+        <td class="mono ${cls(g.mt5_net_pnl_points)}">${btPairNum(g.mt5_net_pnl_points)}</td>
+        <td class="mono">${btPairPf(g.mt5_profit_factor)}</td>
+        <td class="mono">${bd.bullish ? btPairPf(bd.bullish.profit_factor) : '--'}／${bd.bearish ? btPairPf(bd.bearish.profit_factor) : '--'}</td>
+        <td class="mono">${ns.after ? btPairPf(ns.after.profit_factor) : '--'}／${ns.normal ? btPairPf(ns.normal.profit_factor) : '--'}</td>
+        <td>${pass ? '✅' : '❌'}</td></tr>`;
+    }).join('');
+    const both = [a, b].every(j => (j.aggregate || {}).mt5_net_pnl_points > 0 && ((j.aggregate || {}).mt5_profit_factor || 0) >= 1.15);
+    box.innerHTML = `<div class="bt-pair">
+      <div style="font-size:12px; margin-bottom:6px;"><b>前後兩個半年對照</b> <span class="bt-param-label">${label}</span></div>
+      <div style="overflow-x:auto;"><table>
+        <thead><tr style="color:var(--muted);"><th></th><th>筆數</th><th>MT5損益</th><th>MT5 PF</th><th>多／空 PF</th><th>震盪後／其他 PF</th><th>標準</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div style="font-size:11.5px; margin-top:6px;">${both ? '✅ 兩個半年都過(MT5 成本後為正、PF ≥ 1.15)' : '❌ 沒有兩個半年都過(標準：MT5 成本後為正、PF ≥ 1.15)'}</div>
+      <div style="font-size:10.5px; color:var(--muted); margin-top:4px;">多空與消息震盪的 PF 是帳面(還沒扣成本)。點下面清單的任務看各段細節。</div>
+    </div>`;
+  }catch(e){ box.innerHTML = ''; }
+}
 
 function btPf(r){
   if(!r || !r.total_trades) return '--';
@@ -4080,8 +4184,25 @@ function btLabelParamsOf(job){
 
 function btWinCard(title, bias, r, extraClass, idx){
   const pnlCls = r.total_pnl_points >= 0 ? 'bt-pos' : 'bt-neg';
-  return `<div class="bt-win ${extraClass || ''}" ${idx != null ? `data-idx="${idx}"` : ''}>
+  // r122：每一段只露出 MT5 那一行，其他(扣幣安成本、掛單、消息震盪、順逆日線…)收進「更多」；合計那張全部展開
+  if(idx != null){
+    const mt5 = r.mt5_net_pnl_points != null && r.total_trades
+      ? `MT5 損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}` : '';
+    const full = btWinCardBody(r, pnlCls);
+    return `<div class="bt-win ${extraClass || ''}" data-idx="${idx}">
+      <div class="bt-win-head"><span>${title}</span>${bias ? `<span class="bias">${bias}</span>` : ''}</div>
+      <div class="bt-win-split">${r.total_trades} 筆　帳面 <span class="${r.total_trades ? pnlCls : ''}">${r.total_trades ? btNum(r.total_pnl_points) : '--'}</span>　${mt5}</div>
+      <details class="bt-fold" onclick="event.stopPropagation()"><summary><span style="font-size:11px; color:var(--muted);">更多</span><span class="caret">▸</span></summary>${full}</details>
+    </div>`;
+  }
+  return `<div class="bt-win ${extraClass || ''}">
     <div class="bt-win-head"><span>${title}</span>${bias ? `<span class="bias">${bias}</span>` : ''}</div>
+    ${btWinCardBody(r, pnlCls)}
+  </div>`;
+}
+
+function btWinCardBody(r, pnlCls){
+  return `
     <div class="bt-win-nums">
       <div><div class="lbl">筆數</div><div class="num mono">${r.total_trades}</div></div>
       <div><div class="lbl">損益</div><div class="num mono ${r.total_trades ? pnlCls : ''}">${r.total_trades ? btNum(r.total_pnl_points) : '--'}</div></div>
@@ -4094,8 +4215,21 @@ function btWinCard(title, bias, r, extraClass, idx){
     ${r.limit_stats ? `<div class="bt-win-split">掛單 ${r.limit_stats.placed} 次、成交 ${r.limit_stats.filled} 次</div>` : ''}
     ${r.news_shocks != null ? `<div class="bt-win-split">消息震盪 ${r.news_shocks} 次${r.skipped_news ? `，震盪後沒進場 ${r.skipped_news} 次` : ''}</div>` : ''}
     ${r.mt5_net_pnl_points != null && r.total_trades ? `<div class="bt-win-split">MT5(每筆 ${Number(r.mt5_cost_points)} 點＋庫存費 ${btNum(r.mt5_swap_total)})：損益 <span class="${r.mt5_net_pnl_points >= 0 ? 'bt-pos' : 'bt-neg'}">${btNum(r.mt5_net_pnl_points)}</span>，PF ${r.mt5_profit_factor != null ? Number(r.mt5_profit_factor).toFixed(2) : '∞'}</div>` : ''}
-    <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>
-  </div>`;
+    <div class="bt-win-split">${btSplitText(r.daily_smc_breakdown)}</div>`;
+}
+
+// r122：合計下面的分析表預設收合，標題上直接放最關鍵的數字
+function btFoldSection(title, summaryText, html){
+  if(!html) return '';
+  return `<details class="bt-fold" style="margin-top:10px;"><summary style="font-size:12.5px;"><b>${title}</b>${summaryText ? `<span style="font-size:11.5px; color:var(--muted);">　${summaryText}</span>` : ''}<span class="caret">▸</span></summary>${html}</details>`;
+}
+function btDiagSummary(d){
+  if(!d) return '';
+  const pf = g => g && g.trades ? (g.profit_factor != null ? Number(g.profit_factor).toFixed(2) : '∞') : '--';
+  const parts = [];
+  if(d.by_direction) parts.push(`多 PF ${pf(d.by_direction.bullish)}／空 PF ${pf(d.by_direction.bearish)}`);
+  if(d.news_shock) parts.push(`震盪後 PF ${pf(d.news_shock.after)}`);
+  return parts.join('，');
 }
 
 function renderBacktestJob(job){
@@ -4140,9 +4274,9 @@ function renderBacktestJob(job){
     ${ag && ag.missing_windows ? `<div style="font-size:11px; color:var(--gold); margin-top:6px;">🟡 有 ${ag.missing_windows} 段出錯沒算進合計，合計只代表跑完的段落。</div>` : ''}
     ${ag && ag.no_data_windows ? `<div style="font-size:11px; color:var(--muted); margin-top:6px;">ⓘ 有 ${ag.no_data_windows} 段沒有資料(合約上市前)，合計只算有資料的段落。</div>` : ''}
     <div style="font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5;">點任一段看完整結果。合計的回撤是把各段接起來算的。${job.status === 'running' ? '還在跑的段落完成後會自動出現。' : ''}</div>
-    ${ag ? dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組') : ''}
-    ${ag ? reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場') : ''}
-    ${ag ? entryDiagnosticsHtml(ag.entry_diagnostics, '全部段落合計：進出場診斷') : ''}
+    ${ag ? btFoldSection('進出場診斷(多空、消息震盪、被洗、進場特徵)', btDiagSummary(ag.entry_diagnostics), entryDiagnosticsHtml(ag.entry_diagnostics, '全部段落合計：進出場診斷')) : ''}
+    ${ag ? btFoldSection('依開倉時日線結構分組', '', dailySmcBreakdownHtml(ag.daily_smc_breakdown, '全部段落合計：依開倉時日線SMC結構分組')) : ''}
+    ${ag ? btFoldSection('出場後多快再進場', '', reentryBreakdownHtml(ag.reentry_breakdown, '全部段落合計：出場後多快再進場')) : ''}
     <div id="backtestDetail" style="margin-top:12px;"></div>`;
   el.querySelectorAll('.bt-win[data-idx]').forEach(card => card.addEventListener('click', () => {
     const w = wins[Number(card.dataset.idx)];
@@ -4181,6 +4315,7 @@ async function pollBacktestJob(jobId){
     }else{
       setBacktestBusy(false);
       loadBacktestJobList();
+      renderBacktestPair();
     }
   }catch(err){
     // 網路一時斷掉(手機切背景)：稍後再查，不把任務當成失敗
@@ -4237,28 +4372,85 @@ async function loadBacktestJobList(){
 
 els.backtestEndDateClear.addEventListener('click', () => { els.backtestEndDate.value = ''; });
 
+// r122：回測面板——依策略顯示專屬參數、K線週期跟著策略切、期間用預設組合
+const BT_HOURLY = ['smc_structure', 'mean_reversion', 'pullback_resume', 'breakout_trend', 'fib_pullback'];
+const BT_STRATEGY_HINT = {
+  chan_profile: '15分K 纏論中樞＋分價量表，正式端跑的就是這個。下面「回測交易參數」可以開窄中樞、分批進場、消息震盪等實驗選項。',
+  resonance_fvg: 'RSI／EMA-FVG／價格行為／成交量四個條件共振(實驗)。上面選要幾項條件同時成立。',
+  smc_structure: '1小時K SMC 結構(MSS/BOS＋OB/FVG)＋WaveTrend。',
+  mean_reversion: '1小時K 均值回歸(朋友的逆勢做法，r96)。只有回測。',
+  pullback_resume: '1小時K 回拉轉強，模式 2＝布林觸軌(lab 前瞻引擎那套)。只有回測。',
+  breakout_trend: '4小時K(用1小時K組)唐奇安通道突破，只做大行情。只有回測；可以配 90/180 天、PAXG 現貨長歷史。',
+  fib_pullback: '1小時K 趨勢中等回檔到斐波那契 0.618 掛限價單，停損 0.786、停利前高。只有回測。',
+};
+function btIsoDate(d){ return d.toISOString().slice(0, 10); }
+function btHalfEnd(){ const d = new Date(); d.setUTCDate(d.getUTCDate() - 180); return btIsoDate(d); }
+function btPeriodRuns(){
+  // 回傳要送出的任務：[{days, windows, end_date}]
+  const v = els.backtestPeriod ? els.backtestPeriod.value : 'custom';
+  if(v === 'two_halves') return [{days: 30, windows: 6, end_date: '', half: '近半年'}, {days: 30, windows: 6, end_date: btHalfEnd(), half: '前半年'}];
+  if(v === 'recent_half') return [{days: 30, windows: 6, end_date: ''}];
+  return [{days: Number(els.backtestDays.value), windows: Number(els.backtestWindows.value || 1), end_date: els.backtestEndDate.value || ''}];
+}
+function btFormSync(){
+  const st = els.backtestStrategy.value;
+  const hourly = BT_HOURLY.includes(st);
+  if(hourly && els.backtestInterval.value !== '3600') els.backtestInterval.value = '3600';
+  if(!hourly && els.backtestInterval.value === '3600') els.backtestInterval.value = '900';
+  const hint = document.getElementById('backtestStrategyHint');
+  if(hint) hint.textContent = BT_STRATEGY_HINT[st] || '';
+  const resRow = document.getElementById('backtestResonanceRow');
+  if(resRow) resRow.style.display = st === 'resonance_fvg' ? '' : 'none';
+  document.querySelectorAll('.bt-strat-group').forEach(g => {
+    g.style.display = (g.dataset.strategies || '').split(' ').includes(st) ? '' : 'none';
+  });
+  const period = els.backtestPeriod ? els.backtestPeriod.value : 'custom';
+  const custom = document.getElementById('backtestCustomPeriod');
+  if(custom) custom.style.display = period === 'custom' ? '' : 'none';
+  const ph = document.getElementById('backtestPeriodHint');
+  if(ph){
+    ph.textContent = period === 'two_halves' ? `30 天 × 6 段，送兩個任務：到現在、到 ${btHalfEnd()}。兩個都跑完，上面會出現對照表。`
+      : period === 'recent_half' ? '30 天 × 6 段，到現在。' : '';
+  }
+  const adv = document.getElementById('backtestAdvSummary');
+  if(adv){
+    const opt = sel => sel && sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.replace(/\(.*\)/, '') : '';
+    adv.textContent = [opt(els.backtestInterval), '精細度' + opt(els.backtestResolution), els.backtestSymbol.value, '箱寬' + els.backtestBucketSize.value].join('・');
+  }
+}
+['backtestStrategy', 'backtestPeriod', 'backtestInterval', 'backtestResolution', 'backtestSymbol', 'backtestBucketSize']
+  .forEach(id => { const el = document.getElementById(id); if(el) el.addEventListener('change', btFormSync); });
+btFormSync();
+
 els.backtestRunBtn.addEventListener('click', async () => {
-  const days = els.backtestDays.value;
+  btFormSync();
+  const runs = btPeriodRuns();   // r122：期間預設組合(前後兩個半年＝兩個任務)
   const intervalSeconds = els.backtestInterval.value;
   const strategyType = els.backtestStrategy.value;
   const resonanceMinConditions = els.backtestResonanceThreshold.value;
   const symbol = els.backtestSymbol.value;
   const bucketSize = els.backtestBucketSize.value;
   const paramOverrides = buildBacktestParamOverrides();
-  const endDate = els.backtestEndDate.value;
-  const windows = els.backtestWindows.value || '1';
   setBacktestBusy(true);
-  els.backtestResult.innerHTML = '<div class="loading-spinner">送出回測任務…</div>';
+  els.backtestResult.innerHTML = `<div class="loading-spinner">送出回測任務${runs.length > 1 ? `(${runs.length} 個)` : ''}…</div>`;
   try{
     const targetSteps = els.backtestResolution.value;
-    const qs = `days=${days}&windows=${windows}${endDate ? '&end_date=' + endDate : ''}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`;
-    const res = await fetch(`/backtest/jobs?${qs}`, {method: 'POST'});
-    if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
-    const data = await res.json();
-    if(data.error) throw new Error(data.error);
-    try{ localStorage.setItem(BT_JOB_KEY, data.job_id); }catch(e){}
+    const ids = [];
+    for(const run of runs){
+      const qs = `days=${run.days}&windows=${run.windows}${run.end_date ? '&end_date=' + run.end_date : ''}&symbol=${symbol}&bucket_size=${bucketSize}&interval_seconds=${intervalSeconds}&strategy_type=${strategyType}&resonance_min_conditions=${resonanceMinConditions}&target_step_count=${targetSteps}${paramOverrides ? '&' + paramOverrides : ''}`;
+      const res = await fetch(`/backtest/jobs?${qs}`, {method: 'POST'});
+      if(!res.ok) throw new Error(`回測API回傳錯誤 (${res.status})`);
+      const data = await res.json();
+      if(data.error) throw new Error(data.error);
+      ids.push(data.job_id);
+    }
+    if(ids.length === 2){
+      try{ localStorage.setItem(BT_PAIR_KEY, JSON.stringify({recent: ids[0], early: ids[1]})); }catch(e){}
+    }
+    try{ localStorage.setItem(BT_JOB_KEY, ids[0]); }catch(e){}
     loadBacktestJobList();
-    pollBacktestJob(data.job_id);
+    renderBacktestPair();
+    pollBacktestJob(ids[0]);
   }catch(err){
     els.backtestResult.innerHTML = `<div class="error">回測失敗：${err.message}</div>`;
     setBacktestBusy(false);
@@ -4268,6 +4460,7 @@ els.backtestRunBtn.addEventListener('click', async () => {
 // 回到頁面時接上次的回測(還在跑就繼續更新，跑完就直接顯示結果)
 (function resumeLastBacktest(){
   loadBacktestJobList();
+  renderBacktestPair();
   let id = null;
   try{ id = localStorage.getItem(BT_JOB_KEY); }catch(e){}
   if(id) pollBacktestJob(id);

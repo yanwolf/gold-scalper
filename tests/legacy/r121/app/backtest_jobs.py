@@ -53,7 +53,7 @@ LABEL_PARAM_KEYS = ("symbol", "interval_seconds", "strategy_type", "daily_smc_fi
                     "mr_setups", "pr_mode", "pr_sides", "pr_trend", "pr_sl_mode", "pr_hold_bars", "pr_exit_mode",
                     "bo_channel", "bo_big_bar_atr", "bo_trend", "bo_sides", "mt5_cost_points",
                     "profile_window_minutes", "value_area_method", "profile_anchor", "split_entry",
-                    "max_zs_height_atr", "news_cooldown")
+                    "max_zs_height_atr", "news_cooldown", "fp_impulse_atr", "fp_entry_fib", "fp_stop_fib", "fp_sides")
 # 結果裡 mr_cfg 的欄位 → 標籤參數名(以實際用到的值為準，留空＝預設時也看得到)
 _MR_CFG_LABEL = {"mean_reversion": {"setups": "mr_setups"},
                  "pullback_resume": {"mode": "pr_mode", "sides": "pr_sides", "trend": "pr_trend",
@@ -136,6 +136,7 @@ def _window_row(idx, res, start_ms, end_ms):
     row["skipped_zs_height"] = res.get("skipped_zs_height")   # r117
     row["skipped_news"] = res.get("skipped_news")             # r119
     row["news_shocks"] = res.get("news_shocks")
+    row["limit_stats"] = res.get("limit_stats")             # r120
     return row
 
 
