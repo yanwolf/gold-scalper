@@ -44,6 +44,7 @@ REGISTRY = {
     "test_split_entry.py": (set(), "分批進場只存在回測(不碰即時引擎與下單路徑)；r116 新功能，不重跑舊版"),
     "test_news_shock.py": (set(), "消息震盪的診斷與冷卻只存在回測(不碰即時引擎與下單路徑)；r119 新功能，不重跑舊版"),
     "test_backtest_form.py": (set(), "回測面板排版(純前端)：不碰即時引擎與下單路徑；r122 新功能，不重跑舊版"),
+    "test_ext_signal.py": (set(), "外部訊號回報只讀引擎的部位、送給 cfd-live，不碰幣安下單路徑；r123 新功能，不重跑舊版"),
     "test_narrow_zs.py": ({"error_scan"}, "窄中樞條件(r117 回測、r118 起也在即時引擎的 _tick)：走即時引擎的 _tick，錯誤掃描適用；"
                                           "模擬引擎不碰真實下單的部位查詢，不參加突變；新功能，不重跑舊版"),
     "test_profile_window.py": (set(), _BACKTEST + "。r112：分價量表時間窗／標準VA／日線大級別流動性；"

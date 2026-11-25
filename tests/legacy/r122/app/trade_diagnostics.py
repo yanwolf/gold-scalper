@@ -51,30 +51,54 @@ def entry_meta(strategy_type, result, atr, sl_points, price=None, direction=None
     return meta
 
 
-# r119：消息面震盪(不靠經濟日曆，直接從價格認)：某根 1 分K 的高低差 ≥ SHOCK_MULT 倍「前 24 小時 1 分K 高低差的中位數」
-# ＝有消息砸進來(排程數據、地緣政治、突發談話都算)。之後 SHOCK_COOLDOWN_MIN 分鐘內進場的單算「消息震盪後」。
+# r119 → r121 修正：消息面震盪(不靠經濟日曆，直接從價格認)。
+# r119 用「前 24 小時 1 分K 高低差中位數的 5 倍」，結果每 30 天認出 3,000～6,000 次——亞洲盤的 1 分K 很小，
+# 紐約開盤正常放量就超過 5 倍，量到的是「時段」不是「消息」。r121 起兩個條件都要成立：
+#   1. 這根 1 分K 的高低差 ≥ SHOCK_MULT 倍「前 SHOCK_DAYS 天同一個 UTC 小時的 1 分K 高低差中位數」(跟同時段比)；
+#   2. 而且 ≥ 最近 SHOCK_ATR_HOURS 根已收完 1 小時K 的平均高低差(一根 1 分K 走掉一整個小時的平均波動)。
+# 同一個小時至少要有 SHOCK_MIN_DAYS 天的樣本、而且已經收完 SHOCK_ATR_HOURS 根小時K 才判斷；只用那根之前的K線(因果)。
 SHOCK_MULT = 5.0
-SHOCK_LOOKBACK_BARS = 1440
-SHOCK_MIN_HISTORY = 240     # 前面不到 4 小時的資料，中位數不可靠，不判斷
+SHOCK_DAYS = 20
+SHOCK_MIN_DAYS = 5
+SHOCK_ATR_HOURS = 14
 SHOCK_COOLDOWN_MIN = 60
 
 
 def shock_times(klines):
-    """回傳消息震盪那幾根 1 分K 的收盤時間(遞增)。只用那根之前的K線算中位數(因果)。K線不是 1 分K 時回 None(不判斷)。"""
+    """回傳消息震盪那幾根 1 分K 的收盤時間(遞增)。K線不是 1 分K 時回 None(不判斷)。"""
     if len(klines) < 2 or int(klines[1][0]) - int(klines[0][0]) != 60_000:
         return None
-    window, ordered, out = [], [], []
+    per_hour_window = {h: [] for h in range(24)}   # 每個 UTC 小時：最近 SHOCK_DAYS 天的 1 分K 高低差(依時間)
+    per_hour_sorted = {h: [] for h in range(24)}
+    cap = SHOCK_DAYS * 60
+    hour_ranges = []                                # 已收完的 1 小時K 高低差(最近 SHOCK_ATR_HOURS 根)
+    cur_bucket, cur_hi, cur_lo = None, None, None
+    out = []
     for k in klines:
-        rng = float(k[2]) - float(k[3])
-        if len(ordered) >= SHOCK_MIN_HISTORY:
+        t = int(k[0])
+        hi, lo = float(k[2]), float(k[3])
+        rng = hi - lo
+        bucket = t // 3_600_000
+        if bucket != cur_bucket:
+            if cur_bucket is not None:
+                hour_ranges.append(cur_hi - cur_lo)
+                if len(hour_ranges) > SHOCK_ATR_HOURS:
+                    hour_ranges.pop(0)
+            cur_bucket, cur_hi, cur_lo = bucket, hi, lo
+        h = bucket % 24
+        ordered = per_hour_sorted[h]
+        if len(ordered) >= SHOCK_MIN_DAYS * 60 and len(hour_ranges) >= SHOCK_ATR_HOURS:
             med = ordered[len(ordered) // 2]
-            if med > 0 and rng >= SHOCK_MULT * med:
+            hour_avg = sum(hour_ranges) / len(hour_ranges)
+            if med > 0 and rng >= SHOCK_MULT * med and rng >= hour_avg:
                 out.append(int(k[6]))
-        window.append(rng)
+        win = per_hour_window[h]
+        win.append(rng)
         bisect.insort(ordered, rng)
-        if len(window) > SHOCK_LOOKBACK_BARS:
-            old = window.pop(0)
+        if len(win) > cap:
+            old = win.pop(0)
             del ordered[bisect.bisect_left(ordered, old)]
+        cur_hi, cur_lo = max(cur_hi, hi), min(cur_lo, lo)
     return out
 
 
@@ -238,14 +262,18 @@ def summarize(trades):
     breakout_part = {"retest": _group(retest), "runaway": _group(runaway),
                      "unknown": len([t for t in bo if t.get("diag_retest") is None]), "retest_hours": RETEST_HOURS}
     breakout_part["features"] = feature_buckets(bo)
+    # r121：多單／空單分開(看近半年的虧損是不是主要來自某一邊)
+    by_direction = {"bullish": _group([t for t in ts if t.get("direction") == "bullish"]),
+                    "bearish": _group([t for t in ts if t.get("direction") == "bearish"])}
     # r119：消息震盪後 SHOCK_COOLDOWN_MIN 分鐘內進場 vs 其他(全部進場種類)
     shock_part = None
     flagged = [t for t in ts if (t.get("diag") or {}).get("after_shock") is not None]
     if flagged:
         shock_part = {"after": _group([t for t in flagged if t["diag"]["after_shock"]]),
                       "normal": _group([t for t in flagged if not t["diag"]["after_shock"]]),
-                      "cooldown_min": SHOCK_COOLDOWN_MIN, "mult": SHOCK_MULT}
-    return {"washed": washed_part, "winner_mae": mae_part, "kinds": kinds, "breakout": breakout_part, "news_shock": shock_part}
+                      "cooldown_min": SHOCK_COOLDOWN_MIN, "mult": SHOCK_MULT, "days": SHOCK_DAYS}
+    return {"washed": washed_part, "winner_mae": mae_part, "kinds": kinds, "breakout": breakout_part, "news_shock": shock_part,
+            "by_direction": by_direction}
 
 
 FEATURES = (

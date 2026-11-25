@@ -3280,6 +3280,14 @@ function renderPaperTrading(data, t){
     }
   }
   renderActiveConfig(document.getElementById(t.activeConfigId), data.active_settings, data.label, data.settings_changed_at, data.stats_excluded_old_trades, data.circuit_breaker);
+  if(data.ext_signal){
+    // r123：這個引擎的部位有沒有在回報給 cfd-live(MT5 模擬帳戶照著下單)
+    const xs = data.ext_signal, cfgX = document.getElementById(t.activeConfigId);
+    const txt = !xs.enabled ? `沒有啟動：${xs.reason}`
+      : xs.last_error ? `⚠️ 回報失敗 ${xs.fails} 次：${xs.last_error}`
+      : xs.last_ok_ago == null ? '啟動中，還沒送出' : `正常(${xs.last_ok_ago} 秒前)`;
+    if(cfgX) cfgX.insertAdjacentHTML('beforeend', `<div style="font-size:11px; color:${xs.enabled && xs.last_error ? 'var(--gold)' : 'var(--muted)'}; margin-top:4px;">回報給 MT5(cfd-live)：${txt}</div>`);
+  }
   if(Number(data.zs_skips) > 0){
     // r118：重啟以來被「只做窄中樞」擋下的訊號步數(同一個訊號持續幾步會算幾次)
     const cfgEl0 = document.getElementById(t.activeConfigId);
