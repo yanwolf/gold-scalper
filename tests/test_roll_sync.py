@@ -17,9 +17,9 @@ TOKEN = "roll-test-token-123"
 T0 = 1_800_000_000.0
 
 
-def pos(ticket, volume, price, sl, typ=0, symbol="XAUUSD+"):
+def pos(ticket, volume, price, sl, typ=0, symbol="XAUUSD+", time=None):
     return {"ticket": ticket, "symbol": symbol, "type": typ, "volume": volume, "price": price, "sl": sl, "tp": 0,
-            "profit": 0, "swap": 0, "magic": 0, "time": 0}
+            "profit": 0, "swap": 0, "magic": 0, "time": 1_790_000_000 + ticket * 60 if time is None else time}
 
 
 def snap(positions, balance=788.77, equity=1676.27, bid=3672.09, ask=3672.29):
@@ -79,18 +79,46 @@ class View(Base):
         self.assertIs(v["connected"], True)
         self.assertEqual(v["inputs"]["direction"], "long")
         self.assertEqual(v["inputs"]["price"], 3672.09)                 # 多單用 bid(平倉價)
-        self.assertEqual(v["inputs"]["stop"], 3600.0)
-        self.assertEqual(v["inputs"]["positions"], [{"lots": 0.04, "entry": 3447.56}])
+        self.assertEqual(v["inputs"]["core_stop"], 3600.0)              # 只有一筆＝核心單
+        self.assertIsNone(v["inputs"]["stop"])
+        self.assertEqual(v["inputs"]["positions"], [{"lots": 0.04, "entry": 3447.56, "core": True}])
         self.assertEqual(v["account"]["company"], "Vantage")
 
-    def test_sl_mismatch_uses_lowest_and_names_target(self):
-        S.receive(snap([pos(1, 0.04, 3447.56, 3600.0), pos(2, 0.01, 3733.0, 3660.0)], bid=3740), TOKEN, now=T0)
+    def test_sl_mismatch_among_adds_uses_lowest_and_names_target(self):
+        ps = [pos(1, 0.04, 3447.56, 3573.0), pos(2, 0.01, 3703.0, 3630.0), pos(3, 0.01, 3733.0, 3660.0)]
+        S.receive(snap(ps, bid=3740), TOKEN, now=T0)
         v = S.account_view(now=T0)
-        self.assertEqual(v["inputs"]["stop"], 3600.0)                   # 計算用最保守的
+        self.assertEqual(v["inputs"]["core_stop"], 3573.0)
+        self.assertEqual(v["inputs"]["stop"], 3630.0)                   # 加碼單裡最保守的
         mis = [i for i in v["issues"] if i["key"] == "sl_mismatch"]
         self.assertEqual(len(mis), 1)
         self.assertEqual(mis[0]["target"], 3660.0)
-        self.assertIn("3447.56 那筆還在 3600", mis[0]["text"])
+        self.assertIn("3703 那筆還在 3630", mis[0]["text"])
+        self.assertNotIn("3447.56", mis[0]["text"])                     # 核心單停損本來就不同，不算
+
+    def test_core_and_add_different_stops_is_not_mismatch(self):
+        S.receive(snap([pos(1, 0.04, 3447.56, 3573.0), pos(2, 0.01, 3703.0, 3660.0)], bid=3740), TOKEN, now=T0)
+        v = S.account_view(now=T0)
+        self.assertEqual(v["inputs"]["stop"], 3660.0)
+        self.assertEqual([p["core"] for p in v["inputs"]["positions"]], [True, False])
+        self.assertNotIn("sl_mismatch", [i["key"] for i in v["issues"]])
+
+    def test_core_is_earliest_by_open_time_not_list_order(self):
+        ps = [pos(7, 0.01, 3703.0, 3660.0, time=1_790_000_900), pos(3, 0.04, 3447.56, 3573.0, time=1_790_000_100)]
+        S.receive(snap(ps, bid=3740), TOKEN, now=T0)
+        v = S.account_view(now=T0)
+        self.assertEqual(v["core_ticket"], 3)
+        self.assertEqual(v["inputs"]["core_stop"], 3573.0)
+
+    def test_core_mode_none_treats_all_alike(self):
+        rules = {**S.default_rules(), "core_mode": "none"}
+        with mock.patch.object(S, "get_rules", return_value=rules):
+            S.receive(snap([pos(1, 0.04, 3447.56, 3600.0), pos(2, 0.01, 3733.0, 3660.0)], bid=3740), TOKEN, now=T0)
+            v = S.account_view(now=T0)
+        self.assertEqual(v["inputs"]["stop"], 3600.0)
+        self.assertIsNone(v["inputs"]["core_stop"])
+        self.assertIn("sl_mismatch", [i["key"] for i in v["issues"]])
+        self.assertIn("3447.56 那筆還在 3600", next(i["text"] for i in v["issues"] if i["key"] == "sl_mismatch"))
 
     def test_short_uses_ask_and_highest_stop(self):
         S.receive(snap([pos(1, 0.02, 3700, 3720, typ=1), pos(2, 0.01, 3650, 3690, typ=1)], bid=3640, ask=3640.3),
@@ -98,7 +126,8 @@ class View(Base):
         v = S.account_view(now=T0)
         self.assertEqual(v["inputs"]["direction"], "short")
         self.assertEqual(v["inputs"]["price"], 3640.3)
-        self.assertEqual(v["inputs"]["stop"], 3720.0)
+        self.assertEqual(v["inputs"]["core_stop"], 3720.0)
+        self.assertEqual(v["inputs"]["stop"], 3690.0)
 
     def test_other_symbols_and_mixed(self):
         S.receive(snap([pos(1, 0.04, 3447.56, 3600.0), pos(9, 1, 20000, 0, symbol="NAS100")]), TOKEN, now=T0)
@@ -144,18 +173,19 @@ class Alerts(Base):
         self.assertIn("over_leverage", S._state["alerts"])
 
     def test_sl_mismatch_alert(self):
-        S.receive(snap([pos(1, 0.04, 3447.56, 3600.0), pos(2, 0.01, 3733.0, 3660.0)], equity=1800, bid=3740),
-                  TOKEN, now=T0)
-        self.assertTrue(any("⚠️ 各單停損不一致" in m and "3660" in m for m in self.sent()), self.sent())
+        ps = [pos(1, 0.04, 3447.56, 3573.0), pos(2, 0.01, 3703.0, 3630.0), pos(3, 0.01, 3733.0, 3660.0)]
+        S.receive(snap(ps, equity=1900, bid=3740), TOKEN, now=T0)
+        self.assertTrue(any("⚠️ 加碼單停損不一致" in m and "3660" in m for m in self.sent()), self.sent())
 
     def test_add_point_notified_once_per_anchor(self):
-        # 淨值夠大、停損夠緊，讓規則允許加碼；現價離 3447.56 早就超過 30 點
+        # 只有核心單(停損 3640)、淨值夠大，讓規則允許加碼；現價離 3447.56 早就超過 30 點
+        # 第一筆加碼單的停損＝加碼價 − 加碼間距 30 ＝ 3642.09
         p1 = [pos(1, 0.04, 3447.56, 3640.0)]
         S.receive(snap(p1, balance=1788.77, equity=2676.27), TOKEN, now=T0)
         adds = [m for m in self.sent() if "到加碼點了" in m]
         self.assertEqual(len(adds), 1)
-        self.assertIn("停損 3640", adds[0])
-        self.assertIn("舊單停損", adds[0])
+        self.assertIn("加碼單停損 3642.09", adds[0])
+        self.assertIn("核心單停損照舊", adds[0])
         S.receive(snap(p1, balance=1788.77, equity=2680.0, bid=3673.0), TOKEN, now=T0 + 3)
         self.assertEqual(len([m for m in self.sent() if "到加碼點了" in m]), 1)
         # 加碼成交後最有利的進場價變了：還沒離 30 點就不通知
@@ -203,9 +233,17 @@ class Rules(unittest.TestCase):
 
     def test_invalid_rejected(self):
         with mock.patch("app.db.save_app_settings") as sv:
-            with self.assertRaises(ValueError):
-                S.save_rules({"lock_pct": 150})
+            for bad in ({"lock_pct": 150}, {"core_mode": "biggest"}, {"add_stop_points": -5}):
+                with self.assertRaises(ValueError):
+                    S.save_rules(bad)
             self.assertEqual(sv.call_count, 0)
+
+    def test_core_rules_saved(self):
+        with mock.patch("app.db.save_app_settings"):
+            r = S.save_rules({"core_mode": "none", "add_stop_points": "20"})
+        self.assertEqual(r["core_mode"], "none")
+        self.assertEqual(r["add_stop_points"], 20.0)
+        self.assertEqual(S.default_rules()["core_mode"], "earliest")
 
 
 class Endpoints(unittest.TestCase):
@@ -235,7 +273,7 @@ class Endpoints(unittest.TestCase):
             self.assertNotIn("inputs", r)                                   # 密碼錯就看不到持倉
             r = self.c.post("/tools/roll-account", json={"password": "pw-123"}).json()
             self.assertIs(r["success"], True)
-            self.assertEqual(r["inputs"]["stop"], 3600.0)
+            self.assertEqual(r["inputs"]["core_stop"], 3600.0)
 
     def test_rules_endpoint_needs_password(self):
         with mock.patch.dict(os.environ, {"SETTINGS_PASSWORD": "pw-123"}), \

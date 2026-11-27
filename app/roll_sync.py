@@ -29,7 +29,9 @@ STALE_SECONDS = 180          # 有持倉時 EA 超過這麼久沒回報 → 斷�
 REPEAT_SECONDS = 1800        # 沒處理的警示多久再提醒一次
 CHECK_SECONDS = 30           # 背景檢查斷線的間隔
 RULES_DB_KEY = "roll_rules"  # 存在 app_settings(設定頁不認得這個 key，會略過)
-RULE_FIELDS = ("max_leverage", "lock_pct", "add_step", "add_lots", "cost_points", "contract_size", "trail_stop")
+RULE_FIELDS = ("max_leverage", "lock_pct", "add_step", "add_lots", "cost_points", "contract_size", "trail_stop",
+               "core_mode", "add_stop_points")
+CORE_MODES = ("earliest", "none")   # r126：核心單＝最早那筆／不分
 
 _lock = threading.Lock()
 _state = {"snapshot": None, "received_at": None, "rules": None, "alerts": {}, "disconnected": False,
@@ -69,7 +71,9 @@ def _send(text):
 # ---------------------------------------------------------------------------
 
 def default_rules():
-    return {k: position_roll.DEFAULTS[k] for k in RULE_FIELDS}
+    rules = {k: position_roll.DEFAULTS[k] for k in RULE_FIELDS if k in position_roll.DEFAULTS}
+    rules["core_mode"] = "earliest"
+    return rules
 
 
 def get_rules():
@@ -99,10 +103,13 @@ def save_rules(payload):
             rules[k] = payload[k]
     # 用計算器的檢查驗一次(拿一組假部位)，欄位有問題會丟 ValueError
     position_roll.parse({"positions": [{"lots": 0.01, "entry": 100}], "price": 101, "balance": 100, **rules})
+    if str(rules.get("core_mode")) not in CORE_MODES:
+        raise ValueError("核心單設定只能是 earliest(最早那筆)或 none(不分)")
     clean = {k: rules[k] for k in RULE_FIELDS}
     for k in ("max_leverage", "lock_pct", "add_step", "cost_points", "contract_size"):
         clean[k] = float(clean[k])
     clean["add_lots"] = float(clean["add_lots"]) if clean["add_lots"] not in (None, "") else None
+    clean["add_stop_points"] = float(clean["add_stop_points"]) if clean["add_stop_points"] not in (None, "") else None
     tr = clean["trail_stop"]
     clean["trail_stop"] = tr if isinstance(tr, bool) else str(tr).lower() in ("1", "true", "yes", "on")
     from app import db
@@ -180,30 +187,48 @@ def account_view(now=None):
     if not price:
         issues.append({"level": "alarm", "key": "noprice", "text": f"沒有收到 {sym} 的報價"})
         return out
-    sls = [float(p.get("sl") or 0) for p in gold]
     missing = [p for p in gold if not float(p.get("sl") or 0)]
     if missing:
         issues.append({"level": "alarm", "key": "no_sl",
                        "text": "沒有停損：" + "、".join(f"{p.get('volume')} 手 @ {float(p.get('price')):g}" for p in missing)})
-    set_sls = [x for x in sls if x > 0]
+    # r126：核心單＝最早開的那一筆(規則 core_mode=earliest)，它的停損另外算，不跟加碼單比一不一致
+    gold = sorted(gold, key=lambda p: (int(p.get("time") or 0), int(p.get("ticket") or 0)))
+    core_ticket = gold[0].get("ticket") if get_rules().get("core_mode", "earliest") == "earliest" else None
+    core = [p for p in gold if core_ticket is not None and p.get("ticket") == core_ticket]
+    adds = [p for p in gold if p not in core]
+
+    def _sl(p):
+        return float(p.get("sl") or 0)
+
+    core_stop = None
+    if core and _sl(core[0]) > 0:
+        core_stop = _sl(core[0])
+        if s * (price - core_stop) <= 0:
+            issues.append({"level": "alarm", "key": "sl_cross", "text": f"核心單停損 {core_stop:g} 已經在現價另一側"})
+            core_stop = None
+    set_sls = [_sl(p) for p in adds if _sl(p) > 0]
     stop = None
     if set_sls:
-        # 計算用最保守的那個(多單取最低)；各單不一致另外提醒
+        # 計算用最保守的那個(多單取最低)；加碼單之間不一致另外提醒
         stop = min(set_sls) if s == 1 else max(set_sls)
-        if len(set(round(x, 2) for x in set_sls)) > 1 and not missing:
+        if len(set(round(x, 2) for x in set_sls)) > 1 and len(set_sls) == len(adds):
             target = max(set_sls) if s == 1 else min(set_sls)
-            lagging = [p for p in gold if abs(float(p.get("sl") or 0) - target) > 1e-6]
+            lagging = [p for p in adds if abs(_sl(p) - target) > 1e-6]
+            who = "加碼單" if core else "各單"
             issues.append({"level": "warn", "key": "sl_mismatch", "target": target,
-                           "text": f"各單停損不一致：最新的是 {target:g}，" + "、".join(
-                               f"{float(p.get('price')):g} 那筆還在 {float(p.get('sl')):g}" for p in lagging)
+                           "text": f"{who}停損不一致：最新的是 {target:g}，" + "、".join(
+                               f"{float(p.get('price')):g} 那筆還在 {_sl(p):g}" for p in lagging)
                            + f"——如果是加碼後還沒移，記得改成 {target:g}"})
         if s * (price - stop) <= 0:
-            issues.append({"level": "alarm", "key": "sl_cross", "text": f"停損 {stop:g} 已經在現價另一側"})
+            issues.append({"level": "alarm", "key": "sl_cross",
+                           "text": f"{'加碼單' if core else ''}停損 {stop:g} 已經在現價另一側"})
             stop = None
+    out["core_ticket"] = core_ticket
     out["inputs"] = {"direction": direction, "price": round(float(price), 2),
                      "balance": round(float(snap["balance"]), 2), "equity": round(float(snap["equity"]), 2),
-                     "stop": stop, "symbol": sym,
-                     "positions": [{"lots": float(p["volume"]), "entry": float(p["price"])} for p in gold]}
+                     "stop": stop, "core_stop": core_stop, "symbol": sym,
+                     "positions": [{"lots": float(p["volume"]), "entry": float(p["price"]), "core": p in core}
+                                   for p in gold]}
     return out
 
 
@@ -277,7 +302,8 @@ def evaluate(now=None):
                 active["over_leverage"] = ("over", f"🚨 實際槓桿 {st['leverage'] or 0:.1f} 倍超過上限 {float(cap):g} 倍"
                                            + (f"\n建議減碼 {rd.get('close_lots'):g} 手：{plan}" if plan else ""))
             if r["stop"]["kept"] is not None and r["stop"]["kept"] < 0:
-                active["principal"] = (inputs["stop"], f"🚨 停損 {inputs['stop']:g} 打到會虧到本金 {abs(r['stop']['kept']):.2f}")
+                active["principal"] = ((inputs["stop"], inputs.get("core_stop")),
+                                       f"🚨 停損全部打到會虧到本金 {abs(r['stop']['kept']):.2f}")
             _check_add(r, inputs, rules, label)
     for key, (sig, text) in active.items():
         _raise(key, sig, text, now, label)
@@ -302,9 +328,10 @@ def _check_add(r, inputs, rules, label):
     _state["add_keys"].add(key)
     side = "Buy" if s == 1 else "Sell"
     _send(f"{label}\n📈 到加碼點了：現價 {inputs['price']:g}，離上次進場 {anchor:g} 已 {abs(inputs['price'] - anchor):.1f} 點\n"
-          f"可加 {a['lots']:g} 手（{side}），停損 {a['stop']:g}\n"
-          f"加完 {a['total_lots']:g} 手、槓桿 {a['leverage']:.1f} 倍，打到停損仍保住 {a['kept_at_stop']:.2f}\n"
-          f"成交後記得把舊單停損也設成同一個價位")
+          f"可加 {a['lots']:g} 手（{side}），{'加碼單' if inputs.get('core_stop') is not None else ''}停損 {a['stop']:g}\n"
+          f"加完 {a['total_lots']:g} 手、槓桿 {a['leverage']:.1f} 倍，停損全部打到仍保住 {a['kept_at_stop']:.2f}\n"
+          + ("成交後記得把其他加碼單的停損也設成同一個價位；核心單停損照舊" if inputs.get("core_stop") is not None
+             else "成交後記得把舊單停損也設成同一個價位"))
 
 
 def _loop():

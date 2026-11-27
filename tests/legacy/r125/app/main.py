@@ -19,7 +19,7 @@ import functools
 import threading
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -41,6 +41,8 @@ from app import risk_guard
 from app import preflight as preflight_module
 from app import daily_smc
 from app import backtest_jobs
+from app import position_roll   # r124：滾倉計算器(純計算，不碰交易所)
+from app import roll_sync   # r125：真實帳戶(MT5 唯讀 EA)同步＋滾倉提醒，不下單
 
 logger = logging.getLogger("main")
 
@@ -81,6 +83,8 @@ async def startup_event():
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
     # r123：把 lab 引擎的部位回報給 cfd-live，在 MT5 模擬帳戶照著下單(沒設定 EXT_SIGNAL_* 或是正式端就不啟動)
     ext_signal.start(lambda: PAPER_TRADING_ENGINES)
+    # r125：滾倉同步(沒設 ROLL_SYNC_TOKEN 就不啟動)
+    roll_sync.start()
     # r89：日線SMC結構參考，背景每30分鐘刷新一次(交易迴圈只讀快取，不會被網路卡住)
     daily_smc.start_refresher(symbol=execution_module.DEFAULT_SYMBOL)
     # 開機跑一次交易所相容性自檢(BINANCE_LESSONS.md)，異常發Telegram，
@@ -1522,6 +1526,103 @@ async def analysis_daily_smc(refresh: bool = False):
     except (TypeError, ValueError):
         price = None   # 報價還沒到或格式不對：區域改用最後一根日K收盤價分上下
     return daily_smc.get_snapshot(current_price=price)
+
+
+# ---------------------------------------------------------------------------
+# r124：倉位滾動(滾倉)計算器。純計算：不碰交易所、不碰引擎，lab／live 都開。
+# ---------------------------------------------------------------------------
+
+@app.get("/tools/roll")
+async def tools_roll_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "roll.html"))
+
+
+@app.post("/tools/roll-calc")
+async def tools_roll_calc(payload: dict = Body(...)):
+    """輸入目前持倉、現價、結餘(、淨值、停損、規則參數)，回傳現況、警示、減碼與加碼建議。見 app/position_roll.py。"""
+    try:
+        return position_roll.calc(payload)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/tools/roll-sync")
+async def tools_roll_sync(request: Request, payload: dict = Body(...)):
+    """
+    r125：Vantage MT5 上的唯讀 EA(windows/TzujenRollSync.mq5)回報帳戶與持倉。header X-Token = ROLL_SYNC_TOKEN。
+    沒設 ROLL_SYNC_TOKEN 時回 404。這支只收資料、發提醒，不下任何單。
+    """
+    from fastapi.responses import JSONResponse
+    if not roll_sync.enabled():
+        return JSONResponse({"ok": False, "error": "沒有啟用"}, status_code=404)
+    ok, error = roll_sync.receive(payload, request.headers.get("x-token"))
+    if not ok:
+        return JSONResponse({"ok": False, "error": error}, status_code=401 if error == "token 不對" else 400)
+    return {"ok": True}
+
+
+@app.post("/tools/roll-account")
+async def tools_roll_account(payload: dict = Body(...)):
+    """真實帳戶的同步狀態(給計算器自動帶入)。有帳戶餘額與持倉，要密碼(SETTINGS_PASSWORD)。"""
+    if not roll_sync.enabled():
+        return {"success": True, "enabled": False}
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    return {"success": True, **roll_sync.status()}
+
+
+@app.post("/tools/roll-rules")
+async def tools_roll_rules(payload: dict = Body(...)):
+    """存「通知規則」(加碼／槓桿提醒用)，要密碼。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    try:
+        rules = roll_sync.save_rules(payload.get("rules") or {})
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    db.insert_settings_audit("roll_rules", detail=rules)
+    return {"success": True, "rules": rules}
+
+
+@app.get("/tools/roll-levels")
+async def tools_roll_levels(direction: str = "long"):
+    """
+    挑停損用的結構價位(幣安 XAUUSDT 價)：15分K／1小時K 纏論最近的筆端點與中樞、日線 SMC 區。
+    網頁用「券商現價 − 幣安現價」換算成券商價。只讀快取的K棒，不打網路。
+    """
+    direction = "short" if str(direction).lower() == "short" else "long"
+    price = None
+    try:
+        tick = binance_streamer.get_latest()
+        if isinstance(tick, dict) and tick.get("bid") and tick.get("ask"):
+            price = (float(tick["bid"]) + float(tick["ask"])) / 2
+    except (TypeError, ValueError):
+        price = None
+    if price is None:
+        return {"binance_price": None, "levels": [], "error": "幣安報價還沒到，先手動填停損"}
+
+    def _chan(interval):
+        candles = binance_streamer.get_recent_candles(interval_seconds=interval, limit=600)
+        return analyze_chan(candles) if candles else None
+
+    chans, errors = {}, []
+    for label, interval in (("15分K", 900), ("1小時K", 3600)):
+        try:
+            chans[label] = await asyncio.to_thread(_chan, interval)
+        except Exception as e:
+            logger.warning(f"滾倉計算器：{label} 纏論計算失敗: {e}")
+            errors.append(f"{label}：{e}")
+    try:
+        daily = daily_smc.get_snapshot(current_price=price)
+    except Exception as e:
+        logger.warning(f"滾倉計算器：日線SMC讀取失敗: {e}")
+        daily = None
+        errors.append(f"日線：{e}")
+    return {"binance_price": round(price, 2), "direction": direction,
+            "levels": position_roll.structure_levels(direction, chans, daily, price),
+            "error": "；".join(errors) or None}
 
 
 @app.websocket("/ws/price")

@@ -165,6 +165,92 @@ class Adding(unittest.TestCase):
         self.assertGreaterEqual(r["add_now"]["kept_at_stop"], r["stop"]["keep_required"] - 0.01)
 
 
+CORE = {"direction": "long", "price": 3672.09, "balance": 788.77, "equity": 1676.27,
+        "positions": [{"lots": 0.04, "entry": 3447.56, "core": True}]}
+
+
+class Core(unittest.TestCase):
+    """r126：核心單用自己的停損，加碼單另外管理。"""
+
+    def test_core_only_uses_core_stop_and_default_add_stop(self):
+        r = R.calc({**CORE, "core_stop": 3573})
+        st = r["stop"]
+        self.assertIs(st["has_core"], True)
+        self.assertEqual(st["lock_target"], "core")
+        self.assertAlmostEqual(st["lock_line"], 3561.15, places=2)
+        # 核心單打到 3573：887.50 − 4 × (3672.09 − 3573) ＝ 491.14
+        self.assertAlmostEqual(st["kept"], 491.14, places=2)
+        self.assertIs(st["locks_enough"], True)
+        a = r["add_now"]
+        self.assertIs(a["stop_is_default"], True)
+        self.assertEqual(a["stop"], 3642.09)                               # 現價 − 加碼間距 30
+        r2 = R.calc({**CORE, "core_stop": 3573, "add_stop_points": 15})
+        self.assertEqual(r2["add_now"]["stop"], 3657.09)
+
+    def test_core_plus_adds_worst_case_and_add_only_case(self):
+        q = {**CORE, "equity": 1676.27 + 2 * (3672.09 - 3660.4),
+             "positions": CORE["positions"] + [{"lots": 0.02, "entry": 3660.4}], "core_stop": 3573, "stop": 3640}
+        r = R.calc(q)
+        st = r["stop"]
+        adj = r["status"]["adjustment"]
+        worst = adj + 4 * (3573 - 3447.56) + 2 * (3640 - 3660.4)
+        self.assertAlmostEqual(st["kept"], worst, places=1)
+        add_only = r["status"]["floating"] + 6 * (3640 - 3672.09)          # 只有加碼單出場，核心單還在
+        self.assertAlmostEqual(st["add_stop_hit_kept"], add_only, places=1)
+        self.assertEqual(st["lock_target"], "add")
+        # 停損線代回去剛好保住要求的金額
+        worst_at_line = adj + 4 * (3573 - 3447.56) + 2 * (st["lock_line"] - 3660.4)
+        self.assertAlmostEqual(worst_at_line, st["keep_required"], places=1)
+        self.assertTrue(any("核心單續抱" in a["text"] for a in r["actions"]), r["actions"])
+
+    def test_missing_stops_alarm(self):
+        r = R.calc({**CORE})
+        self.assertTrue(any("核心單沒有停損" in a["text"] for a in r["actions"] if a["level"] == "alarm"))
+        q = {**CORE, "positions": CORE["positions"] + [{"lots": 0.01, "entry": 3660}], "core_stop": 3573}
+        r = R.calc(q)
+        self.assertTrue(any(a["text"] == "加碼單沒有停損" for a in r["actions"] if a["level"] == "alarm"))
+        self.assertEqual(r["add_now"]["why"], "還沒設加碼單停損")
+        with self.assertRaises(ValueError):
+            R.calc({**CORE, "core_stop": 3700})
+
+    def test_reduce_closes_adds_before_core(self):
+        q = {"direction": "long", "price": 3662.79, "balance": 300.01, "equity": 1567.48, "stop": 3640, "core_stop": 3600,
+             "positions": [{"lots": 0.05, "entry": 3621.87, "core": True}, {"lots": 0.05, "entry": 3447.56}]}
+        rd = R.calc(q)["reduce"]
+        self.assertEqual(len(rd["plan"]), 2)
+        self.assertEqual(rd["plan"][0]["entry"], 3447.56)                  # 加碼單先平，就算核心單成本比較差
+        self.assertIs(rd["plan"][0]["core"], False)
+        self.assertIs(rd["plan"][1]["core"], True)
+
+    def test_add_now_respects_worst_case_with_core(self):
+        q = {**CORE, "balance": 1788.77, "equity": 2676.27, "core_stop": 3600, "stop": 3650, "max_leverage": 50,
+             "add_lots": 1}
+        r = R.calc(q)
+        a = r["add_now"]
+        self.assertGreater(a["lots"], 0)
+        self.assertEqual(a["why"], "停損時要保住的浮盈")
+        p = R.parse(q)
+        book = R.Book(p["s"], p["cs"], p["balance"], p["positions"], r["status"]["adjustment"])
+        keep = r["stop"]["keep_required"]
+
+        def worst(x):
+            b2 = R.Book(1, 100, p["balance"], book.positions + [{"lots": x, "entry": a["entry"], "core": False}], book.adj)
+            return b2.worst_kept(3650, 3600)
+        self.assertGreaterEqual(worst(a["lots"]), keep - 1e-6)
+        self.assertLess(worst(a["lots"] + 0.01), keep)
+
+    def test_hint_when_core_stop_eats_budget(self):
+        r = R.calc({**CORE, "core_stop": 3530, "stop": 3660, "max_leverage": 50})
+        self.assertEqual(r["add_now"]["lots"], 0.0)
+        self.assertTrue(any("可吐回的額度大多被核心單用掉" in a["text"] for a in r["actions"]), r["actions"])
+
+    def test_no_core_flag_keeps_old_behavior(self):
+        old = R.calc(inp(stop=3620))
+        new = R.calc(inp(stop=3620, core_stop=3500))                       # 沒標核心單時 core_stop 不理
+        self.assertEqual(old["stop"]["kept"], new["stop"]["kept"])
+        self.assertIs(new["stop"]["has_core"], False)
+
+
 class Levels(unittest.TestCase):
     CHAN = {"15分K": {"bi_list": [{"start_price": 3650, "end_price": 3630}, {"start_price": 3630, "end_price": 3670},
                                   {"start_price": 3670, "end_price": 3645}],

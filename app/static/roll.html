@@ -33,6 +33,9 @@
   .pos-row{ display:flex; gap:6px; margin-bottom:6px; align-items:center; }
   .pos-row input{ flex:1 1 0; }
   .pos-row .x{ background:transparent; color:var(--muted); padding:6px 8px; }
+  .pos-row .core-lbl{ font-size:12px; color:var(--muted); white-space:nowrap; display:flex; align-items:center; gap:3px; }
+  .pos-row.is-core input.lots, .pos-row.is-core input.entry{ border-color:var(--gold); }
+  .tag-core{ color:var(--gold); font-size:11px; }
   .hint{ font-size:11.5px; color:var(--muted); line-height:1.6; }
   details > summary{ cursor:pointer; color:var(--muted); font-size:12.5px; }
   details[open] > summary{ margin-bottom:8px; }
@@ -86,7 +89,7 @@
       <button data-dir="short">空單</button>
     </div>
   </div>
-  <div class="hint" style="margin-bottom:6px;">每一筆：手數、進場價（照 MT5 持倉逐筆填）</div>
+  <div class="hint" style="margin-bottom:6px;">每一筆：手數、進場價（照 MT5 持倉逐筆填）。勾「核心」的那筆用自己的停損抱波段，其他是加碼單。</div>
   <div id="posList"></div>
   <button id="addPos">＋ 新增一筆</button>
 </div>
@@ -101,9 +104,12 @@
 </div>
 
 <div class="card">
-  <h2>整體停損</h2>
-  <div class="row"><label>停損價</label><input type="number" step="0.01" id="stop" inputmode="decimal" placeholder="選填：所有部位一起出場的價位" />
+  <h2 id="stopTitle">整體停損</h2>
+  <div class="row" id="coreStopRow" style="display:none;"><label>核心單停損</label><input type="number" step="0.01" id="core_stop" inputmode="decimal" placeholder="抱波段用，通常放在結構下方" />
+    <button id="clearCoreStop">清除</button></div>
+  <div class="row"><label id="stopLabel">停損價</label><input type="number" step="0.01" id="stop" inputmode="decimal" placeholder="選填：所有部位一起出場的價位" />
     <button id="clearStop">清除</button></div>
+  <div class="hint" id="coreHint" style="display:none;">加碼單停損比核心單緊：加碼單打掉就算了，核心單繼續抱。保住浮盈的規則看「所有停損都打到」的最壞情況。</div>
   <details id="lvBox">
     <summary>從結構挑停損（15分K／1小時K 纏論、日線 SMC）</summary>
     <div id="lvInfo" class="hint">載入中…</div>
@@ -121,7 +127,9 @@
     <div class="row"><label>加碼階數</label><input type="number" step="1" id="ladder_steps" value="3" /></div>
     <div class="row"><label>加碼成本</label><input type="number" step="0.1" id="cost_points" value="0.4" /><span class="muted">點（點差＋滑價）</span></div>
     <div class="row"><label>合約大小</label><input type="number" step="1" id="contract_size" value="100" /><span class="muted">盎司／手</span></div>
-    <div class="row"><label>停損跟著移</label><input type="checkbox" id="trail_stop" checked /><span class="muted">每到一個加碼點，停損移同樣的距離</span></div>
+    <div class="row"><label>停損跟著移</label><input type="checkbox" id="trail_stop" checked /><span class="muted">每到一個加碼點，加碼單停損移同樣的距離（核心單不動）</span></div>
+    <div class="row"><label>加碼停損距</label><input type="number" step="1" id="add_stop_points" placeholder="預設＝加碼間距" /><span class="muted">點（只有核心單、還沒加碼時，第一筆加碼單的停損距離）</span></div>
+    <div class="row"><label>同步核心單</label><select id="core_mode"><option value="earliest">最早開的那筆</option><option value="none">不分核心單</option></select><span class="muted">（MT5 同步與通知用）</span></div>
     <div id="ruleSync" style="display:none; border-top:1px solid var(--grid); padding-top:8px;">
       <div id="ruleServer" class="hint"></div>
       <button id="ruleSave" style="margin-top:6px;">把上面的規則存成通知規則</button>
@@ -134,8 +142,8 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const FIELDS = ['price', 'balance', 'equity', 'stop', 'max_leverage', 'lock_pct', 'add_step', 'add_lots',
-                'ladder_steps', 'cost_points', 'contract_size'];
+const FIELDS = ['price', 'balance', 'equity', 'stop', 'core_stop', 'max_leverage', 'lock_pct', 'add_step', 'add_lots',
+                'ladder_steps', 'cost_points', 'contract_size', 'add_stop_points'];
 const STORE = 'rollCalc.v1';
 let direction = 'long', last = null, levels = null, timer = null;
 
@@ -143,21 +151,36 @@ function fmt(x, d = 2) { return (x === null || x === undefined) ? '--' : Number(
 function sign(x) { return (x > 0 ? '+' : '') + fmt(x); }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
 
-function posRow(lots = '', entry = '') {
+function posRow(lots = '', entry = '', core = false) {
   const d = document.createElement('div');
   d.className = 'pos-row';
   d.innerHTML = `<input type="number" step="0.01" inputmode="decimal" class="lots" placeholder="手數" value="${lots}">
                  <input type="number" step="0.01" inputmode="decimal" class="entry" placeholder="進場價" value="${entry}">
+                 <label class="core-lbl"><input type="checkbox" class="core" ${core ? 'checked' : ''}>核心</label>
                  <button class="x" title="刪除">✕</button>`;
-  d.querySelector('.x').onclick = () => { d.remove(); schedule(); };
-  d.querySelectorAll('input').forEach(i => i.addEventListener('input', schedule));
+  d.querySelector('.x').onclick = () => { d.remove(); coreUI(); schedule(); };
+  d.querySelectorAll('input').forEach(i => i.addEventListener('input', () => { coreUI(); schedule(); }));
   $('posList').appendChild(d);
+  coreUI();
+}
+
+function hasCore() { return [...document.querySelectorAll('.pos-row .core')].some(c => c.checked); }
+function coreUI() {
+  const c = hasCore();
+  document.querySelectorAll('.pos-row').forEach(r => r.classList.toggle('is-core', r.querySelector('.core').checked));
+  $('coreStopRow').style.display = c ? '' : 'none';
+  $('coreHint').style.display = c ? '' : 'none';
+  $('stopTitle').textContent = c ? '停損（核心單／加碼單分開）' : '整體停損';
+  $('stopLabel').textContent = c ? '加碼單停損' : '停損價';
+  $('stop').placeholder = c ? '加碼單一起出場的價位' : '選填：所有部位一起出場的價位';
 }
 
 function gather() {
   const body = {direction, trail_stop: $('trail_stop').checked,
-    positions: [...document.querySelectorAll('.pos-row')].map(r => ({lots: r.querySelector('.lots').value, entry: r.querySelector('.entry').value}))};
+    positions: [...document.querySelectorAll('.pos-row')].map(r => ({lots: r.querySelector('.lots').value,
+      entry: r.querySelector('.entry').value, core: r.querySelector('.core').checked}))};
   FIELDS.forEach(f => { body[f] = $(f).value; });
+  body.core_mode = $('core_mode').value;
   return body;
 }
 
@@ -167,9 +190,11 @@ function load() {
   try { b = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { b = null; }
   if (!b) { posRow(); posRow(); return; }
   setDir(b.direction || 'long', false);
-  (b.positions && b.positions.length ? b.positions : [{}]).forEach(p => posRow(p.lots || '', p.entry || ''));
+  (b.positions && b.positions.length ? b.positions : [{}]).forEach(p => posRow(p.lots || '', p.entry || '', !!p.core));
   FIELDS.forEach(f => { if (b[f] !== undefined && b[f] !== null) $(f).value = b[f]; });
   $('trail_stop').checked = b.trail_stop !== false;
+  if (b.core_mode) $('core_mode').value = b.core_mode;
+  coreUI();
 }
 
 function setDir(d, recalc = true) {
@@ -228,18 +253,19 @@ function render(r) {
   </div>`;
 
   h += `<div class="card"><h2>停損</h2>
-    <div class="kv"><span>保住 ${st.lock_pct}% 浮盈的停損線</span><span class="mono">${st.keep_required > 0 ? fmt(st.lock_line) : '--'}</span></div>
+    <div class="kv"><span>保住 ${st.lock_pct}% 浮盈的${{all: '停損線', add: '加碼單停損線', core: '核心單停損線'}[st.lock_target]}</span><span class="mono">${st.keep_required > 0 ? fmt(st.lock_line) : '--'}</span></div>
     <div class="kv"><span>要保住</span><span class="mono">${fmt(st.keep_required)}</span></div>
-    ${st.stop !== null ? `<div class="kv"><span>目前停損 ${fmt(st.stop)} 打到時保住</span><span class="mono ${st.kept < 0 ? 'over' : ''}">${sign(st.kept)}</span></div>
-    <div class="kv"><span>打到時淨值</span><span class="mono">${fmt(st.equity_at_stop)}</span></div>` : '<div class="hint" style="margin-top:6px;">還沒填停損：下面的加碼試算先用「保住浮盈的停損線」當停損。</div>'}
+    ${st.kept !== null ? `<div class="kv"><span>${st.has_core ? '所有停損都打到時保住' : `目前停損 ${fmt(st.stop)} 打到時保住`}</span><span class="mono ${st.kept < 0 ? 'over' : ''}">${sign(st.kept)}</span></div>
+    <div class="kv"><span>打到時淨值</span><span class="mono">${fmt(st.equity_at_stop)}</span></div>` : (st.has_core ? '' : '<div class="hint" style="margin-top:6px;">還沒填停損：下面的加碼試算先用「保住浮盈的停損線」當停損。</div>')}
+    ${st.add_stop_hit_kept !== null ? `<div class="kv"><span>只有加碼單停損打到（核心續抱）</span><span class="mono">${sign(st.add_stop_hit_kept)}</span></div>` : ''}
   </div>`;
 
   if (r.reduce) {
     const rd = r.reduce;
     h += `<div class="card"><h2>減碼（槓桿降到 ${cap} 倍內）</h2>
-      <div class="hint">平掉 ${fmt(rd.close_lots)} 手、留 ${fmt(rd.target_lots)} 手；成本最差的先平。平倉不會改變淨值，只會把浮盈變成結餘。</div>
+      <div class="hint">平掉 ${fmt(rd.close_lots)} 手、留 ${fmt(rd.target_lots)} 手；加碼單先平（成本最差的先），核心單最後。平倉不會改變淨值，只會把浮盈變成結餘。</div>
       <div class="scroll"><table><tr><th>進場價</th><th>持有</th><th>平掉</th><th>實現</th></tr>
-      ${rd.plan.map(p => `<tr><td class="mono">${fmt(p.entry)}</td><td class="mono">${fmt(p.lots_held)}</td><td class="mono">${fmt(p.close_lots)}</td><td class="mono">${sign(p.realized)}</td></tr>`).join('')}
+      ${rd.plan.map(p => `<tr><td class="mono">${fmt(p.entry)}${p.core ? ' <span class="tag-core">核心</span>' : ''}</td><td class="mono">${fmt(p.lots_held)}</td><td class="mono">${fmt(p.close_lots)}</td><td class="mono">${sign(p.realized)}</td></tr>`).join('')}
       </table></div>
       ${rd.after ? `<div class="grid" style="margin-top:8px;">
         <div class="kv"><span>減碼後槓桿</span><span class="mono">${fmt(rd.after.leverage, 1)} 倍</span></div>
@@ -259,8 +285,8 @@ function render(r) {
       <div class="kv"><span>加完總手數</span><span class="mono">${fmt(a.total_lots)}</span></div>
       <div class="kv"><span>加完均價</span><span class="mono">${fmt(a.avg_price)}</span></div>
       <div class="kv"><span>加完槓桿</span><span class="mono">${fmt(a.leverage, 1)} 倍</span></div>
-      <div class="kv"><span>停損 ${fmt(a.stop)} 保住</span><span class="mono">${sign(a.kept_at_stop)}</span></div>
-    </div><div class="hint" style="margin-top:6px;">手數卡在：${esc(a.why)}</div>`
+      <div class="kv"><span>${s.core_lots > 0 ? '加碼單' : ''}停損 ${fmt(a.stop)}，全部打到保住</span><span class="mono">${sign(a.kept_at_stop)}</span></div>
+    </div><div class="hint" style="margin-top:6px;">手數卡在：${esc(a.why)}${a.stop_is_default ? `；加碼單停損用預設距離（現價 ∓ ${r.params.add_step} 點），要改就填「加碼單停損」或規則裡的加碼停損距` : ''}</div>`
     : `<div class="hint">現在不加：${esc(a.why)}${a.stop_is_lock_line ? '（停損還沒填，用保住浮盈的停損線試算，停損剛好在那條線上就沒有加碼空間）' : ''}</div>`}
   </div>`;
 
@@ -307,13 +333,14 @@ function renderLevels() {
     let kept = '';
     if (last && valid) {
       const k = last.status.floating + s * last.status.per_point * (p - last.price);
-      kept = `打到保住 ${sign(k)}`;
+      kept = `全部在這出場保住 ${sign(k)}`;
     }
     return `<div class="lv"><div><span class="mono">${fmt(p)}</span> <span class="src">${esc(lv.source)}</span><div class="src">${kept}</div></div>
-      ${valid ? `<button data-p="${p}">用這個</button>` : '<span class="src">在現價另一側</span>'}</div>`;
+      ${valid ? (hasCore() ? `<span style="display:flex;gap:4px;"><button data-p="${p}" data-f="core_stop">核心</button><button data-p="${p}" data-f="stop">加碼</button></span>`
+                           : `<button data-p="${p}" data-f="stop">用這個</button>`) : '<span class="src">在現價另一側</span>'}</div>`;
   });
   $('lvList').innerHTML = list.join('') || '<div class="hint">現價這一側沒有結構價位</div>';
-  $('lvList').querySelectorAll('button[data-p]').forEach(b => b.onclick = () => { $('stop').value = b.dataset.p; schedule(); });
+  $('lvList').querySelectorAll('button[data-p]').forEach(b => b.onclick = () => { $(b.dataset.f).value = b.dataset.p; schedule(); });
 }
 
 $('addPos').onclick = () => posRow();
@@ -321,6 +348,8 @@ document.querySelectorAll('#dirSeg button').forEach(b => b.onclick = () => setDi
 FIELDS.forEach(f => $(f).addEventListener('input', schedule));
 $('trail_stop').addEventListener('change', schedule);
 $('clearStop').onclick = () => { $('stop').value = ''; schedule(); };
+$('clearCoreStop').onclick = () => { $('core_stop').value = ''; schedule(); };
+$('core_mode').addEventListener('change', schedule);
 $('lvBox').addEventListener('toggle', () => { if ($('lvBox').open && !levels) loadLevels(); });
 $('useBinance').onclick = async () => {
   try {
@@ -331,7 +360,7 @@ $('useBinance').onclick = async () => {
 
 // ---- r125：MT5 同步(唯讀) ----
 const PW_KEY = 'rollSync.pw';
-const RULE_KEYS = ['max_leverage', 'lock_pct', 'add_step', 'add_lots', 'cost_points', 'contract_size'];
+const RULE_KEYS = ['max_leverage', 'lock_pct', 'add_step', 'add_lots', 'cost_points', 'contract_size', 'add_stop_points', 'core_mode'];
 let syncPwVal = null, syncTimer = null, syncRules = null;
 try { syncPwVal = localStorage.getItem(PW_KEY); } catch (e) { syncPwVal = null; }
 
@@ -339,9 +368,10 @@ function fillFromSync(inp) {
   if (!inp) return;
   if (direction !== inp.direction) setDir(inp.direction, false);
   const rows = [...document.querySelectorAll('.pos-row')];
-  const cur = rows.map(r => [r.querySelector('.lots').value, r.querySelector('.entry').value].join('@')).join('|');
-  const want = inp.positions.map(p => [p.lots, p.entry].join('@')).join('|');
-  if (cur !== want) { rows.forEach(r => r.remove()); inp.positions.forEach(p => posRow(p.lots, p.entry)); }
+  const cur = rows.map(r => [r.querySelector('.lots').value, r.querySelector('.entry').value, r.querySelector('.core').checked].join('@')).join('|');
+  const want = inp.positions.map(p => [p.lots, p.entry, !!p.core].join('@')).join('|');
+  if (cur !== want) { rows.forEach(r => r.remove()); inp.positions.forEach(p => posRow(p.lots, p.entry, !!p.core)); }
+  $('core_stop').value = (inp.core_stop === null || inp.core_stop === undefined) ? '' : inp.core_stop;
   $('price').value = inp.price;
   $('balance').value = inp.balance;
   $('equity').value = inp.equity;
@@ -353,7 +383,8 @@ function showRules() {
   $('ruleSync').style.display = '';
   const r = syncRules;
   $('ruleServer').textContent = `目前的通知規則（Telegram 提醒用）：槓桿 ≤ ${r.max_leverage} 倍、停損保住 ${r.lock_pct}% 浮盈、`
-    + `每 ${r.add_step} 點加碼（${r.add_lots ? r.add_lots + ' 手' : '手數＝最小那筆'}）、成本 ${r.cost_points} 點`;
+    + `每 ${r.add_step} 點加碼（${r.add_lots ? r.add_lots + ' 手' : '手數＝最小那筆'}）、成本 ${r.cost_points} 點、`
+    + `核心單：${r.core_mode === 'none' ? '不分' : '最早開的那筆'}`;
 }
 
 async function syncPoll(force = false) {
