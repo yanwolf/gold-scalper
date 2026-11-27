@@ -44,6 +44,7 @@ from app import backtest_jobs
 from app import position_roll   # r124：滾倉計算器(純計算，不碰交易所)
 from app import roll_sync   # r125：真實帳戶(MT5 唯讀 EA)同步＋滾倉提醒，不下單
 from app import basis as basis_module   # r128：幣安↔券商價差紀錄
+from app import roll_exec   # r129：滾倉自動執行(兩把鑰匙：伺服器模式＋EA AllowTrading)
 
 logger = logging.getLogger("main")
 
@@ -1559,6 +1560,15 @@ async def tools_roll_sync(request: Request, payload: dict = Body(...)):
     ok, error = roll_sync.receive(payload, request.headers.get("x-token"))
     if not ok:
         return JSONResponse({"ok": False, "error": error}, status_code=401 if error == "token 不對" else 400)
+    if request.headers.get("x-proto") == "2":
+        # r129：EA v2 要純文字回應(第一行 OK|mode，之後是指令)；算錯也不能讓 EA 以為回報失敗
+        from fastapi.responses import PlainTextResponse
+        try:
+            body = roll_sync.exec_response(payload)
+        except Exception as e:
+            logger.exception(f"滾倉執行：計算失敗: {e}")
+            body = "OK|error"
+        return PlainTextResponse(body)
     return {"ok": True}
 
 
@@ -1571,6 +1581,20 @@ async def tools_roll_account(payload: dict = Body(...)):
     if not ok:
         return {"success": False, "error": error}
     return {"success": True, **roll_sync.status()}
+
+
+@app.post("/tools/roll-exec-mode")
+async def tools_roll_exec_mode(payload: dict = Body(...)):
+    """r129：切換自動執行模式 off／dry(試跑)／live(執行)，要密碼、寫審計。"""
+    ok, error = settings_module.verify_password(payload.get("password", ""))
+    if not ok:
+        return {"success": False, "error": error}
+    try:
+        mode = roll_exec.set_mode(str(payload.get("mode", "")))
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    db.insert_settings_audit("roll_exec_mode", detail={"mode": mode})
+    return {"success": True, "mode": mode}
 
 
 @app.post("/tools/roll-rules")

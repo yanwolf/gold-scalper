@@ -288,6 +288,26 @@ def init_schema():
                         detail JSONB
                     );
                 """)
+                # r128：幣安↔券商價差(每分鐘彙總)與休市後開盤事件，只看資料、跟交易無關
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS basis_minutes (
+                        minute BIGINT PRIMARY KEY,
+                        n INTEGER NOT NULL,
+                        sum DOUBLE PRECISION NOT NULL,
+                        sumsq DOUBLE PRECISION NOT NULL,
+                        min DOUBLE PRECISION NOT NULL,
+                        max DOUBLE PRECISION NOT NULL,
+                        cfd_mid DOUBLE PRECISION,
+                        bn_mid DOUBLE PRECISION
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS basis_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        detail JSONB NOT NULL
+                    );
+                """)
             conn.commit()
 
             # 舊版部署可能還有 tp_price 欄位且是 NOT NULL(固定停利機制的殘留)，
@@ -1474,3 +1494,86 @@ def list_backtest_jobs(limit=10):
     except Exception as e:
         logger.warning(f"讀取回測任務清單失敗: {e}")
         return False, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# r128：幣安↔券商價差紀錄(app/basis.py)。盡力而為：沒有資料庫就是空的
+# ---------------------------------------------------------------------------
+
+def save_basis_minute(rec):
+    if not _enabled:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO basis_minutes (minute, n, sum, sumsq, min, max, cfd_mid, bn_mid)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (minute) DO UPDATE SET n = EXCLUDED.n, sum = EXCLUDED.sum, sumsq = EXCLUDED.sumsq,
+                        min = EXCLUDED.min, max = EXCLUDED.max, cfd_mid = EXCLUDED.cfd_mid, bn_mid = EXCLUDED.bn_mid;
+                    """,
+                    (rec["m"], rec["n"], rec["sum"], rec["sumsq"], rec["min"], rec["max"], rec.get("cfd"), rec.get("bn")),
+                )
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"寫入價差紀錄失敗: {e}")
+
+
+def load_basis_minutes(days=14):
+    if not _enabled:
+        return []
+    import time as _t
+    lo = int((_t.time() - days * 86400) // 60)
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT minute, n, sum, sumsq, min, max, cfd_mid, bn_mid FROM basis_minutes "
+                            "WHERE minute >= %s ORDER BY minute;", (lo,))
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"讀取價差紀錄失敗: {e}")
+        return []
+    return [{"m": r[0], "n": r[1], "sum": r[2], "sumsq": r[3], "min": r[4], "max": r[5], "cfd": r[6], "bn": r[7]}
+            for r in rows]
+
+
+def insert_basis_event(ev):
+    if not _enabled:
+        return
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO basis_events (detail) VALUES (%s);", (json.dumps(ev, ensure_ascii=False),))
+            conn.commit()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"寫入開盤事件失敗: {e}")
+
+
+def load_basis_events(limit=30):
+    if not _enabled:
+        return []
+    try:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT detail FROM basis_events ORDER BY id DESC LIMIT %s;", (limit,))
+                rows = cur.fetchall()
+        finally:
+            _pool.putconn(conn)
+    except Exception as e:
+        logger.warning(f"讀取開盤事件失敗: {e}")
+        return []
+    out = []
+    for (d,) in reversed(rows):
+        out.append(d if isinstance(d, dict) else json.loads(d))
+    return out

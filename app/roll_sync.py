@@ -390,6 +390,13 @@ def _check_add(r, inputs, rules, label):
              else "成交後記得把舊單停損也設成同一個價位"))
 
 
+def exec_response(payload, now=None):
+    """r129：EA v2 回報後要給它的純文字回應(見 app/roll_exec.py)。"""
+    from app import roll_exec
+    view = account_view(now)
+    return roll_exec.handle(view, payload, get_rules(), _send, _label(view), now=now)
+
+
 def _loop():
     while True:
         time.sleep(CHECK_SECONDS)
@@ -417,5 +424,12 @@ def status(now=None):
     v = account_view(now)
     with _lock:
         alerts = {k: {"text": a["text"], "times": a["times"]} for k, a in _state["alerts"].items()}
-    return {**v, "rules": get_rules() if enabled() else None, "active_alerts": alerts,
+    out = {**v, "rules": get_rules() if enabled() else None, "active_alerts": alerts,
             "symbol_hint": symbol_hint()}
+    if enabled():
+        from app import roll_exec
+        with _lock:
+            snap = _state["snapshot"] or {}
+        out["exec"] = {**roll_exec.status(), "ea_version": snap.get("version"),
+                       "ea_allow_trading": snap.get("allow_trading")}
+    return out

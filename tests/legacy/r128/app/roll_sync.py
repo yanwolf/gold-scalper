@@ -21,7 +21,7 @@ import os
 import threading
 import time
 
-from app import position_roll
+from app import basis, position_roll
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,14 @@ def receive(payload, given_token, now=None):
     with _lock:
         _state["snapshot"] = payload
         _state["received_at"] = now
+    try:
+        # r128：順便記錄幣安↔券商價差(EA 會送圖表商品的報價，沒持倉也有)
+        hint = symbol_hint()
+        tick = next((v for k, v in (payload.get("ticks") or {}).items() if hint in str(k).upper()), None)
+        if isinstance(tick, dict):
+            basis.record(tick, now=now)
+    except Exception as e:
+        logger.exception(f"滾倉同步：記錄價差失敗: {e}")
     try:
         evaluate(now)
     except Exception as e:      # 檢查出錯不能讓 EA 以為回報失敗
@@ -304,13 +312,61 @@ def evaluate(now=None):
             if r["stop"]["kept"] is not None and r["stop"]["kept"] < 0:
                 active["principal"] = ((inputs["stop"], inputs.get("core_stop")),
                                        f"🚨 停損全部打到會虧到本金 {abs(r['stop']['kept']):.2f}")
+            lock = _lock_alert(r, inputs)
+            if lock:
+                active["lock"] = lock
             _check_add(r, inputs, rules, label)
+        wk = _weekend_alert(view, inputs, rules, now)
+        if wk:
+            active["weekend"] = wk
     for key, (sig, text) in active.items():
         _raise(key, sig, text, now, label)
     _resolve_missing(set(active), label)
     if not view["positions"]:
         _state["add_keys"].clear()
     return set(active)
+
+
+def _weekend_alert(view, inputs, rules, now):
+    """
+    r128：券商休市(週末、每日休息)時，幣安還在交易。幣安價 + 收盤前價差 已經越過某張單的停損 →
+    開盤很可能直接開在停損外面，停損會用開盤價成交。提前通知，附預估多吐回多少。sig＝哪幾張單越過。
+    """
+    proj = basis.projected_cfd(now) if basis.is_closed() else None
+    if not proj:
+        return None
+    s = 1 if inputs["direction"] == "long" else -1
+    cs = float(rules.get("contract_size") or 100)
+    p = proj["projected"]
+    crossing = [q for q in view["positions"] if float(q.get("sl") or 0) > 0 and s * (p - float(q["sl"])) <= 0]
+    if not crossing:
+        return None
+    extra = sum(float(q["volume"]) * cs * s * (float(q["sl"]) - p) for q in crossing)
+    word = "跌破" if s == 1 else "漲破"
+    lines = "、".join(f"{float(q['price']):g} 那筆停損 {float(q['sl']):g}" for q in crossing)
+    return (tuple(sorted(str(q.get("ticket")) for q in crossing)),
+            f"🌙 休市預警：幣安 {proj['binance']:.2f} ＋ 收盤前價差 {proj['close_basis']:+.2f} ＝ 券商約 {p:.2f}，"
+            f"已經{word}：{lines}\n開盤可能直接開在停損外面，照這個價出場會比停損多吐回約 {extra:.2f}")
+
+
+def _lock_alert(r, inputs):
+    """
+    r127：浮盈變大後，要保住的金額跟著變大；停損全部打到保住的錢不夠時提醒上移(空單下移)哪一個停損、移到哪。
+    sig＝(哪一個停損, 目前停損價)：價格一直動、停損線一直變，不會每次回報都發；停損改過還不夠就馬上再提醒一次。
+    """
+    st = r["stop"]
+    if st["kept"] is None or st["lock_line"] is None or r["status"]["floating"] <= 0:
+        return None
+    if st["kept"] >= st["keep_required"] - 1e-6:
+        return None
+    s = 1 if inputs["direction"] == "long" else -1
+    target = st["lock_target"]
+    which = {"all": "停損", "add": "加碼單停損", "core": "核心單停損"}[target]
+    cur = inputs.get("core_stop") if target == "core" else inputs.get("stop")
+    move = "上移" if s == 1 else "下移"
+    return ((target, cur),
+            f"⚠️ 浮盈變大了，{which}要{move}到 {st['lock_line']:.2f}{'以上' if s == 1 else '以下'}（目前 {cur:g}）\n"
+            f"停損全部打到現在只保住 {st['kept']:.2f}，要保住 {st['lock_pct']:g}% 浮盈＝{st['keep_required']:.2f}")
 
 
 def _check_add(r, inputs, rules, label):

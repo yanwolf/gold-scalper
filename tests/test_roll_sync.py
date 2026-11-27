@@ -316,12 +316,14 @@ class Endpoints(unittest.TestCase):
 
 
 class EaFile(unittest.TestCase):
-    def test_ea_is_read_only(self):
+    def test_ea_is_read_only_by_default(self):
         with open(os.path.join(ROOT, "windows", "TzujenRollSync.mq5"), encoding="utf-8") as f:
             src = f.read()
         self.assertIn('"/tools/roll-sync"', src)
         self.assertIn("X-Token", src)
-        for banned in ("#include", "OrderSend", "CTrade", "PositionClose", "PositionModify", "OrderModify"):
+        # r129 起 EA 能執行指令，但預設關著(AllowTrading=false)＝跟 r125 一樣只回報；細節見 test_roll_exec
+        self.assertIn("input bool   AllowTrading = false;", src)
+        for banned in ("OrderSend(", "PositionClose", "OrderModify"):
             self.assertNotIn(banned, src)
 
     def test_installer_cmd_is_ascii(self):

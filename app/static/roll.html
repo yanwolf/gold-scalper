@@ -66,7 +66,7 @@
 </header>
 
 <div class="card" id="syncCard" style="display:none;">
-  <h2>MT5 同步（唯讀）</h2>
+  <h2>MT5 同步</h2>
   <div id="syncLogin" style="display:none;">
     <div class="hint" style="margin-bottom:6px;">真實帳戶的餘額與持倉要密碼（設定頁那組）才能看，輸入一次會記在這支手機。</div>
     <div class="row"><input type="password" id="syncPw" placeholder="密碼" style="flex:1;" /><button id="syncGo">連線</button></div>
@@ -76,6 +76,15 @@
     <div class="row" style="margin-top:6px;"><label style="min-width:auto;"><input type="checkbox" id="syncAuto" checked /> 自動帶入（每 5 秒）</label>
       <button id="syncForget" style="margin-left:auto;">登出</button></div>
     <div id="syncIssues"></div>
+    <div id="execBox" style="display:none; border-top:1px solid var(--grid); margin-top:8px; padding-top:8px;">
+      <h2>自動執行（第 2 步）</h2>
+      <div id="execHead" class="hint"></div>
+      <div class="seg" id="execSeg" style="margin:8px 0;">
+        <button data-mode="off">關閉</button><button data-mode="dry">試跑</button><button data-mode="live">執行</button>
+      </div>
+      <div id="execPlan"></div>
+      <div id="execMsg" class="hint"></div>
+    </div>
   </div>
   <div id="syncErr" class="err"></div>
 </div>
@@ -434,6 +443,7 @@ async function syncPoll(force = false) {
       + `　${r.positions.length} 筆黃金持倉`;
   }
   $('syncIssues').innerHTML = (r.issues || []).map(i => `<div class="act ${i.level}">${esc(i.text)}</div>`).join('');
+  renderExec(r.exec);
   if ($('syncAuto').checked && r.connected && r.inputs) { fillFromSync(r.inputs); schedule(); }
   syncTimer = setTimeout(syncPoll, 5000);
 }
@@ -469,6 +479,49 @@ $('ruleSave').onclick = async () => {
     else $('ruleMsg').textContent = r.error || '存檔失敗';
   } catch (e) { $('ruleMsg').textContent = '連不到服務'; }
 };
+
+// ---- r129：自動執行 ----
+const MODE_TXT = {off: '關閉（不計算）', dry: '試跑（只算、只發通知，不動單）', live: '執行（EA 也開了才會真的動單）'};
+function renderExec(x) {
+  if (!x) { $('execBox').style.display = 'none'; return; }
+  $('execBox').style.display = '';
+  document.querySelectorAll('#execSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === x.mode));
+  const ea = x.ea_version ? `EA v${esc(x.ea_version)}，AllowTrading：${x.ea_allow_trading ? '開' : '關'}` : 'EA 還沒回報版本';
+  let head = `伺服器模式：<b>${esc(MODE_TXT[x.mode] || x.mode)}</b>　${ea}　自動加碼單每張上限 ${x.max_auto_lots} 手`;
+  if (x.mode === 'live' && x.ea_version && !x.ea_allow_trading) head += `<div class="act warn" style="margin-top:6px;">伺服器是執行模式，但 EA 的 AllowTrading 沒開，不會動單</div>`;
+  if (x.mode === 'live' && x.ea_version && String(x.ea_version) < '2') head += `<div class="act alarm" style="margin-top:6px;">EA 是舊版（v1），收不到指令，要重新安裝 v2</div>`;
+  $('execHead').innerHTML = head;
+  const p = x.plan;
+  let h = '';
+  if (p) {
+    h += (p.blocked || []).map(b => `<div class="act alarm">暫停：${esc(b)}</div>`).join('');
+    h += (p.actions || []).length
+      ? (p.actions || []).map(a => `<div class="act ok">${x.mode === 'live' ? '要做' : '試跑會做'}：${esc(actText(a))}</div>`).join('')
+      : (p.blocked || []).length ? '' : '<div class="hint">目前沒有要做的事</div>';
+    h += (p.notes || []).map(n => `<div class="act info">${esc(n)}</div>`).join('');
+  }
+  if ((x.results || []).length) {
+    h += '<div class="hint" style="margin-top:6px;">最近執行結果：</div>' + x.results.slice().reverse().map(r =>
+      `<div class="act ${r.ok ? 'ok' : 'alarm'}">${r.ok ? '成功' : '失敗'}：${esc(r.msg || r.id)}</div>`).join('');
+  }
+  $('execPlan').innerHTML = h;
+}
+function actText(a) {
+  if (a.op === 'MOD') return `#${a.ticket} 停損 ${a.from} → ${a.to}（${a.why}）`;
+  if (a.op === 'PEND') return `掛 ${a.type} ${a.volume} 手 @ ${a.price}，停損 ${a.sl}（${a.why}）`;
+  return `刪除自動加碼單 #${a.ticket}（${a.why}）`;
+}
+document.querySelectorAll('#execSeg button').forEach(b => b.onclick = async () => {
+  const mode = b.dataset.mode;
+  if (mode === 'live' && !confirm('切到「執行」：EA 的 AllowTrading 也開著的話，程式會真的改停損、掛加碼單。確定？')) return;
+  $('execMsg').textContent = '切換中…';
+  try {
+    const r = await (await fetch('/tools/roll-exec-mode', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                         body: JSON.stringify({password: syncPwVal, mode})})).json();
+    $('execMsg').textContent = r.success ? `已切到 ${MODE_TXT[r.mode]}` : (r.error || '切換失敗');
+    syncPoll();
+  } catch (e) { $('execMsg').textContent = '連不到服務'; }
+});
 
 // ---- r128：幣安↔券商價差 ----
 function basisRow(name, x) {

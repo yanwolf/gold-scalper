@@ -1,4 +1,4 @@
-﻿# 把 TzujenRollSync(唯讀同步，不下單)裝進這台電腦所有的 MT5，並自動編譯
+﻿# 把 TzujenRollSync(回報持倉；參數 AllowTrading 開了才會照伺服器指令收緊停損／掛加碼單)裝進這台電腦所有的 MT5，並自動編譯
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Set-Location -Path $PSScriptRoot
@@ -44,7 +44,7 @@ foreach ($d in $dirs) {
 if ($n -eq 0) { Write-Host '找到 MT5 資料夾，但找不到 metaeditor64.exe。' -ForegroundColor Red; Pause-Exit 1 }
 
 Write-Host ''
-Write-Host '這支 EA 只回報、不下單。只要掛在 Vantage 那個 MT5 上，Pepperstone 那個不用掛。' -ForegroundColor Cyan
+Write-Host 'v2：預設只回報（AllowTrading=false）。只要掛在 Vantage 那個 MT5 上，Pepperstone 那個不用掛。' -ForegroundColor Cyan
 Write-Host ''
 Write-Host '接下來在 Vantage 的 MT5 裡做三件事：' -ForegroundColor Cyan
 Write-Host '  1. 工具 → 選項 → EA交易：勾選「允許演算法交易」與「允許 WebRequest 的網址」，加入 https://gold-live.tzujenlab.com'
