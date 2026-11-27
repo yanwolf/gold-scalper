@@ -29,6 +29,9 @@ def snap(positions, balance=788.77, equity=1676.27, bid=3672.09, ask=3672.29):
 
 
 def fresh():
+    from app import basis
+    basis.reset()
+    basis._state["loaded"] = True          # 不讀資料庫
     S._state.update({"snapshot": None, "received_at": None, "rules": None, "alerts": {}, "disconnected": False,
                      "had_positions": False, "add_keys": set(), "last_eval": None, "sent": []})
 

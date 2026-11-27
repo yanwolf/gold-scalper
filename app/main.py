@@ -43,6 +43,7 @@ from app import daily_smc
 from app import backtest_jobs
 from app import position_roll   # r124：滾倉計算器(純計算，不碰交易所)
 from app import roll_sync   # r125：真實帳戶(MT5 唯讀 EA)同步＋滾倉提醒，不下單
+from app import basis as basis_module   # r128：幣安↔券商價差紀錄
 
 logger = logging.getLogger("main")
 
@@ -1601,7 +1602,7 @@ async def tools_roll_levels(direction: str = "long"):
     except (TypeError, ValueError):
         price = None
     if price is None:
-        return {"binance_price": None, "levels": [], "error": "幣安報價還沒到，先手動填停損"}
+        return {"binance_price": None, "levels": [], "basis": basis_module.current(), "error": "幣安報價還沒到，先手動填停損"}
 
     def _chan(interval):
         candles = binance_streamer.get_recent_candles(interval_seconds=interval, limit=600)
@@ -1622,7 +1623,14 @@ async def tools_roll_levels(direction: str = "long"):
         errors.append(f"日線：{e}")
     return {"binance_price": round(price, 2), "direction": direction,
             "levels": position_roll.structure_levels(direction, chans, daily, price),
+            "basis": basis_module.current(),   # r128：有實測價差時網頁用它換算，不用手動算現價差
             "error": "；".join(errors) or None}
+
+
+@app.get("/tools/basis")
+async def tools_basis():
+    """r128：幣安↔券商價差的現況、24 小時／7 天統計、最近幾次休市後開盤。不含帳戶資料。"""
+    return basis_module.report()
 
 
 @app.websocket("/ws/price")

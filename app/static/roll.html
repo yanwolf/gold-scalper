@@ -138,6 +138,13 @@
   </details>
 </div>
 
+<div class="card">
+  <details id="basisBox">
+    <summary>幣安 ↔ 券商價差（實測）</summary>
+    <div id="basisOut" class="hint">載入中…</div>
+  </details>
+</div>
+
 <div id="out"></div>
 
 <script>
@@ -321,9 +328,17 @@ function renderLevels() {
   if (!levels) return;
   const bp = levels.binance_price;
   const price = parseFloat($('price').value);
-  const off = (bp && price) ? price - bp : 0;
-  let info = bp ? `幣安 XAUUSDT ${fmt(bp)}` + (price ? `，券商現價差 ${sign(off)} 點，下面已換算成券商價` : '，填了券商現價才會換算') : '';
-  if (bp && price && Math.abs(off) > 20) info += `<div class="err" style="margin-top:4px;">兩邊差超過 20 點，可能不是同一個商品或報價沒更新——這些價位只能參考。</div>`;
+  const measured = levels.basis && levels.basis.basis !== null && levels.basis.basis !== undefined;
+  // r128：有實測價差(EA 同步的券商報價 − 幣安)就用它；沒有才用「填的現價 − 幣安價」
+  const off = measured ? levels.basis.basis : ((bp && price) ? price - bp : 0);
+  let info = '';
+  if (bp && measured) {
+    info = `幣安 XAUUSDT ${fmt(bp)}，用實測價差 ${sign(off)} 點換算成券商價`
+      + (levels.basis.source === 'close' ? '（券商休市中，用收盤前的價差）' : `（${levels.basis.age_seconds} 秒前）`);
+  } else if (bp) {
+    info = `幣安 XAUUSDT ${fmt(bp)}` + (price ? `，券商現價差 ${sign(off)} 點，下面已換算成券商價` : '，填了券商現價才會換算');
+  }
+  if (bp && Math.abs(off) > 20) info += `<div class="err" style="margin-top:4px;">兩邊差超過 20 點，可能不是同一個商品或報價沒更新——這些價位只能參考。</div>`;
   if (levels.error) info += `<div class="hint">${esc(levels.error)}</div>`;
   $('lvInfo').innerHTML = info || '沒有資料';
   const s = direction === 'long' ? 1 : -1;
@@ -454,6 +469,37 @@ $('ruleSave').onclick = async () => {
     else $('ruleMsg').textContent = r.error || '存檔失敗';
   } catch (e) { $('ruleMsg').textContent = '連不到服務'; }
 };
+
+// ---- r128：幣安↔券商價差 ----
+function basisRow(name, x) {
+  if (!x || !x.samples) return `<tr><td>${name}</td><td colspan="6" class="muted">還沒有資料</td></tr>`;
+  const d15 = x.drift['15'] || {}, d60 = x.drift['60'] || {};
+  return `<tr><td>${name}</td><td class="mono">${sign(x.mean)}</td><td class="mono">${fmt(x.std)}</td>
+    <td class="mono">${fmt(x.p5)}～${fmt(x.p95)}</td><td class="mono">${fmt(x.min)}～${fmt(x.max)}</td>
+    <td class="mono">${fmt(d15.p95)} / ${fmt(d15.max)}</td><td class="mono">${fmt(d60.p95)} / ${fmt(d60.max)}</td></tr>`;
+}
+async function loadBasis() {
+  let r;
+  try { r = await (await fetch('/tools/basis')).json(); } catch (e) { $('basisOut').textContent = '連不到服務'; return; }
+  const c = r.current || {};
+  let h = c.basis === null || c.basis === undefined
+    ? '<div class="hint">還沒有實測資料：要等 Vantage 的 MT5 掛上 TzujenRollSync、券商開盤中才會開始記錄。</div>'
+    : `<div class="kv"><span>${c.source === 'close' ? '券商休市中，收盤前價差' : '現在價差（券商 − 幣安）'}</span><span class="mono">${sign(c.basis)} 點</span></div>`;
+  h += `<div class="scroll" style="margin-top:8px;"><table>
+    <tr><th>期間</th><th>平均</th><th>標準差</th><th>5%～95%</th><th>最低～最高</th><th>15分漂移 95%/最大</th><th>60分漂移 95%/最大</th></tr>
+    ${basisRow('24 小時', r.day)}${basisRow('7 天', r.week)}</table></div>
+    <div class="hint" style="margin-top:6px;">「漂移」＝同一筆單抱 15／60 分鐘期間價差變了多少。拿來跟停損距離比：漂移遠小於停損就不用管，接近停損的幾成就要注意。</div>`;
+  if (r.events && r.events.length) {
+    h += `<h2 style="margin-top:10px;">休市後開盤</h2><div class="scroll"><table>
+      <tr><th>開盤</th><th>休市</th><th>券商跳空</th><th>幣安休市中走了</th><th>預估開盤誤差</th></tr>
+      ${r.events.map(e => `<tr><td>${esc((e.reopened_at || '').slice(5, 16).replace('T', ' '))}</td><td class="mono">${e.closed_minutes} 分</td>
+        <td class="mono">${sign(e.cfd_gap)}</td><td class="mono">${e.bn_move === null ? '--' : sign(e.bn_move)}</td>
+        <td class="mono">${e.projection_error === undefined || e.projection_error === null ? '--' : sign(e.projection_error)}</td></tr>`).join('')}
+      </table></div><div class="hint">預估開盤＝休市時幣安價 ＋ 收盤前價差；誤差越小，週末預警越準。時間是 UTC。</div>`;
+  }
+  $('basisOut').innerHTML = h;
+}
+$('basisBox').addEventListener('toggle', () => { if ($('basisBox').open) loadBasis(); });
 
 load();
 schedule();
