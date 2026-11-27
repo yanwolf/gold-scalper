@@ -30,6 +30,7 @@ from app import trading_core
 from app import abandoned
 from app import cost_profiles
 from app import trade_diagnostics
+from app import ext_signal
 from app import settings as settings_module
 from app import notifier as notifier_module
 from app import alert_cadence
@@ -2484,7 +2485,8 @@ class PaperTradingEngine:
             "stats_spread_adjusted": stats_spread_adjusted,
             "readiness_spread_adjusted": readiness_spread_adjusted,
             "mt5_view": mt5_view,   # r111：同一批交易用 MT5 券商成本重算(只是統計)
-            "zs_skips": getattr(self, "_zs_skips", 0),   # r118：重啟以來被「只做窄中樞」擋下的訊號步數
+            "zs_skips": getattr(self, "_zs_skips", 0),
+            "ext_signal": ext_signal.status(self.engine_id),   # r123：有沒有在把部位回報給 cfd-live(MT5)   # r118：重啟以來被「只做窄中樞」擋下的訊號步數
             "assumed_spread_points": spread_points,
             "slippage_impact": slippage_impact,
             "daily_smc_breakdown": daily_smc_breakdown,

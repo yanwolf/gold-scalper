@@ -41,6 +41,7 @@ from app import risk_guard
 from app import preflight as preflight_module
 from app import daily_smc
 from app import backtest_jobs
+from app import position_roll   # r124：滾倉計算器(純計算，不碰交易所)
 
 logger = logging.getLogger("main")
 
@@ -1522,6 +1523,63 @@ async def analysis_daily_smc(refresh: bool = False):
     except (TypeError, ValueError):
         price = None   # 報價還沒到或格式不對：區域改用最後一根日K收盤價分上下
     return daily_smc.get_snapshot(current_price=price)
+
+
+# ---------------------------------------------------------------------------
+# r124：倉位滾動(滾倉)計算器。純計算：不碰交易所、不碰引擎，lab／live 都開。
+# ---------------------------------------------------------------------------
+
+@app.get("/tools/roll")
+async def tools_roll_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "roll.html"))
+
+
+@app.post("/tools/roll-calc")
+async def tools_roll_calc(payload: dict = Body(...)):
+    """輸入目前持倉、現價、結餘(、淨值、停損、規則參數)，回傳現況、警示、減碼與加碼建議。見 app/position_roll.py。"""
+    try:
+        return position_roll.calc(payload)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/tools/roll-levels")
+async def tools_roll_levels(direction: str = "long"):
+    """
+    挑停損用的結構價位(幣安 XAUUSDT 價)：15分K／1小時K 纏論最近的筆端點與中樞、日線 SMC 區。
+    網頁用「券商現價 − 幣安現價」換算成券商價。只讀快取的K棒，不打網路。
+    """
+    direction = "short" if str(direction).lower() == "short" else "long"
+    price = None
+    try:
+        tick = binance_streamer.get_latest()
+        if isinstance(tick, dict) and tick.get("bid") and tick.get("ask"):
+            price = (float(tick["bid"]) + float(tick["ask"])) / 2
+    except (TypeError, ValueError):
+        price = None
+    if price is None:
+        return {"binance_price": None, "levels": [], "error": "幣安報價還沒到，先手動填停損"}
+
+    def _chan(interval):
+        candles = binance_streamer.get_recent_candles(interval_seconds=interval, limit=600)
+        return analyze_chan(candles) if candles else None
+
+    chans, errors = {}, []
+    for label, interval in (("15分K", 900), ("1小時K", 3600)):
+        try:
+            chans[label] = await asyncio.to_thread(_chan, interval)
+        except Exception as e:
+            logger.warning(f"滾倉計算器：{label} 纏論計算失敗: {e}")
+            errors.append(f"{label}：{e}")
+    try:
+        daily = daily_smc.get_snapshot(current_price=price)
+    except Exception as e:
+        logger.warning(f"滾倉計算器：日線SMC讀取失敗: {e}")
+        daily = None
+        errors.append(f"日線：{e}")
+    return {"binance_price": round(price, 2), "direction": direction,
+            "levels": position_roll.structure_levels(direction, chans, daily, price),
+            "error": "；".join(errors) or None}
 
 
 @app.websocket("/ws/price")

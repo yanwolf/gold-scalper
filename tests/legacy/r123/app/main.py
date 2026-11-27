@@ -31,6 +31,7 @@ from app.notifier import notifier
 from app.paper_trading import PAPER_TRADING_ENGINES
 from app.health_monitor import health_monitor
 from app import backtest as backtest_module
+from app import ext_signal   # r123：lab 引擎部位回報給 cfd-live(MT5 模擬帳戶)
 from app import sweep as sweep_module
 from app import settings as settings_module
 from app import execution as execution_module
@@ -78,6 +79,8 @@ async def startup_event():
     for engine in PAPER_TRADING_ENGINES.values():
         engine.start()  # 依角色載入的引擎平行啟動，各自獨立追蹤
     health_monitor.start()  # 放最後，確保要監控的元件都已經start()過了
+    # r123：把 lab 引擎的部位回報給 cfd-live，在 MT5 模擬帳戶照著下單(沒設定 EXT_SIGNAL_* 或是正式端就不啟動)
+    ext_signal.start(lambda: PAPER_TRADING_ENGINES)
     # r89：日線SMC結構參考，背景每30分鐘刷新一次(交易迴圈只讀快取，不會被網路卡住)
     daily_smc.start_refresher(symbol=execution_module.DEFAULT_SYMBOL)
     # 開機跑一次交易所相容性自檢(BINANCE_LESSONS.md)，異常發Telegram，

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>滾倉計算器</title>
+<style>
+  :root{
+    --bg:#0a0e17; --panel:#0f1420; --grid:#1c2436; --text:#e8ecf4; --muted:#6b7690;
+    --gold:#d4af37; --alarm:#e34c4c; --warn:#f0a030; --ok:#5b9cf0;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+        padding:14px; max-width:720px; margin:0 auto; font-size:14px; }
+  .mono{ font-family:'JetBrains Mono','SF Mono','Courier New',monospace; font-variant-numeric:tabular-nums; }
+  header{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:14px; }
+  header h1{ font-size:19px; }
+  header a{ color:var(--muted); font-size:13px; text-decoration:none; }
+  .card{ background:var(--panel); border:1px solid var(--grid); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .card h2{ font-size:13px; color:var(--gold); margin-bottom:8px; letter-spacing:.5px; }
+  .row{ display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .row label{ font-size:12.5px; color:var(--muted); min-width:4.5em; }
+  input, select{ background:var(--bg); border:1px solid var(--grid); color:var(--text); border-radius:6px;
+                 padding:8px; font-size:15px; min-width:0; max-width:100%; }
+  input[type=number]{ flex:1 1 90px; }
+  button{ background:var(--grid); color:var(--text); border:none; border-radius:6px; padding:8px 12px; font-size:13px; cursor:pointer; }
+  button:active{ opacity:.7; }
+  .seg{ display:flex; gap:0; flex:1; }
+  .seg button{ flex:1; border-radius:0; background:var(--bg); border:1px solid var(--grid); }
+  .seg button:first-child{ border-radius:6px 0 0 6px; }
+  .seg button:last-child{ border-radius:0 6px 6px 0; }
+  .seg button.on{ background:var(--gold); color:#111; font-weight:700; }
+  .pos-row{ display:flex; gap:6px; margin-bottom:6px; align-items:center; }
+  .pos-row input{ flex:1 1 0; }
+  .pos-row .x{ background:transparent; color:var(--muted); padding:6px 8px; }
+  .hint{ font-size:11.5px; color:var(--muted); line-height:1.6; }
+  details > summary{ cursor:pointer; color:var(--muted); font-size:12.5px; }
+  details[open] > summary{ margin-bottom:8px; }
+  .act{ border-left:3px solid var(--muted); padding:6px 10px; margin-bottom:6px; border-radius:4px; background:var(--bg); line-height:1.55; }
+  .act.alarm{ border-color:var(--alarm); }
+  .act.alarm::before{ content:"⚠ "; color:var(--alarm); }
+  .act.warn{ border-color:var(--warn); }
+  .act.ok{ border-color:var(--ok); }
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:6px 12px; }
+  .kv{ display:flex; justify-content:space-between; gap:8px; font-size:13px; border-bottom:1px dashed var(--grid); padding:3px 0; }
+  .kv span:first-child{ color:var(--muted); }
+  .over{ color:var(--alarm); font-weight:700; }
+  table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+  th{ color:var(--muted); font-weight:500; text-align:right; padding:4px 4px; white-space:nowrap; }
+  td{ text-align:right; padding:4px 4px; border-top:1px solid var(--grid); white-space:nowrap; }
+  th:first-child, td:first-child{ text-align:left; }
+  .scroll{ overflow-x:auto; }
+  .lv{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:5px 0; border-top:1px solid var(--grid); font-size:12.5px; }
+  .lv .src{ color:var(--muted); font-size:11.5px; }
+  .err{ color:var(--alarm); font-size:13px; }
+  .muted{ color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>滾倉計算器</h1>
+  <a href="/dashboard">← 回主畫面</a>
+</header>
+
+<div class="card">
+  <h2>持倉</h2>
+  <div class="row">
+    <label>方向</label>
+    <div class="seg" id="dirSeg">
+      <button data-dir="long" class="on">多單</button>
+      <button data-dir="short">空單</button>
+    </div>
+  </div>
+  <div class="hint" style="margin-bottom:6px;">每一筆：手數、進場價（照 MT5 持倉逐筆填）</div>
+  <div id="posList"></div>
+  <button id="addPos">＋ 新增一筆</button>
+</div>
+
+<div class="card">
+  <h2>帳戶與現價</h2>
+  <div class="row"><label>現價</label><input type="number" step="0.01" id="price" inputmode="decimal" placeholder="券商報價" />
+    <button id="useBinance">帶入幣安價</button></div>
+  <div class="row"><label>結餘</label><input type="number" step="0.01" id="balance" inputmode="decimal" placeholder="MT5「結餘」" /></div>
+  <div class="row"><label>淨值</label><input type="number" step="0.01" id="equity" inputmode="decimal" placeholder="選填，MT5「淨值」" /></div>
+  <div class="hint">淨值有填的話，跟價格算出來的差額（隔夜費、手續費）會帶進所有情境。</div>
+</div>
+
+<div class="card">
+  <h2>整體停損</h2>
+  <div class="row"><label>停損價</label><input type="number" step="0.01" id="stop" inputmode="decimal" placeholder="選填：所有部位一起出場的價位" />
+    <button id="clearStop">清除</button></div>
+  <details id="lvBox">
+    <summary>從結構挑停損（15分K／1小時K 纏論、日線 SMC）</summary>
+    <div id="lvInfo" class="hint">載入中…</div>
+    <div id="lvList"></div>
+  </details>
+</div>
+
+<div class="card">
+  <details id="ruleBox">
+    <summary id="ruleSum">規則</summary>
+    <div class="row"><label>槓桿上限</label><input type="number" step="0.5" id="max_leverage" value="10" /><span class="muted">倍（名目部位 ÷ 淨值）</span></div>
+    <div class="row"><label>保住浮盈</label><input type="number" step="5" id="lock_pct" value="50" /><span class="muted">%（打到停損時至少留下的浮盈；0＝保本金）</span></div>
+    <div class="row"><label>加碼間距</label><input type="number" step="1" id="add_step" value="30" /><span class="muted">點</span></div>
+    <div class="row"><label>每次加碼</label><input type="number" step="0.01" id="add_lots" placeholder="預設＝最小那筆" /><span class="muted">手</span></div>
+    <div class="row"><label>加碼階數</label><input type="number" step="1" id="ladder_steps" value="3" /></div>
+    <div class="row"><label>加碼成本</label><input type="number" step="0.1" id="cost_points" value="0.4" /><span class="muted">點（點差＋滑價）</span></div>
+    <div class="row"><label>合約大小</label><input type="number" step="1" id="contract_size" value="100" /><span class="muted">盎司／手</span></div>
+    <div class="row"><label>停損跟著移</label><input type="checkbox" id="trail_stop" checked /><span class="muted">每到一個加碼點，停損移同樣的距離</span></div>
+  </details>
+</div>
+
+<div id="out"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const FIELDS = ['price', 'balance', 'equity', 'stop', 'max_leverage', 'lock_pct', 'add_step', 'add_lots',
+                'ladder_steps', 'cost_points', 'contract_size'];
+const STORE = 'rollCalc.v1';
+let direction = 'long', last = null, levels = null, timer = null;
+
+function fmt(x, d = 2) { return (x === null || x === undefined) ? '--' : Number(x).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d}); }
+function sign(x) { return (x > 0 ? '+' : '') + fmt(x); }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
+
+function posRow(lots = '', entry = '') {
+  const d = document.createElement('div');
+  d.className = 'pos-row';
+  d.innerHTML = `<input type="number" step="0.01" inputmode="decimal" class="lots" placeholder="手數" value="${lots}">
+                 <input type="number" step="0.01" inputmode="decimal" class="entry" placeholder="進場價" value="${entry}">
+                 <button class="x" title="刪除">✕</button>`;
+  d.querySelector('.x').onclick = () => { d.remove(); schedule(); };
+  d.querySelectorAll('input').forEach(i => i.addEventListener('input', schedule));
+  $('posList').appendChild(d);
+}
+
+function gather() {
+  const body = {direction, trail_stop: $('trail_stop').checked,
+    positions: [...document.querySelectorAll('.pos-row')].map(r => ({lots: r.querySelector('.lots').value, entry: r.querySelector('.entry').value}))};
+  FIELDS.forEach(f => { body[f] = $(f).value; });
+  return body;
+}
+
+function save(body) { try { localStorage.setItem(STORE, JSON.stringify(body)); } catch (e) { /* 存不了就算了 */ } }
+function load() {
+  let b = null;
+  try { b = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { b = null; }
+  if (!b) { posRow(); posRow(); return; }
+  setDir(b.direction || 'long', false);
+  (b.positions && b.positions.length ? b.positions : [{}]).forEach(p => posRow(p.lots || '', p.entry || ''));
+  FIELDS.forEach(f => { if (b[f] !== undefined && b[f] !== null) $(f).value = b[f]; });
+  $('trail_stop').checked = b.trail_stop !== false;
+}
+
+function setDir(d, recalc = true) {
+  direction = d;
+  document.querySelectorAll('#dirSeg button').forEach(b => b.classList.toggle('on', b.dataset.dir === d));
+  levels = null;
+  if ($('lvBox').open) loadLevels();
+  if (recalc) schedule();
+}
+
+function ruleSummary() {
+  $('ruleSum').textContent = `規則：槓桿 ≤ ${$('max_leverage').value || '?'} 倍、停損保住 ${$('lock_pct').value || '?'}% 浮盈、`
+    + `每 ${$('add_step').value || '?'} 點加碼一次（${$('add_lots').value ? $('add_lots').value + ' 手' : '手數＝最小那筆'}）`;
+}
+
+function schedule() { ruleSummary(); clearTimeout(timer); timer = setTimeout(run, 300); }
+
+async function run() {
+  const body = gather();
+  save(body);
+  if (!body.price || !body.balance || !body.positions.some(p => p.lots && p.entry)) {
+    $('out').innerHTML = '<div class="card hint">填好持倉、現價、結餘就會開始算。</div>';
+    return;
+  }
+  let r;
+  try {
+    const resp = await fetch('/tools/roll-calc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    r = await resp.json();
+  } catch (e) {
+    $('out').innerHTML = `<div class="card err">連不到服務：${esc(e.message || e)}</div>`;
+    return;
+  }
+  if (!r.success) { $('out').innerHTML = `<div class="card err">${esc(r.error || '計算失敗')}</div>`; last = null; renderLevels(); return; }
+  last = r;
+  render(r);
+  renderLevels();
+}
+
+function render(r) {
+  const s = r.status, st = r.stop, cap = r.params.max_leverage;
+  const adv = r.direction === 'long' ? '跌到' : '漲到';
+  let h = '<div class="card"><h2>建議</h2>' + r.actions.map(a => `<div class="act ${a.level}">${esc(a.text)}</div>`).join('') + '</div>';
+
+  h += `<div class="card"><h2>現況</h2><div class="grid">
+    <div class="kv"><span>總手數</span><span class="mono">${fmt(s.lots)}</span></div>
+    <div class="kv"><span>均價</span><span class="mono">${fmt(s.avg_price)}</span></div>
+    <div class="kv"><span>浮動損益</span><span class="mono">${sign(s.floating)}</span></div>
+    <div class="kv"><span>淨值</span><span class="mono">${fmt(s.equity)}</span></div>
+    <div class="kv"><span>每 1 點</span><span class="mono">${fmt(s.per_point)} 美元</span></div>
+    <div class="kv"><span>實際槓桿</span><span class="mono ${s.leverage === null || s.leverage > cap ? 'over' : ''}">${s.leverage === null ? '--' : fmt(s.leverage, 1) + ' 倍'}</span></div>
+    <div class="kv"><span>${adv}歸零</span><span class="mono">${fmt(s.zero_price)}</span></div>
+    <div class="kv"><span>距歸零</span><span class="mono">${fmt(s.points_to_zero)} 點</span></div>
+  </div>
+  ${s.adjustment ? `<div class="hint" style="margin-top:6px;">隔夜費／手續費等差額 ${sign(s.adjustment)}（已帶進所有情境）</div>` : ''}
+  ${s.leverage_cap_price ? `<div class="hint">價格在 ${fmt(s.leverage_cap_price)} 時槓桿剛好 ${cap} 倍</div>` : ''}
+  </div>`;
+
+  h += `<div class="card"><h2>停損</h2>
+    <div class="kv"><span>保住 ${st.lock_pct}% 浮盈的停損線</span><span class="mono">${st.keep_required > 0 ? fmt(st.lock_line) : '--'}</span></div>
+    <div class="kv"><span>要保住</span><span class="mono">${fmt(st.keep_required)}</span></div>
+    ${st.stop !== null ? `<div class="kv"><span>目前停損 ${fmt(st.stop)} 打到時保住</span><span class="mono ${st.kept < 0 ? 'over' : ''}">${sign(st.kept)}</span></div>
+    <div class="kv"><span>打到時淨值</span><span class="mono">${fmt(st.equity_at_stop)}</span></div>` : '<div class="hint" style="margin-top:6px;">還沒填停損：下面的加碼試算先用「保住浮盈的停損線」當停損。</div>'}
+  </div>`;
+
+  if (r.reduce) {
+    const rd = r.reduce;
+    h += `<div class="card"><h2>減碼（槓桿降到 ${cap} 倍內）</h2>
+      <div class="hint">平掉 ${fmt(rd.close_lots)} 手、留 ${fmt(rd.target_lots)} 手；成本最差的先平。平倉不會改變淨值，只會把浮盈變成結餘。</div>
+      <div class="scroll"><table><tr><th>進場價</th><th>持有</th><th>平掉</th><th>實現</th></tr>
+      ${rd.plan.map(p => `<tr><td class="mono">${fmt(p.entry)}</td><td class="mono">${fmt(p.lots_held)}</td><td class="mono">${fmt(p.close_lots)}</td><td class="mono">${sign(p.realized)}</td></tr>`).join('')}
+      </table></div>
+      ${rd.after ? `<div class="grid" style="margin-top:8px;">
+        <div class="kv"><span>減碼後槓桿</span><span class="mono">${fmt(rd.after.leverage, 1)} 倍</span></div>
+        <div class="kv"><span>結餘約</span><span class="mono">${fmt(rd.after.balance)}</span></div>
+        <div class="kv"><span>均價</span><span class="mono">${fmt(rd.after.avg_price)}</span></div>
+        <div class="kv"><span>${adv}歸零</span><span class="mono">${fmt(rd.after.zero_price)}</span></div>
+        ${rd.after.kept_at_stop !== null ? `<div class="kv"><span>打到停損保住</span><span class="mono">${sign(rd.after.kept_at_stop)}</span></div>` : ''}
+      </div>` : ''}
+    </div>`;
+  }
+
+  const a = r.add_now;
+  h += `<div class="card"><h2>現在加碼</h2>
+    ${a.lots > 0 ? `<div class="grid">
+      <div class="kv"><span>可加</span><span class="mono">${fmt(a.lots)} 手</span></div>
+      <div class="kv"><span>預估成交</span><span class="mono">${fmt(a.entry)}</span></div>
+      <div class="kv"><span>加完總手數</span><span class="mono">${fmt(a.total_lots)}</span></div>
+      <div class="kv"><span>加完均價</span><span class="mono">${fmt(a.avg_price)}</span></div>
+      <div class="kv"><span>加完槓桿</span><span class="mono">${fmt(a.leverage, 1)} 倍</span></div>
+      <div class="kv"><span>停損 ${fmt(a.stop)} 保住</span><span class="mono">${sign(a.kept_at_stop)}</span></div>
+    </div><div class="hint" style="margin-top:6px;">手數卡在：${esc(a.why)}</div>`
+    : `<div class="hint">現在不加：${esc(a.why)}${a.stop_is_lock_line ? '（停損還沒填，用保住浮盈的停損線試算，停損剛好在那條線上就沒有加碼空間）' : ''}</div>`}
+  </div>`;
+
+  h += `<div class="card"><h2>往後的加碼點</h2>
+    <div class="hint" style="margin-bottom:6px;">假設每到一個點都照「可加」的手數加${r.params.trail_stop ? '、停損跟著移' : '、停損不動'}。打到停損保住的錢要 ≥「要保住」才算過。</div>
+    <div class="scroll"><table>
+      <tr><th>價位</th><th>停損</th><th>可加</th><th>總手數</th><th>槓桿</th><th>停損保住</th><th>要保住</th></tr>
+      ${r.ladder.map(x => `<tr><td class="mono">${fmt(x.price)}</td><td class="mono">${fmt(x.stop)}</td>
+        <td class="mono" title="${esc(x.why)}">${x.add_lots > 0 ? fmt(x.add_lots) : '<span class="muted">0</span>'}</td>
+        <td class="mono">${fmt(x.total_lots)}</td><td class="mono ${x.leverage === null || x.leverage > cap ? 'over' : ''}">${x.leverage === null ? '--' : fmt(x.leverage, 1)}</td>
+        <td class="mono">${sign(x.kept_at_stop)}</td><td class="mono">${fmt(x.keep_required)}</td></tr>`).join('')}
+    </table></div>
+    <div class="hint" style="margin-top:6px;">可加是 0 的那一列：${esc((r.ladder.find(x => x.add_lots === 0) || {}).why || '—')}</div>
+  </div>
+  <div class="hint" style="padding:0 4px 20px;">只是風險試算，不是投資建議；停損滑價、跳空、券商強平線都沒算進去。</div>`;
+  $('out').innerHTML = h;
+}
+
+async function loadLevels() {
+  $('lvInfo').textContent = '載入中…';
+  $('lvList').innerHTML = '';
+  try {
+    const resp = await fetch('/tools/roll-levels?direction=' + direction);
+    levels = await resp.json();
+  } catch (e) {
+    levels = {levels: [], error: '連不到服務：' + (e.message || e)};
+  }
+  renderLevels();
+}
+
+function renderLevels() {
+  if (!levels) return;
+  const bp = levels.binance_price;
+  const price = parseFloat($('price').value);
+  const off = (bp && price) ? price - bp : 0;
+  let info = bp ? `幣安 XAUUSDT ${fmt(bp)}` + (price ? `，券商現價差 ${sign(off)} 點，下面已換算成券商價` : '，填了券商現價才會換算') : '';
+  if (bp && price && Math.abs(off) > 20) info += `<div class="err" style="margin-top:4px;">兩邊差超過 20 點，可能不是同一個商品或報價沒更新——這些價位只能參考。</div>`;
+  if (levels.error) info += `<div class="hint">${esc(levels.error)}</div>`;
+  $('lvInfo').innerHTML = info || '沒有資料';
+  const s = direction === 'long' ? 1 : -1;
+  const list = (levels.levels || []).map(lv => {
+    const p = Math.round((lv.price + off) * 100) / 100;
+    const valid = !price || s * (price - p) > 0;
+    let kept = '';
+    if (last && valid) {
+      const k = last.status.floating + s * last.status.per_point * (p - last.price);
+      kept = `打到保住 ${sign(k)}`;
+    }
+    return `<div class="lv"><div><span class="mono">${fmt(p)}</span> <span class="src">${esc(lv.source)}</span><div class="src">${kept}</div></div>
+      ${valid ? `<button data-p="${p}">用這個</button>` : '<span class="src">在現價另一側</span>'}</div>`;
+  });
+  $('lvList').innerHTML = list.join('') || '<div class="hint">現價這一側沒有結構價位</div>';
+  $('lvList').querySelectorAll('button[data-p]').forEach(b => b.onclick = () => { $('stop').value = b.dataset.p; schedule(); });
+}
+
+$('addPos').onclick = () => posRow();
+document.querySelectorAll('#dirSeg button').forEach(b => b.onclick = () => setDir(b.dataset.dir));
+FIELDS.forEach(f => $(f).addEventListener('input', schedule));
+$('trail_stop').addEventListener('change', schedule);
+$('clearStop').onclick = () => { $('stop').value = ''; schedule(); };
+$('lvBox').addEventListener('toggle', () => { if ($('lvBox').open && !levels) loadLevels(); });
+$('useBinance').onclick = async () => {
+  try {
+    const r = await (await fetch('/price/latest/binance')).json();
+    if (r.bid && r.ask) { $('price').value = ((parseFloat(r.bid) + parseFloat(r.ask)) / 2).toFixed(2); schedule(); }
+  } catch (e) { /* 沒報價就維持手填 */ }
+};
+load();
+schedule();
+</script>
+</body>
+</html>
