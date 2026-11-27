@@ -62,6 +62,21 @@
   <a href="/dashboard">← 回主畫面</a>
 </header>
 
+<div class="card" id="syncCard" style="display:none;">
+  <h2>MT5 同步（唯讀）</h2>
+  <div id="syncLogin" style="display:none;">
+    <div class="hint" style="margin-bottom:6px;">真實帳戶的餘額與持倉要密碼（設定頁那組）才能看，輸入一次會記在這支手機。</div>
+    <div class="row"><input type="password" id="syncPw" placeholder="密碼" style="flex:1;" /><button id="syncGo">連線</button></div>
+  </div>
+  <div id="syncBody" style="display:none;">
+    <div id="syncHead" class="hint"></div>
+    <div class="row" style="margin-top:6px;"><label style="min-width:auto;"><input type="checkbox" id="syncAuto" checked /> 自動帶入（每 5 秒）</label>
+      <button id="syncForget" style="margin-left:auto;">登出</button></div>
+    <div id="syncIssues"></div>
+  </div>
+  <div id="syncErr" class="err"></div>
+</div>
+
 <div class="card">
   <h2>持倉</h2>
   <div class="row">
@@ -107,6 +122,11 @@
     <div class="row"><label>加碼成本</label><input type="number" step="0.1" id="cost_points" value="0.4" /><span class="muted">點（點差＋滑價）</span></div>
     <div class="row"><label>合約大小</label><input type="number" step="1" id="contract_size" value="100" /><span class="muted">盎司／手</span></div>
     <div class="row"><label>停損跟著移</label><input type="checkbox" id="trail_stop" checked /><span class="muted">每到一個加碼點，停損移同樣的距離</span></div>
+    <div id="ruleSync" style="display:none; border-top:1px solid var(--grid); padding-top:8px;">
+      <div id="ruleServer" class="hint"></div>
+      <button id="ruleSave" style="margin-top:6px;">把上面的規則存成通知規則</button>
+      <span id="ruleMsg" class="hint"></span>
+    </div>
   </details>
 </div>
 
@@ -308,8 +328,105 @@ $('useBinance').onclick = async () => {
     if (r.bid && r.ask) { $('price').value = ((parseFloat(r.bid) + parseFloat(r.ask)) / 2).toFixed(2); schedule(); }
   } catch (e) { /* 沒報價就維持手填 */ }
 };
+
+// ---- r125：MT5 同步(唯讀) ----
+const PW_KEY = 'rollSync.pw';
+const RULE_KEYS = ['max_leverage', 'lock_pct', 'add_step', 'add_lots', 'cost_points', 'contract_size'];
+let syncPwVal = null, syncTimer = null, syncRules = null;
+try { syncPwVal = localStorage.getItem(PW_KEY); } catch (e) { syncPwVal = null; }
+
+function fillFromSync(inp) {
+  if (!inp) return;
+  if (direction !== inp.direction) setDir(inp.direction, false);
+  const rows = [...document.querySelectorAll('.pos-row')];
+  const cur = rows.map(r => [r.querySelector('.lots').value, r.querySelector('.entry').value].join('@')).join('|');
+  const want = inp.positions.map(p => [p.lots, p.entry].join('@')).join('|');
+  if (cur !== want) { rows.forEach(r => r.remove()); inp.positions.forEach(p => posRow(p.lots, p.entry)); }
+  $('price').value = inp.price;
+  $('balance').value = inp.balance;
+  $('equity').value = inp.equity;
+  $('stop').value = inp.stop === null ? '' : inp.stop;
+}
+
+function showRules() {
+  if (!syncRules) return;
+  $('ruleSync').style.display = '';
+  const r = syncRules;
+  $('ruleServer').textContent = `目前的通知規則（Telegram 提醒用）：槓桿 ≤ ${r.max_leverage} 倍、停損保住 ${r.lock_pct}% 浮盈、`
+    + `每 ${r.add_step} 點加碼（${r.add_lots ? r.add_lots + ' 手' : '手數＝最小那筆'}）、成本 ${r.cost_points} 點`;
+}
+
+async function syncPoll(force = false) {
+  clearTimeout(syncTimer);
+  if (!syncPwVal) return;
+  let r;
+  try {
+    r = await (await fetch('/tools/roll-account', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                 body: JSON.stringify({password: syncPwVal})})).json();
+  } catch (e) {
+    $('syncErr').textContent = '連不到服務：' + (e.message || e);
+    syncTimer = setTimeout(syncPoll, 15000);
+    return;
+  }
+  if (r.enabled === false) { $('syncCard').style.display = 'none'; return; }
+  if (!r.success) {
+    $('syncErr').textContent = r.error || '讀取失敗';
+    if ((r.error || '').includes('密碼')) { try { localStorage.removeItem(PW_KEY); } catch (e) { /* 略 */ } syncPwVal = null; showLogin(); }
+    return;
+  }
+  $('syncErr').textContent = '';
+  $('syncLogin').style.display = 'none';
+  $('syncBody').style.display = '';
+  syncRules = r.rules; showRules();
+  const acc = r.account;
+  if (!acc) {
+    $('syncHead').textContent = 'EA 還沒回報過。確認 Vantage 的 MT5 有掛 TzujenRollSync、圖表左上角顯示「回報正常」。';
+  } else {
+    const mode = {0: '模擬', 1: '比賽', 2: '真實'}[acc.trade_mode] || '';
+    $('syncHead').innerHTML = `${esc(acc.company || '')} ${esc(acc.login || '')}（${mode}，1:${esc(acc.leverage || '?')}）　`
+      + (r.connected ? `${Math.round(r.age_seconds)} 秒前同步` : `<span class="err">已 ${Math.round(r.age_seconds / 60)} 分鐘沒回報</span>`)
+      + `　${r.positions.length} 筆黃金持倉`;
+  }
+  $('syncIssues').innerHTML = (r.issues || []).map(i => `<div class="act ${i.level}">${esc(i.text)}</div>`).join('');
+  if ($('syncAuto').checked && r.connected && r.inputs) { fillFromSync(r.inputs); schedule(); }
+  syncTimer = setTimeout(syncPoll, 5000);
+}
+
+function showLogin() { $('syncLogin').style.display = ''; $('syncBody').style.display = 'none'; }
+
+async function syncInit() {
+  // 先問一次有沒有啟用(沒啟用時不用密碼就會回 enabled:false)
+  let r;
+  try {
+    r = await (await fetch('/tools/roll-account', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
+  } catch (e) { return; }
+  if (r.enabled === false) return;
+  $('syncCard').style.display = '';
+  if (syncPwVal) syncPoll(); else showLogin();
+}
+
+$('syncGo').onclick = () => {
+  syncPwVal = $('syncPw').value;
+  try { localStorage.setItem(PW_KEY, syncPwVal); } catch (e) { /* 存不了就只用這次 */ }
+  syncPoll(true);
+};
+$('syncForget').onclick = () => { try { localStorage.removeItem(PW_KEY); } catch (e) { /* 略 */ } syncPwVal = null; clearTimeout(syncTimer); showLogin(); };
+$('syncAuto').addEventListener('change', () => syncPoll());
+$('ruleSave').onclick = async () => {
+  const rules = {trail_stop: $('trail_stop').checked};
+  RULE_KEYS.forEach(k => { rules[k] = $(k).value; });
+  $('ruleMsg').textContent = '存檔中…';
+  try {
+    const r = await (await fetch('/tools/roll-rules', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                     body: JSON.stringify({password: syncPwVal, rules})})).json();
+    if (r.success) { syncRules = r.rules; showRules(); $('ruleMsg').textContent = '已存'; }
+    else $('ruleMsg').textContent = r.error || '存檔失敗';
+  } catch (e) { $('ruleMsg').textContent = '連不到服務'; }
+};
+
 load();
 schedule();
+syncInit();
 </script>
 </body>
 </html>
