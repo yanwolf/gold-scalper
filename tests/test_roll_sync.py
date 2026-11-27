@@ -193,6 +193,33 @@ class Alerts(Base):
         S.receive(snap(p2, balance=1788.77, equity=2680.0, bid=3680.0), TOKEN, now=T0 + 6)
         self.assertEqual(len([m for m in self.sent() if "到加碼點了" in m]), 1)
 
+    def test_lock_alert_when_profit_grows(self):
+        # 核心單 0.04 @3447.56 停損 3582.28、加碼 0.02 @3676.83 停損 3646(使用者 11/27 的部位)，規則 15 倍、保住 30%
+        rules = {**S.default_rules(), "max_leverage": 15, "lock_pct": 30}
+        ps = [pos(1, 0.04, 3447.56, 3582.28), pos(2, 0.02, 3676.83, 3646.0)]
+
+        def at(bid, now, p=ps):
+            eq = 788.71 - 10.62 + sum(100 * q["volume"] * (bid - q["price"]) for q in p)
+            S.receive(snap(p, balance=788.71, equity=round(eq, 2), bid=bid), TOKEN, now=now)
+
+        with mock.patch.object(S, "get_rules", return_value=rules):
+            at(3677.6, T0)
+            self.assertNotIn("lock", S._state["alerts"])                     # 現在保住 466 ≥ 273，沒事
+            at(3800.0, T0 + 3)                                              # 漲上去：要保住的變多
+            locks = [m for m in self.sent() if "浮盈變大了" in m]
+            self.assertEqual(len(locks), 1)
+            self.assertIn("加碼單停損要上移到", locks[0])
+            self.assertIn("目前 3646", locks[0])
+            at(3805.0, T0 + 6)
+            at(3810.0, T0 + 9)
+            self.assertEqual(len([m for m in self.sent() if "浮盈變大了" in m]), 1)   # 價格在動不重發
+            line = S.status(now=T0 + 9)["active_alerts"]["lock"]["text"]     # 網頁上的文字跟著最新價格更新
+            self.assertIn("要上移到", line)
+            p2 = [pos(1, 0.04, 3447.56, 3582.28), pos(2, 0.02, 3676.83, 3760.0)]
+            at(3810.0, T0 + 12, p2)
+            self.assertTrue(any("✅ 已處理" in m and "浮盈變大了" in m for m in self.sent()), self.sent())
+            self.assertNotIn("lock", S._state["alerts"])
+
     def test_disconnect_once_and_recover(self):
         S.receive(snap([pos(1, 0.04, 3447.56, 3600.0)]), TOKEN, now=T0)
         S.evaluate(now=T0 + S.STALE_SECONDS + 5)

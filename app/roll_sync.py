@@ -304,6 +304,9 @@ def evaluate(now=None):
             if r["stop"]["kept"] is not None and r["stop"]["kept"] < 0:
                 active["principal"] = ((inputs["stop"], inputs.get("core_stop")),
                                        f"🚨 停損全部打到會虧到本金 {abs(r['stop']['kept']):.2f}")
+            lock = _lock_alert(r, inputs)
+            if lock:
+                active["lock"] = lock
             _check_add(r, inputs, rules, label)
     for key, (sig, text) in active.items():
         _raise(key, sig, text, now, label)
@@ -311,6 +314,26 @@ def evaluate(now=None):
     if not view["positions"]:
         _state["add_keys"].clear()
     return set(active)
+
+
+def _lock_alert(r, inputs):
+    """
+    r127：浮盈變大後，要保住的金額跟著變大；停損全部打到保住的錢不夠時提醒上移(空單下移)哪一個停損、移到哪。
+    sig＝(哪一個停損, 目前停損價)：價格一直動、停損線一直變，不會每次回報都發；停損改過還不夠就馬上再提醒一次。
+    """
+    st = r["stop"]
+    if st["kept"] is None or st["lock_line"] is None or r["status"]["floating"] <= 0:
+        return None
+    if st["kept"] >= st["keep_required"] - 1e-6:
+        return None
+    s = 1 if inputs["direction"] == "long" else -1
+    target = st["lock_target"]
+    which = {"all": "停損", "add": "加碼單停損", "core": "核心單停損"}[target]
+    cur = inputs.get("core_stop") if target == "core" else inputs.get("stop")
+    move = "上移" if s == 1 else "下移"
+    return ((target, cur),
+            f"⚠️ 浮盈變大了，{which}要{move}到 {st['lock_line']:.2f}{'以上' if s == 1 else '以下'}（目前 {cur:g}）\n"
+            f"停損全部打到現在只保住 {st['kept']:.2f}，要保住 {st['lock_pct']:g}% 浮盈＝{st['keep_required']:.2f}")
 
 
 def _check_add(r, inputs, rules, label):

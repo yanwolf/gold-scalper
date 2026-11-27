@@ -25,6 +25,7 @@ DEFAULTS = {
     "cost_points": 0.4,     # 每次加碼的點差＋滑價(點)，r111 MT5 成本假設
     "lot_step": 0.01,
     "trail_stop": True,     # 每往上一個加碼點，停損也跟著移同樣的距離
+    "add_stop_points": None,  # r126：有核心單、還沒有加碼單時，新加碼單的停損距離(點)；None＝跟加碼間距一樣
 }
 
 MAX_LADDER = 10
@@ -74,16 +75,23 @@ def parse(inp):
             raise ValueError(f"第 {i} 筆部位格式不對")
         if (p.get("lots") in (None, "")) and (p.get("entry") in (None, "")):
             continue   # 網頁上的空白列
+        core = p.get("core", False)
+        core = core if isinstance(core, bool) else str(core).lower() in ("1", "true", "yes", "on")
         positions.append({"lots": _num(p.get("lots"), f"第 {i} 筆手數", positive=True),
-                          "entry": _num(p.get("entry"), f"第 {i} 筆進場價", positive=True)})
+                          "entry": _num(p.get("entry"), f"第 {i} 筆進場價", positive=True), "core": core})
     if not positions:
         raise ValueError("至少要有一筆部位")
     price = _num(inp.get("price"), "現價", positive=True)
     balance = _num(inp.get("balance"), "結餘", positive=True)
     equity = _num(inp.get("equity"), "淨值", allow_none=True)
-    stop = _num(inp.get("stop"), "停損價", positive=True, allow_none=True)
+    has_core = any(q["core"] for q in positions)
+    side = '下方(多單)' if s == 1 else '上方(空單)'
+    stop = _num(inp.get("stop"), "加碼單停損" if has_core else "停損價", positive=True, allow_none=True)
     if stop is not None and s * (price - stop) <= 0:
-        raise ValueError(f"停損價 {stop:g} 要在現價{'下方(多單)' if s == 1 else '上方(空單)'}")
+        raise ValueError(f"{'加碼單停損' if has_core else '停損價'} {stop:g} 要在現價{side}")
+    core_stop = _num(inp.get("core_stop"), "核心單停損", positive=True, allow_none=True) if has_core else None
+    if core_stop is not None and s * (price - core_stop) <= 0:
+        raise ValueError(f"核心單停損 {core_stop:g} 要在現價{side}")
     max_lev = _num(inp.get("max_leverage", DEFAULTS["max_leverage"]), "槓桿上限", positive=True)
     if max_lev <= 1:
         raise ValueError("槓桿上限要大於 1 倍")
@@ -93,17 +101,20 @@ def parse(inp):
     add_step = _num(inp.get("add_step", DEFAULTS["add_step"]), "加碼間距", positive=True)
     add_lots = _num(inp.get("add_lots"), "每次加碼手數", positive=True, allow_none=True)
     if add_lots is None:
-        add_lots = min(p["lots"] for p in positions)
+        adds = [q["lots"] for q in positions if not q["core"]]
+        add_lots = min(adds or [q["lots"] for q in positions])
     steps = int(_num(inp.get("ladder_steps", DEFAULTS["ladder_steps"]), "加碼階數"))
     steps = max(1, min(MAX_LADDER, steps))
     cost = _num(inp.get("cost_points", DEFAULTS["cost_points"]), "加碼成本(點)")
     if cost < 0:
         raise ValueError("加碼成本不能是負的")
+    add_stop_pts = _num(inp.get("add_stop_points"), "加碼單停損距離", positive=True, allow_none=True)
     trail = inp.get("trail_stop", DEFAULTS["trail_stop"])
     trail = trail if isinstance(trail, bool) else str(trail).lower() in ("1", "true", "yes", "on")
     return {"s": s, "direction": d, "cs": cs, "lot_step": lot_step, "positions": positions, "price": price,
-            "balance": balance, "equity": equity, "stop": stop, "max_lev": max_lev, "lock_pct": lock_pct,
-            "add_step": add_step, "add_lots": add_lots, "steps": steps, "cost": cost, "trail": trail}
+            "balance": balance, "equity": equity, "stop": stop, "core_stop": core_stop, "has_core": has_core,
+            "max_lev": max_lev, "lock_pct": lock_pct,
+            "add_step": add_step, "add_lots": add_lots, "add_stop_points": add_stop_pts, "steps": steps, "cost": cost, "trail": trail}
 
 
 class Book:
@@ -130,6 +141,19 @@ class Book:
     def kept_at(self, price):
         """打到這個價位時，相對結餘還剩多少(正＝還有賺、負＝虧到本金)。"""
         return self.equity_at(price) - self.balance
+
+    def worst_kept(self, add_stop, core_stop=None):
+        """
+        每一筆都打到自己的停損(核心單打到 core_stop、其他打到 add_stop)時，相對結餘還剩多少。
+        有任何一筆沒有停損就回 None。沒有核心單時＝kept_at(add_stop)。
+        """
+        total = self.adj
+        for p in self.positions:
+            st = core_stop if p.get("core") else add_stop
+            if st is None:
+                return None
+            total += self.s * self.cs * p["lots"] * (st - p["entry"])
+        return total
 
     def leverage_at(self, price):
         eq = self.equity_at(price)
@@ -158,10 +182,10 @@ class Book:
         return p
 
 
-def max_add(book, price, stop, keep_req, cap, cost, plan_lots, lot_step):
+def max_add(book, price, stop, keep_req, cap, cost, plan_lots, lot_step, core_stop=None):
     """
-    在 price 加碼、整體停損放 stop 時最多能加幾手。回傳 (手數, 卡住的條件, 進場價)。
-    三個上限取最小：槓桿上限、停損時至少保住 keep_req、計畫手數。
+    在 price 加碼、加碼單停損放 stop(沒有核心單時＝整體停損)時最多能加幾手。回傳 (手數, 卡住的條件, 進場價)。
+    三個上限取最小：槓桿上限、全部停損都打到時至少保住 keep_req、計畫手數。
     """
     s, cs = book.s, book.cs
     entry = price + s * cost
@@ -172,7 +196,10 @@ def max_add(book, price, stop, keep_req, cap, cost, plan_lots, lot_step):
     by_lev = (cap * eq - book.lots * cs * price) / (cs * (price + cap * cost))
     # 停損：kept(stop) + s·cs·x·(stop − entry) ≥ keep_req，(stop − entry) 跟方向相反所以每加一手就少保住一點
     per_lot_loss = cs * s * (entry - stop)
-    by_stop = (book.kept_at(stop) - keep_req) / per_lot_loss if per_lot_loss > 0 else 0.0
+    base = book.worst_kept(stop, core_stop)
+    if base is None:
+        return 0.0, "核心單還沒設停損", entry
+    by_stop = (base - keep_req) / per_lot_loss if per_lot_loss > 0 else 0.0
     limits = [(by_lev, "槓桿上限"), (by_stop, "停損時要保住的浮盈"), (plan_lots, "計畫手數")]
     x, why = min(limits, key=lambda t: t[0])
     lots = _floor_lots(x, lot_step)
@@ -192,19 +219,50 @@ def calc(inp):
     up = "上" if s == 1 else "下"
     adverse = "跌到" if s == 1 else "漲到"
     favor = "漲到" if s == 1 else "跌到"
+    has_core = p["has_core"]
+    core_stop = p["core_stop"]
 
     book0 = Book(s, cs, p["balance"], p["positions"])
     adj = (p["equity"] - book0.equity_at(price)) if p["equity"] is not None else 0.0
     book = Book(s, cs, p["balance"], p["positions"], adj)
+    core_pos = [q for q in book.positions if q["core"]]
+    add_pos = [q for q in book.positions if not q["core"]]
 
     eq = book.equity_at(price)
     floating = eq - p["balance"]
     lev = book.leverage_at(price)
     keep_req = max(floating, 0.0) * p["lock_pct"] / 100.0
-    lock_line = book.lock_price(keep_req)
     stop = p["stop"]
-    stop_for_calc = stop if stop is not None else lock_line
-    stop_kept = book.kept_at(stop) if stop is not None else None
+
+    # 保住浮盈的停損線：沒有核心單＝整體停損；有核心單＋加碼單＝加碼單停損(核心停損固定)；只有核心單＝核心單停損
+    if not has_core:
+        lock_target, lock_line = "all", book.lock_price(keep_req)
+    elif add_pos:
+        lock_target = "add"
+        if core_stop is None:
+            lock_line = None
+        else:
+            core_part = s * cs * sum(q["lots"] * (core_stop - q["entry"]) for q in core_pos)
+            a = Book(s, cs, p["balance"], add_pos)
+            lock_line = a.avg + s * (keep_req - adj - core_part) / (a.lots * cs)
+    else:
+        lock_target = "core"
+        lock_line = Book(s, cs, p["balance"], core_pos, adj).lock_price(keep_req)
+
+    # 加碼試算用的加碼單停損：沒有核心單時沒填就用保住浮盈的停損線(跟以前一樣)；有核心單時要自己填
+    stop_default = False
+    if stop is not None:
+        stop_for_calc = stop
+    elif not has_core:
+        stop_for_calc = lock_line
+    elif not add_pos:
+        # 只有核心單：第一筆加碼單的停損＝加碼價 ∓ 停損距離(沒設就用加碼間距)
+        stop_for_calc = price - s * (p["add_stop_points"] or p["add_step"])
+        stop_default = True
+    else:
+        stop_for_calc = None
+    worst = book.worst_kept(stop, core_stop)    # 需要的停損有任何一個沒填就是 None
+    add_hit = book.kept_at(stop) if (has_core and core_pos and add_pos and stop is not None) else None
 
     status = {
         "lots": _r(book.lots), "avg_price": _r(book.avg), "floating": _r(floating), "equity": _r(eq),
@@ -212,113 +270,143 @@ def calc(inp):
         "leverage": _r(lev), "zero_price": _r(book.zero_price()),
         "points_to_zero": _r(abs(price - book.zero_price())),
         "leverage_cap_price": _r(book.leverage_cap_price(cap)),
+        "core_lots": _r(sum(q["lots"] for q in core_pos)), "add_lots": _r(sum(q["lots"] for q in add_pos)),
     }
     stop_info = {
-        "stop": stop, "kept": _r(stop_kept),
-        "equity_at_stop": _r(stop_kept + p["balance"]) if stop_kept is not None else None,
+        "stop": stop, "core_stop": core_stop, "has_core": has_core, "kept": _r(worst),
+        "equity_at_stop": _r(worst + p["balance"]) if worst is not None else None,
+        "add_stop_hit_kept": _r(add_hit),
         "lock_pct": p["lock_pct"], "keep_required": _r(keep_req), "lock_line": _r(lock_line),
-        "locks_enough": (stop_kept is not None and floating > 0 and stop_kept >= keep_req - 1e-6),
+        "lock_target": lock_target,
+        "locks_enough": (worst is not None and floating > 0 and worst >= keep_req - 1e-6),
     }
 
-    # ---- 減碼：槓桿超過上限時，要平掉幾手、先平哪一筆 ----
+    # ---- 減碼：槓桿超過上限時，要平掉幾手；加碼單先平(成本最差的先)，核心單最後 ----
     reduce = None
     if lev is None or lev > cap + 1e-9:
         target = _floor_lots(cap * eq / (cs * price), step) if eq > 0 else 0.0
         need = _ceil_lots(book.lots - target, step)
-        order = sorted(range(len(book.positions)), key=lambda i: -s * book.positions[i]["entry"])  # 成本最差的先平
+        order = sorted(range(len(book.positions)),
+                       key=lambda i: (book.positions[i]["core"], -s * book.positions[i]["entry"]))
         plan, left = [], need
         for i in order:
             if left <= 1e-9:
                 break
             pos = book.positions[i]
             take = round(min(pos["lots"], left), 6)
-            plan.append({"index": i, "entry": pos["entry"], "lots_held": pos["lots"], "close_lots": _r(take),
-                         "realized": _r(s * cs * take * (price - pos["entry"]))})
+            plan.append({"index": i, "entry": pos["entry"], "core": pos["core"], "lots_held": pos["lots"],
+                         "close_lots": _r(take), "realized": _r(s * cs * take * (price - pos["entry"]))})
             left = round(left - take, 6)
         remaining = []
         for i, pos in enumerate(book.positions):
             closed = sum(x["close_lots"] for x in plan if x["index"] == i)
             if pos["lots"] - closed > 1e-9:
-                remaining.append({"lots": round(pos["lots"] - closed, 6), "entry": pos["entry"]})
+                remaining.append({"lots": round(pos["lots"] - closed, 6), "entry": pos["entry"], "core": pos["core"]})
         after = None
         if remaining:
             realized = sum(x["realized"] for x in plan)
             b2 = Book(s, cs, p["balance"] + realized, remaining, adj)
+            wk = b2.worst_kept(stop, core_stop)
             after = {"lots": _r(b2.lots), "avg_price": _r(b2.avg), "leverage": _r(b2.leverage_at(price)),
                      "balance": _r(b2.balance), "zero_price": _r(b2.zero_price()),
                      # 跟原本的結餘比(平掉那幾筆實現的獲利也算保住)
-                     "kept_at_stop": _r(b2.equity_at(stop) - p["balance"]) if stop is not None else None}
+                     "kept_at_stop": _r(wk + realized) if wk is not None else None}
         reduce = {"close_lots": _r(need), "target_lots": _r(target), "plan": plan, "after": after}
 
     # ---- 現在加碼 ----
     if floating <= 0:
         add_now = {"lots": 0.0, "why": "沒有浮盈(滾倉只用浮盈加碼)", "entry": _r(price + s * p["cost"]),
                    "stop": _r(stop_for_calc)}
+    elif stop_for_calc is None:
+        add_now = {"lots": 0.0, "why": "還沒設加碼單停損", "entry": _r(price + s * p["cost"]), "stop": None}
     else:
-        x, why, entry = max_add(book, price, stop_for_calc, keep_req, cap, p["cost"], p["add_lots"], step)
+        x, why, entry = max_add(book, price, stop_for_calc, keep_req, cap, p["cost"], p["add_lots"], step, core_stop)
         add_now = {"lots": x, "why": why, "entry": _r(entry), "stop": _r(stop_for_calc)}
         if x > 0:
-            b2 = Book(s, cs, p["balance"], book.positions + [{"lots": x, "entry": entry}], adj)
+            b2 = Book(s, cs, p["balance"], book.positions + [{"lots": x, "entry": entry, "core": False}], adj)
             add_now.update({"total_lots": _r(b2.lots), "avg_price": _r(b2.avg), "leverage": _r(b2.leverage_at(price)),
-                            "kept_at_stop": _r(b2.kept_at(stop_for_calc))})
-    add_now["stop_is_lock_line"] = stop is None
+                            "kept_at_stop": _r(b2.worst_kept(stop_for_calc, core_stop))})
+    add_now["stop_is_lock_line"] = stop is None and not has_core
+    add_now["stop_is_default"] = stop_default
 
-    # ---- 往後的加碼點(假設前一階有照可加的手數加) ----
+    # ---- 往後的加碼點(假設前一階有照可加的手數加；核心單停損不動) ----
     ladder = []
-    lb = Book(s, cs, p["balance"], book.positions + ([{"lots": add_now["lots"], "entry": add_now["entry"]}]
+    lb = Book(s, cs, p["balance"], book.positions + ([{"lots": add_now["lots"], "entry": add_now["entry"], "core": False}]
                                                       if add_now["lots"] > 0 else []), adj)
     last_add = add_now["lots"] if add_now["lots"] > 0 else p["add_lots"]
     for k in range(1, p["steps"] + 1):
         t = price + s * k * p["add_step"]
-        st = stop_for_calc + s * k * p["add_step"] if p["trail"] else stop_for_calc
+        st = None if stop_for_calc is None else (stop_for_calc + s * k * p["add_step"] if p["trail"] else stop_for_calc)
         fl = lb.kept_at(t)
         kr = max(fl, 0.0) * p["lock_pct"] / 100.0
-        x, why, entry = max_add(lb, t, st, kr, cap, p["cost"], min(p["add_lots"], last_add), step) if fl > 0 \
-            else (0.0, "沒有浮盈", t + s * p["cost"])
+        if fl <= 0:
+            x, why, entry = 0.0, "沒有浮盈", t + s * p["cost"]
+        elif st is None:
+            x, why, entry = 0.0, "還沒設加碼單停損", t + s * p["cost"]
+        else:
+            x, why, entry = max_add(lb, t, st, kr, cap, p["cost"], min(p["add_lots"], last_add), step, core_stop)
         if x > 0:
-            lb = Book(s, cs, p["balance"], lb.positions + [{"lots": x, "entry": entry}], adj)
+            lb = Book(s, cs, p["balance"], lb.positions + [{"lots": x, "entry": entry, "core": False}], adj)
             last_add = x
+        wk = lb.worst_kept(st, core_stop)
         ladder.append({"step": k, "price": _r(t), "stop": _r(st), "add_lots": x, "why": why,
                        "total_lots": _r(lb.lots), "avg_price": _r(lb.avg), "equity": _r(lb.equity_at(t)),
-                       "leverage": _r(lb.leverage_at(t)), "kept_at_stop": _r(lb.kept_at(st)),
-                       "keep_required": _r(kr)})
+                       "leverage": _r(lb.leverage_at(t)), "kept_at_stop": _r(wk), "keep_required": _r(kr)})
 
     # ---- 建議(由重到輕) ----
     actions = []
+    zero_txt = f"{adverse} {status['zero_price']:.2f}（距現價 {status['points_to_zero']:.2f} 點）帳戶歸零，強平還會更早"
     if eq <= 0:
         actions.append({"level": "alarm", "text": "淨值已經小於等於 0，先處理部位"})
-    if stop is None:
-        actions.append({"level": "alarm", "text": f"沒有停損：{adverse} {status['zero_price']:.2f}"
-                        f"（距現價 {status['points_to_zero']:.2f} 點）帳戶歸零，強平還會更早"})
-    elif stop_kept < 0:
-        actions.append({"level": "alarm", "text": f"停損 {stop:g} 打到會虧到本金 {abs(stop_kept):.2f}"})
+    if not has_core and stop is None:
+        actions.append({"level": "alarm", "text": f"沒有停損：{zero_txt}"})
+    if has_core and core_stop is None:
+        actions.append({"level": "alarm", "text": f"核心單沒有停損：{zero_txt}"})
+    if has_core and add_pos and stop is None:
+        actions.append({"level": "alarm", "text": "加碼單沒有停損"})
+    if worst is not None and worst < 0:
+        what = "停損" if not has_core else "所有停損"
+        actions.append({"level": "alarm", "text": f"{what}打到會虧到本金 {abs(worst):.2f}"})
     if lev is None or lev > cap + 1e-9:
         first = reduce["plan"][0] if reduce and reduce["plan"] else None
         actions.append({"level": "alarm", "text": (
             f"實際槓桿 {lev:.1f} 倍超過上限 {cap:g} 倍：建議減碼 {reduce['close_lots']:g} 手"
-            + (f"（先平進場 {first['entry']:g} 那筆）" if first else "")
+            + (f"（先平進場 {first['entry']:g} 那筆{'，是核心單' if first['core'] else ''}）" if first else "")
             + (f"，或等{favor} {status['leverage_cap_price']:.2f} 槓桿自然回到 {cap:g} 倍" if status["leverage_cap_price"]
                and s * (status["leverage_cap_price"] - price) > 0 else "")) if lev is not None
             else "淨值小於等於 0，無法計算槓桿"})
+    which = {"all": "停損", "add": "加碼單停損", "core": "核心單停損"}[lock_target]
     if floating > 0:
-        if stop is None:
-            actions.append({"level": "warn", "text": f"停損至少要移到 {lock_line:.2f}，打到時才保住 {p['lock_pct']:g}% 浮盈"
-                            f"（{keep_req:.2f}）；要有加碼空間，停損得比這條更{('高' if s == 1 else '低')}"})
-        elif stop_kept is not None and stop_kept < keep_req - 1e-6:
-            actions.append({"level": "warn", "text": f"停損 {stop:g} 只保住 {stop_kept:.2f}，"
-                            f"要保住 {p['lock_pct']:g}% 浮盈需移到 {lock_line:.2f} 以{up}"})
+        if lock_line is not None and (worst is None or worst < keep_req - 1e-6):
+            if worst is None:
+                if lock_target == "all":
+                    actions.append({"level": "warn", "text": f"停損至少要移到 {lock_line:.2f}，打到時才保住 {p['lock_pct']:g}% 浮盈"
+                                    f"（{keep_req:.2f}）；要有加碼空間，停損得比這條更{('高' if s == 1 else '低')}"})
+            else:
+                actions.append({"level": "warn", "text": f"所有停損打到只保住 {worst:.2f}，要保住 {p['lock_pct']:g}% 浮盈"
+                                f"（{keep_req:.2f}）需把{which}移到 {lock_line:.2f} 以{up}"})
+        if add_hit is not None:
+            actions.append({"level": "info", "text": f"只有加碼單停損 {stop:g} 打到時，核心單續抱，帳上保住 {add_hit:.2f}"})
     else:
         actions.append({"level": "info", "text": "目前沒有浮盈，不適合滾倉加碼"})
     if not any(a["level"] == "alarm" for a in actions) and floating > 0:
         if add_now["lots"] > 0:
-            actions.append({"level": "ok", "text": f"現在可以加 {add_now['lots']:g} 手，停損 {add_now['stop']:.2f}；"
-                            f"打到停損仍保住 {add_now['kept_at_stop']:.2f}，槓桿 {add_now['leverage']:.1f} 倍"})
+            actions.append({"level": "ok", "text": f"現在可以加 {add_now['lots']:g} 手，"
+                            f"{'加碼單' if has_core else ''}停損 {add_now['stop']:.2f}；"
+                            f"所有停損打到仍保住 {add_now['kept_at_stop']:.2f}，槓桿 {add_now['leverage']:.1f} 倍"})
         else:
             nxt = next((r for r in ladder if r["add_lots"] > 0), None)
+            if has_core and core_stop is not None and add_now["why"] == "停損時要保住的浮盈":
+                give = s * cs * sum(q["lots"] * (price - core_stop) for q in core_pos)
+                actions.append({"level": "info", "text": (
+                    f"核心單停損 {core_stop:g} 打到會吐回 {give:.2f}（浮盈的 {give / floating * 100:.0f}%），"
+                    f"可吐回的額度大多被核心單用掉了；要有加碼空間，核心單停損要上移，或把「保住浮盈」調低")})
             actions.append({"level": "info", "text": (
-                f"現在先不加（卡在{add_now['why']}）；" + (
-                    f"下一個加碼點 {nxt['price']:.2f}，可加 {nxt['add_lots']:g} 手，停損移到 {nxt['stop']:.2f}"
-                    if nxt else "往後幾個加碼點也加不進去，先調整停損或部位"))})
+                f"現在先不加（{add_now['why']}）；" + (
+                    f"下一個加碼點 {nxt['price']:.2f}，可加 {nxt['add_lots']:g} 手，"
+                    f"{'加碼單' if has_core else ''}停損移到 {nxt['stop']:.2f}"
+                    if nxt else ("往後幾個加碼點也加不進去，先調整停損或部位" if add_now["why"] != "還沒設加碼單停損"
+                                 else "填了加碼單停損才算得出能加多少")))})
     elif any(a["level"] == "alarm" for a in actions):
         actions.append({"level": "info", "text": "先處理上面的警示，再考慮加碼"})
 
